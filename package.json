@@ -1,0 +1,19 @@
+{
+  "name": "feature-gap-dashboard",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Local-only dashboard that finds feature gaps between hyperswitch-web and hyperswitch-client-core and generates local patches.",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "dev:server": "npm run dev -w server",
+    "dev:web": "npm run dev -w web",
+    "build": "npm run build -w server && npm run build -w web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

@@ -1,0 +1,389 @@
+/**
+ * Props skill — Add a new configuration prop across both SDKs.
+ *
+ * Sends one Opus agent per platform target (web, mobile, android_native, ios_native).
+ * Each agent gets pattern files from the target repo so it knows exactly how
+ * to wire props. Creates git branches per repo and captures diffs.
+ *
+ * Exports two handlers:
+ *  - handlePropsRoute   → used by /props/generate (legacy shape, backward compat)
+ *  - handlePropsSkill   → used by /skills/props/generate (SkillEnvelope shape)
+ */
+
+import type { Request, Response } from "express";
+import fs from "node:fs";
+import path from "node:path";
+import simpleGit from "simple-git";
+import { PATCHES_DIR, REPOS, type RepoKey } from "../../config.js";
+import { ask } from "../../llm.js";
+import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
+
+export interface PropSpec {
+  propName: string;
+  type: string;
+  default: string;
+  parentConfig?: string;
+  behavior: string;
+  platforms: string[];
+}
+
+// Pattern reference files that teach the agent how props are wired in each repo
+const WEB_PATTERN_FILES = [
+  "src/Types/PaymentType.res",
+  "src/Utilities/DynamicFieldsUtils.res",
+  "src/Components/DynamicFields.res",
+];
+
+const MOBILE_PATTERN_FILES = [
+  "src/types/SdkTypes.res",
+  "src/types/NativeSdkPropsKeys.res",
+  "src/contexts/DynamicFieldsContext.res",
+  "src/components/dynamic/RequiredFields.res",
+];
+
+const ANDROID_PATTERN_FILES = [
+  "android/hyperswitch-sdk-android-api/src/main/kotlin/io/hyperswitch/paymentsheet/PaymentSheet.kt",
+  "android/hyperswitch-sdk-android-api/src/main/kotlin/io/hyperswitch/paymentsession/LaunchOptions.kt",
+];
+
+const IOS_PATTERN_FILES = [
+  "ios/hyperswitchSDK/Shared/PaymentSheetConfiguration.swift",
+];
+
+export function readPatternFile(repoDir: string, relPath: string, maxSize = 12000): string {
+  try {
+    const full = path.join(repoDir, relPath);
+    let content = fs.readFileSync(full, "utf8");
+    if (content.length > maxSize) content = content.slice(0, maxSize) + "\n... [truncated]";
+    return `### ${relPath}\n\`\`\`\n${content}\n\`\`\``;
+  } catch {
+    return `### ${relPath}\n(file not found)`;
+  }
+}
+
+function buildWebPrompt(spec: PropSpec, repoDir: string): string {
+  const patterns = WEB_PATTERN_FILES.map((f) => readPatternFile(repoDir, f)).join("\n\n");
+  return `You are adding a new configuration prop to the hyperswitch-web (ReScript web SDK) repository.
+
+Your current working directory IS the web repo: ${repoDir}
+You have Edit, Write, Read, Glob, and Grep tools.
+
+## Prop Specification
+
+- **Name**: ${spec.propName}
+- **Type**: ${spec.type}
+- **Default**: ${spec.default}
+- **Parent config**: ${spec.parentConfig || "top-level options"}
+- **Behavior**: ${spec.behavior}
+
+## How props are wired in this repo (FOLLOW THIS PATTERN EXACTLY)
+
+${patterns}
+
+## Instructions
+
+1. First use Glob/Grep to confirm the current code structure matches the patterns above.
+2. Add the prop to the type definition (in PaymentType.res or relevant type file).
+3. Add parsing in the parser function (follow the existing getBoolWithWarning / getWarningString pattern).
+4. Add the default value.
+5. Update the unknownKeysWarning array to include the new key.
+6. Wire the prop into the component logic that controls the behavior described above.
+7. Only touch files that are necessary. Follow existing conventions exactly.
+
+Important:
+- This is a ReScript codebase. Use ReScript syntax.
+- Follow the EXACT naming conventions used in this repo (camelCase for ReScript fields).
+- Look at how similar props (like hideExpiredPaymentMethods, displaySavedPaymentMethods) are wired as examples.
+
+After implementing, output ONLY a JSON summary (no code fences):
+{"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what changed>"}], "backward_compatible": true, "notes": "<any caveats>"}`;
+}
+
+function buildMobilePrompt(spec: PropSpec, repoDir: string): string {
+  const patterns = MOBILE_PATTERN_FILES.map((f) => readPatternFile(repoDir, f)).join("\n\n");
+  return `You are adding a new configuration prop to the hyperswitch-client-core (ReScript mobile SDK) repository.
+
+Your current working directory IS the mobile repo: ${repoDir}
+You have Edit, Write, Read, Glob, and Grep tools.
+
+## Prop Specification
+
+- **Name**: ${spec.propName}
+- **Type**: ${spec.type}
+- **Default**: ${spec.default}
+- **Parent config**: ${spec.parentConfig || "configurationType"}
+- **Behavior**: ${spec.behavior}
+
+## How props are wired in this repo (FOLLOW THIS PATTERN EXACTLY)
+
+${patterns}
+
+## Instructions
+
+1. First use Glob/Grep to understand how existing config props flow through the codebase.
+2. Add the prop to \`configurationType\` in SdkTypes.res.
+3. Add parsing in \`parseConfigurationDict\` to extract from the native props dict.
+4. Add key mappings in NativeSdkPropsKeys.res for android, ios, and rn keys.
+5. Wire the prop into the component logic that controls the behavior described above.
+6. The prop flows: Native config → Bundle/Dict → SdkTypes.configurationType → NativePropContext → Components.
+7. Only touch files that are necessary.
+
+Important:
+- This is a ReScript codebase. Use ReScript syntax.
+- Follow the EXACT naming conventions used in this repo.
+- Look at how similar props (like hideExpiredPaymentMethods, displayDefaultSavedPaymentIcon) are wired.
+
+After implementing, output ONLY a JSON summary (no code fences):
+{"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what changed>"}], "backward_compatible": true, "notes": "<any caveats>"}`;
+}
+
+function buildAndroidPrompt(spec: PropSpec, repoDir: string): string {
+  const patterns = ANDROID_PATTERN_FILES.map((f) => readPatternFile(repoDir, f)).join("\n\n");
+  return `You are adding a new configuration prop to the Android native layer of hyperswitch-client-core.
+
+Your current working directory IS the mobile repo: ${repoDir}
+You have Edit, Write, Read, Glob, and Grep tools.
+
+## Prop Specification
+
+- **Name**: ${spec.propName}
+- **Type**: ${spec.type} (Kotlin equivalent: ${spec.type === "bool" ? "Boolean" : spec.type === "string" ? "String" : spec.type})
+- **Default**: ${spec.default}
+- **Behavior**: ${spec.behavior}
+
+## How Android native props are wired (FOLLOW THIS PATTERN EXACTLY)
+
+${patterns}
+
+## Instructions
+
+1. Add the prop to the \`Configuration\` data class in PaymentSheet.kt.
+2. Add Bundle serialization in the \`.bundle\` computed property.
+3. Ensure it's passed through in LaunchOptions.kt if needed.
+4. Follow the exact pattern of existing props like \`defaultBillingDetails\`, \`displayDefaultSavedPaymentIcon\`.
+5. Only touch Kotlin files in the android/ directory.
+
+After implementing, output ONLY a JSON summary (no code fences):
+{"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what changed>"}], "backward_compatible": true, "notes": "<any caveats>"}`;
+}
+
+function buildIosPrompt(spec: PropSpec, repoDir: string): string {
+  const patterns = IOS_PATTERN_FILES.map((f) => readPatternFile(repoDir, f)).join("\n\n");
+  return `You are adding a new configuration prop to the iOS native layer of hyperswitch-client-core.
+
+Your current working directory IS the mobile repo: ${repoDir}
+You have Edit, Write, Read, Glob, and Grep tools.
+
+## Prop Specification
+
+- **Name**: ${spec.propName}
+- **Type**: ${spec.type} (Swift equivalent: ${spec.type === "bool" ? "Bool" : spec.type === "string" ? "String" : spec.type})
+- **Default**: ${spec.default}
+- **Behavior**: ${spec.behavior}
+
+## How iOS native props are wired (FOLLOW THIS PATTERN EXACTLY)
+
+${patterns}
+
+## Instructions
+
+1. Add the prop to the \`Configuration\` struct in PaymentSheetConfiguration.swift.
+2. Add dictionary serialization in the \`toDictionary()\` method.
+3. Follow the exact pattern of existing props.
+4. Only touch Swift files in the ios/ directory.
+
+After implementing, output ONLY a JSON summary (no code fences):
+{"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what changed>"}], "backward_compatible": true, "notes": "<any caveats>"}`;
+}
+
+export async function runPropAgent(
+  repoKey: RepoKey,
+  slug: string,
+  spec: PropSpec,
+  buildPrompt: (spec: PropSpec, repoDir: string) => string,
+): Promise<SkillRepoResult> {
+  const repoDir = REPOS[repoKey].dir;
+  const git = simpleGit(repoDir);
+  const branchName = `feat/prop-${slug}`;
+
+  await git.raw(["checkout", "--force", "HEAD"]);
+  const defaultBranch = (await git.branch()).current || "main";
+
+  try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+  await git.checkoutLocalBranch(branchName);
+
+  const prompt = buildPrompt(spec, repoDir);
+  const summary = await ask(prompt, {
+    model: "opus",
+    timeoutMs: 600_000,
+    cwd: repoDir,
+    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+  });
+
+  const diff = await git.diff();
+  const diffStat = await git.diffSummary();
+
+  if (!diff || diffStat.files.length === 0) {
+    await git.checkout(defaultBranch);
+    try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+    throw new Error("Opus did not produce any file changes");
+  }
+
+  const patchPath = path.join(PATCHES_DIR, `prop-${slug}-${repoKey}.patch`);
+  fs.writeFileSync(patchPath, diff);
+
+  await git.add(".");
+  await git.commit(`feat: add ${spec.propName} prop\n\nGenerated by feature-gap-dashboard prop skill`);
+  await git.checkout(defaultBranch);
+
+  return {
+    repo: repoKey,
+    branch: branchName,
+    summary: summary.slice(0, 3000),
+    diff,
+    filesTouched: diffStat.files.length,
+  };
+}
+
+export async function runMobilePropAgent(
+  slug: string,
+  spec: PropSpec,
+  platforms: string[],
+): Promise<SkillRepoResult> {
+  const repoDir = REPOS.mobile.dir;
+  const git = simpleGit(repoDir);
+  const branchName = `feat/prop-${slug}`;
+
+  await git.raw(["checkout", "--force", "HEAD"]);
+  const defaultBranch = (await git.branch()).current || "main";
+
+  try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+  await git.checkoutLocalBranch(branchName);
+
+  const summaries: string[] = [];
+
+  if (platforms.includes("mobile")) {
+    const s = await ask(buildMobilePrompt(spec, repoDir), {
+      model: "opus", timeoutMs: 600_000, cwd: repoDir,
+      allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+    });
+    summaries.push(s);
+    await git.add(".");
+  }
+
+  if (platforms.includes("android_native")) {
+    const s = await ask(buildAndroidPrompt(spec, repoDir), {
+      model: "opus", timeoutMs: 600_000, cwd: repoDir,
+      allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+    });
+    summaries.push(s);
+    await git.add(".");
+  }
+
+  if (platforms.includes("ios_native")) {
+    const s = await ask(buildIosPrompt(spec, repoDir), {
+      model: "opus", timeoutMs: 600_000, cwd: repoDir,
+      allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+    });
+    summaries.push(s);
+    await git.add(".");
+  }
+
+  const diff = await git.diff(["HEAD"]);
+  const diffStat = await git.diffSummary(["HEAD"]);
+
+  if (!diff || diffStat.files.length === 0) {
+    await git.checkout(defaultBranch);
+    try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+    throw new Error("Opus did not produce any file changes");
+  }
+
+  const patchPath = path.join(PATCHES_DIR, `prop-${slug}-mobile.patch`);
+  fs.writeFileSync(patchPath, diff);
+
+  await git.add(".");
+  await git.commit(`feat: add ${spec.propName} prop (ReScript + native layers)\n\nGenerated by feature-gap-dashboard prop skill`);
+  await git.checkout(defaultBranch);
+
+  return {
+    repo: "mobile",
+    branch: branchName,
+    summary: summaries.join("\n---\n").slice(0, 5000),
+    diff,
+    filesTouched: diffStat.files.length,
+  };
+}
+
+/** Shared logic: run the prop agents and return results keyed by repo. */
+async function runProps(spec: PropSpec): Promise<{ propName: string; results: Record<string, SkillRepoResult> }> {
+  const slug = spec.propName
+    .replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 40).replace(/-$/, "");
+
+  const results: Record<string, SkillRepoResult> = {};
+  const webPlatforms = spec.platforms.filter((p) => p === "web");
+  const mobilePlatforms = spec.platforms.filter((p) =>
+    ["mobile", "android_native", "ios_native"].includes(p),
+  );
+
+  if (webPlatforms.length > 0) {
+    try {
+      results.web = await runPropAgent("web", slug, spec, buildWebPrompt);
+    } catch (err) {
+      results.web = { repo: "web", branch: "", summary: "", diff: "", filesTouched: 0, error: (err as Error).message };
+    }
+  }
+
+  if (mobilePlatforms.length > 0) {
+    try {
+      results.mobile = await runMobilePropAgent(slug, spec, mobilePlatforms);
+    } catch (err) {
+      results.mobile = { repo: "mobile", branch: "", summary: "", diff: "", filesTouched: 0, error: (err as Error).message };
+    }
+  }
+
+  return { propName: spec.propName, results };
+}
+
+/** Handler for legacy POST /props/generate — returns original shape. */
+export async function handlePropsRoute(req: Request, res: Response): Promise<void> {
+  const spec = req.body as PropSpec;
+  if (!spec.propName || !spec.behavior || !spec.platforms?.length) {
+    res.status(400).json({ error: "propName, behavior, and platforms are required" });
+    return;
+  }
+  const { propName, results } = await runProps(spec);
+  res.json({ propName, results });
+}
+
+/** Handler for POST /skills/props/generate — returns SkillEnvelope shape. */
+export async function handlePropsSkill(req: Request, res: Response): Promise<void> {
+  const spec = req.body as PropSpec;
+  if (!spec.propName || !spec.behavior || !spec.platforms?.length) {
+    res.status(400).json({ error: "propName, behavior, and platforms are required" });
+    return;
+  }
+  try {
+    const { propName, results } = await runProps(spec);
+    const hasError = Object.values(results).some((r) => r.error);
+    const allError = Object.values(results).every((r) => r.error);
+    const envelope: SkillEnvelope = {
+      skillId: "props",
+      status: allError ? "error" : hasError ? "partial" : "ok",
+      results,
+      meta: { propName },
+    };
+    res.json(envelope);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+}
+
+/** Handler for GET /props — list all prop patch files. */
+export function handlePropsList(_req: Request, res: Response): void {
+  try {
+    const files = fs.readdirSync(PATCHES_DIR).filter((f) => f.startsWith("prop-"));
+    res.json(files.map((f) => ({ file: f, path: path.join(PATCHES_DIR, f) })));
+  } catch {
+    res.json([]);
+  }
+}
