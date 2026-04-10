@@ -214,7 +214,7 @@ export async function runPropAgent(
 
   const prompt = buildPrompt(spec, repoDir);
   const summary = await ask(prompt, {
-    model: "opus",
+    model: "sonnet",
     timeoutMs: 600_000,
     cwd: repoDir,
     allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
@@ -226,7 +226,7 @@ export async function runPropAgent(
   if (!diff || diffStat.files.length === 0) {
     await git.checkout(defaultBranch);
     try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
-    throw new Error("Opus did not produce any file changes");
+    throw new Error("Agent did not produce any file changes");
   }
 
   const patchPath = path.join(PATCHES_DIR, `prop-${slug}-${repoKey}.patch`);
@@ -264,7 +264,7 @@ export async function runMobilePropAgent(
 
   if (platforms.includes("mobile")) {
     const s = await ask(buildMobilePrompt(spec, repoDir), {
-      model: "opus", timeoutMs: 600_000, cwd: repoDir,
+      model: "sonnet", timeoutMs: 600_000, cwd: repoDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
     });
     summaries.push(s);
@@ -273,7 +273,7 @@ export async function runMobilePropAgent(
 
   if (platforms.includes("android_native")) {
     const s = await ask(buildAndroidPrompt(spec, repoDir), {
-      model: "opus", timeoutMs: 600_000, cwd: repoDir,
+      model: "sonnet", timeoutMs: 600_000, cwd: repoDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
     });
     summaries.push(s);
@@ -282,7 +282,7 @@ export async function runMobilePropAgent(
 
   if (platforms.includes("ios_native")) {
     const s = await ask(buildIosPrompt(spec, repoDir), {
-      model: "opus", timeoutMs: 600_000, cwd: repoDir,
+      model: "sonnet", timeoutMs: 600_000, cwd: repoDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
     });
     summaries.push(s);
@@ -295,7 +295,7 @@ export async function runMobilePropAgent(
   if (!diff || diffStat.files.length === 0) {
     await git.checkout(defaultBranch);
     try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
-    throw new Error("Opus did not produce any file changes");
+    throw new Error("Agent did not produce any file changes");
   }
 
   const patchPath = path.join(PATCHES_DIR, `prop-${slug}-mobile.patch`);

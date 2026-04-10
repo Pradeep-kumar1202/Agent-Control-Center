@@ -82,7 +82,7 @@ export const SKILLS_REGISTRY: SkillConfig[] = [
   {
     id: "review",
     name: "PR Review",
-    description: "Opus-powered comprehensive PR review",
+    description: "Comprehensive AI-powered PR review",
     activeTabClass: "border-violet-500 text-violet-300",
     FormComponent: ReviewForm,
     ResultsComponent: ReviewResults,

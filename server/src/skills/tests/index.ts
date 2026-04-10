@@ -167,7 +167,7 @@ After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
   const summary = await ask(prompt, {
-    model: "opus",
+    model: "sonnet",
     timeoutMs: 600_000,
     cwd: repoDir,
     allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
@@ -281,7 +281,7 @@ After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
   const summary = await ask(prompt, {
-    model: "opus",
+    model: "sonnet",
     timeoutMs: 600_000,
     cwd: repoDir,
     allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],

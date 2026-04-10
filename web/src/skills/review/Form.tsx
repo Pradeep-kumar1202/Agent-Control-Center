@@ -40,7 +40,7 @@ export function ReviewForm({ onResult, onError }: SkillFormProps) {
     <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-6">
       <h2 className="text-lg font-semibold text-slate-100 mb-1">PR Reviewer</h2>
       <p className="text-sm text-slate-500 mb-6">
-        Provide a branch to review. Opus will do a comprehensive review covering correctness, patterns,
+        Provide a branch to review. The AI will do a comprehensive review covering correctness, patterns,
         test coverage, translations, type safety, security, and edge cases.
       </p>
 

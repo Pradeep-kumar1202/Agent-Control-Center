@@ -145,7 +145,7 @@ Example:
 {"what": "Added hideExpiredPaymentMethods config option", "files": [{"path": "src/types/SdkTypes.res", "change": "Added field to configurationType record, parsed from config dict (default: false)"}], "backward_compatible": true, "notes": "Defaults to false, existing integrations unaffected"}`;
 
     const summary = await ask(prompt, {
-      model: "opus",
+      model: "sonnet",
       timeoutMs: 600_000,
       cwd: targetDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],

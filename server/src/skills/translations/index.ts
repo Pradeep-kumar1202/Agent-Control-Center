@@ -113,7 +113,7 @@ Return ONLY the JSON object, no explanation:
 }`;
 
   return askJson<Record<string, string>>(prompt, {
-    model: "opus",
+    model: "sonnet",
     timeoutMs: 120_000,
   });
 }

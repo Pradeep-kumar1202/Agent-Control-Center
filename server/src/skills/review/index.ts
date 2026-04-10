@@ -267,7 +267,7 @@ async function reviewRepo(
   const prompt = buildReviewPrompt(repoName, repoKey, spec.branch, baseBranch, diff, stat);
 
   const reviewResult = await askJson<ReviewResult>(prompt, {
-    model: "opus",
+    model: "sonnet",
     timeoutMs: 300_000,
   });
 
