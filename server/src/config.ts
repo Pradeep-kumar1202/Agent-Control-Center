@@ -33,4 +33,4 @@ export const REPOS: Record<
 
 // LLM model selection — extraction is cheap, validation/patching is expensive.
 export const MODEL_EXTRACT = "sonnet";
-export const MODEL_REASON = "opus";
+export const MODEL_REASON = "sonnet";
