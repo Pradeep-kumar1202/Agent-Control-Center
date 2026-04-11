@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { getValidateCache, putValidateCache } from "../cache.js";
 import { MODEL_REASON, REPOS, type RepoKey } from "../config.js";
-import { db, type GapRow } from "../db.js";
+import { db, nowIso, type GapPrRow, type GapRow } from "../db.js";
 import { askJson } from "../llm.js";
 import { syncAllRepos } from "../workspace/repoManager.js";
 
@@ -192,3 +192,65 @@ function safeParse(s: string): unknown {
     return null;
   }
 }
+
+// ─── PR link routes ───────────────────────────────────────────────────────────
+
+/** GET /gap-prs — all PR links, returned as array */
+gapsRouter.get("/gap-prs", (_req, res) => {
+  const rows = db
+    .prepare(`SELECT * FROM gap_prs ORDER BY added_at ASC`)
+    .all() as GapPrRow[];
+  res.json(rows);
+});
+
+/** POST /gaps/:id/pr — attach a PR URL to a gap */
+gapsRouter.post("/gaps/:id/pr", (req, res) => {
+  const gapId = Number(req.params.id);
+  if (!Number.isFinite(gapId)) {
+    return res.status(400).json({ error: "bad id" });
+  }
+
+  const gap = db.prepare(`SELECT * FROM gaps WHERE id = ?`).get(gapId) as
+    | GapRow
+    | undefined;
+  if (!gap) return res.status(404).json({ error: "gap not found" });
+
+  const { pr_url } = req.body as { pr_url?: string };
+  if (!pr_url || !pr_url.startsWith("http")) {
+    return res.status(400).json({ error: "pr_url must be a valid URL" });
+  }
+
+  // Deduplicate: don't add the same URL twice for the same gap identity
+  const existing = db
+    .prepare(
+      `SELECT id FROM gap_prs
+       WHERE canonical_name = ? AND category = ? AND missing_in = ? AND pr_url = ?`,
+    )
+    .get(gap.canonical_name, gap.category, gap.missing_in, pr_url);
+  if (existing) {
+    return res.status(409).json({ error: "PR already linked to this gap" });
+  }
+
+  const info = db
+    .prepare(
+      `INSERT INTO gap_prs (canonical_name, category, missing_in, pr_url, added_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(gap.canonical_name, gap.category, gap.missing_in, pr_url, nowIso());
+
+  const row = db
+    .prepare(`SELECT * FROM gap_prs WHERE id = ?`)
+    .get(info.lastInsertRowid) as GapPrRow;
+  res.status(201).json(row);
+});
+
+/** DELETE /gap-prs/:prId — remove a PR link */
+gapsRouter.delete("/gap-prs/:prId", (req, res) => {
+  const prId = Number(req.params.prId);
+  if (!Number.isFinite(prId)) {
+    return res.status(400).json({ error: "bad id" });
+  }
+  const info = db.prepare(`DELETE FROM gap_prs WHERE id = ?`).run(prId);
+  if (info.changes === 0) return res.status(404).json({ error: "not found" });
+  res.json({ deleted: true });
+});

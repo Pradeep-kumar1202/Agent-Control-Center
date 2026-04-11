@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Gap, type PatchResponse, type PatchRow, type Report } from "./api";
+import { api, type Gap, type GapPrRow, type PatchResponse, type PatchRow, type Report } from "./api";
 import { DiffViewer } from "./components/DiffViewer";
 import { GapTable } from "./components/GapTable";
+import { PreviewDrawer } from "./components/PreviewDrawer";
 import { RunButton } from "./components/RunButton";
 import { SourceViewer } from "./components/SourceViewer";
 import { SKILLS_REGISTRY, type SkillEnvelopeClient } from "./skills/registry";
+import { ReviewHistory } from "./skills/review/History";
 
 type StatusFilter = "all" | "verified" | "unverified" | "platform_specific" | "patched";
 
@@ -18,6 +20,9 @@ function patchRowToResponse(p: PatchRow): PatchResponse {
     diff: p.diff ?? "",
     buildStatus: (p.build_status as PatchResponse["buildStatus"]) ?? undefined,
     buildLog: p.build_log ?? undefined,
+    prUrl: p.pr_url ?? null,
+    prNumber: p.pr_number ?? null,
+    prWarning: p.pr_warning ?? null,
   };
 }
 
@@ -38,6 +43,12 @@ export default function App() {
     gapName: string;
   } | null>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
+  const [activePreview, setActivePreview] = useState<{
+    repoKey: "web" | "mobile";
+    branch: string;
+    prUrl?: string | null;
+    prWarning?: string | null;
+  } | null>(null);
   const [verifyAllProgress, setVerifyAllProgress] = useState<{
     current: number;
     total: number;
@@ -45,6 +56,8 @@ export default function App() {
   } | null>(null);
   const [activeTab, setActiveTab] = useState<string>("gaps");
   const [skillResults, setSkillResults] = useState<Map<string, SkillEnvelopeClient>>(new Map());
+  /** Map from "canonical_name:category:missing_in" → linked PR rows */
+  const [gapPrs, setGapPrs] = useState<Map<string, GapPrRow[]>>(new Map());
   const verifyAllAbort = useRef(false);
   const pollTimer = useRef<number | null>(null);
 
@@ -53,10 +66,21 @@ export default function App() {
       const latest = await api.latestReport();
       setReport(latest);
       if (latest && latest.status === "done") {
-        const [list, patches] = await Promise.all([
+        const [list, patches, prRows] = await Promise.all([
           api.gaps(latest.id),
           api.listPatches(),
+          api.listGapPrs(),
         ]);
+
+        // Build PR map keyed by identity triple (stable across re-runs)
+        const prMap = new Map<string, GapPrRow[]>();
+        for (const pr of prRows) {
+          const key = `${pr.canonical_name}:${pr.category}:${pr.missing_in}`;
+          const arr = prMap.get(key) ?? [];
+          arr.push(pr);
+          prMap.set(key, arr);
+        }
+        setGapPrs(prMap);
         setGaps(list);
 
         // Match patches to current gaps by (canonical_name, category, missing_in)
@@ -284,6 +308,32 @@ export default function App() {
     verifyAllAbort.current = true;
   };
 
+  const onAddPr = async (gapId: number, prUrl: string) => {
+    const newRow = await api.addGapPr(gapId, prUrl);
+    const key = `${newRow.canonical_name}:${newRow.category}:${newRow.missing_in}`;
+    setGapPrs((prev) => {
+      const next = new Map(prev);
+      const arr = [...(next.get(key) ?? []), newRow];
+      next.set(key, arr);
+      return next;
+    });
+  };
+
+  const onRemovePr = async (prId: number, _gapId: number) => {
+    await api.removeGapPr(prId);
+    setGapPrs((prev) => {
+      const next = new Map(prev);
+      for (const [key, prs] of next) {
+        const filtered = prs.filter((p) => p.id !== prId);
+        if (filtered.length !== prs.length) {
+          next.set(key, filtered);
+          break;
+        }
+      }
+      return next;
+    });
+  };
+
   // Payment methods are loaded dynamically from backend responses in the
   // mobile SDK, so static extraction always flags them as missing even when
   // they aren't. Hide them by default; user can opt back in with the toggle.
@@ -323,7 +373,7 @@ export default function App() {
     <div className="min-h-screen p-8 max-w-6xl mx-auto">
       <header className="mb-6">
         <h1 className="text-3xl font-bold tracking-tight">
-          Agent Control Center
+          Agent Orchestrator
         </h1>
         <p className="text-slate-400 mt-1">
           hyperswitch-web ↔ hyperswitch-client-core
@@ -354,6 +404,17 @@ export default function App() {
               {skill.name}
             </button>
           ))}
+          <button
+            onClick={() => setActiveTab("review-history")}
+            className={
+              "px-4 py-2 text-sm font-medium border-b-2 transition " +
+              (activeTab === "review-history"
+                ? "border-violet-400 text-violet-300"
+                : "border-transparent text-slate-500 hover:text-slate-300")
+            }
+          >
+            Review History
+          </button>
         </div>
       </header>
 
@@ -382,6 +443,18 @@ export default function App() {
           </div>
         );
       })}
+
+      {activeTab === "review-history" && (
+        <div className="mt-2">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold">Review History</h2>
+            <p className="text-slate-400 text-sm mt-0.5">
+              All past PR reviews. Click any row to reopen the full analysis.
+            </p>
+          </div>
+          <ReviewHistory />
+        </div>
+      )}
 
       {activeTab === "gaps" && (<>
       <section className="rounded-xl border border-slate-800 bg-slate-900/50 p-6 mb-6">
@@ -521,9 +594,26 @@ export default function App() {
             patching={patching}
             patchedGaps={patchedGaps}
             patchBuildStatus={patchBuildStatus}
+            patchBranches={
+              new Map(
+                Array.from(patchData.entries()).map(([id, p]) => [id, p.branch]),
+              )
+            }
+            gapPrs={gapPrs}
             onVerify={onVerifyGap}
             onPatch={onPatchGap}
             onViewSource={(g) => setActiveSourceGap(g)}
+            onAddPr={onAddPr}
+            onRemovePr={onRemovePr}
+            onOpenPreview={(repoKey, branch, gapId) => {
+              const p = gapId != null ? patchData.get(gapId) : undefined;
+              setActivePreview({
+                repoKey,
+                branch,
+                prUrl: p?.prUrl ?? null,
+                prWarning: p?.prWarning ?? null,
+              });
+            }}
           />
         </>
       )}
@@ -533,6 +623,16 @@ export default function App() {
           patch={activePatch.patch}
           gapName={activePatch.gapName}
           onClose={() => setActivePatch(null)}
+        />
+      )}
+
+      {activePreview && (
+        <PreviewDrawer
+          repoKey={activePreview.repoKey}
+          branch={activePreview.branch}
+          prUrl={activePreview.prUrl}
+          prWarning={activePreview.prWarning}
+          onClose={() => setActivePreview(null)}
         />
       )}
 

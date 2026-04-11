@@ -5,8 +5,11 @@ import { db } from "./db.js";
 import { analyzeRouter } from "./routes/analyze.js";
 import { gapsRouter } from "./routes/gaps.js";
 import { patchesRouter } from "./routes/patches.js";
+import { previewRouter } from "./routes/preview.js";
 import { propsRouter } from "./routes/props.js";
+import { reviewsRouter } from "./routes/reviews.js";
 import { skillsRouter } from "./routes/skills.js";
+import { stopAllPreviews } from "./skills/previewManager.js";
 
 const app = express();
 app.use(cors());
@@ -24,9 +27,28 @@ app.get("/health", (_req, res) => {
 app.use(analyzeRouter);
 app.use(gapsRouter);
 app.use(patchesRouter);
-app.use(propsRouter);   // legacy /props/generate (backward compat)
-app.use(skillsRouter);  // /skills/* (new unified endpoint)
+app.use(previewRouter);  // /preview/* (dev-server lifecycle for demo videos)
+app.use(propsRouter);    // legacy /props/generate (backward compat)
+app.use(reviewsRouter);  // /reviews/* (review history)
+app.use(skillsRouter);   // /skills/* (new unified endpoint)
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);
 });
+
+// Tear down any running dev-server previews when the dashboard exits, so
+// webpack workers / gradle daemons don't outlive us and squat on ports.
+async function shutdown(signal: string): Promise<void> {
+  console.log(`[server] ${signal} received — stopping previews`);
+  try {
+    await stopAllPreviews();
+  } catch (err) {
+    console.error("[server] error stopping previews:", err);
+  }
+  server.close(() => process.exit(0));
+  // Hard exit if close hangs
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

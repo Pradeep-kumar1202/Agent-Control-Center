@@ -163,23 +163,45 @@ export function DiffViewer({ patch, gapName, onClose }: Props) {
               Copy
             </button>
           </div>
-          <div className="flex items-center gap-3">
-            <span className="text-xs text-slate-500">PR ready:</span>
-            <span className="flex-1 text-xs text-slate-500">
-              Title + description with summary, changes, and test plan
-            </span>
-            <button
-              onClick={onCopyPr}
-              className={
-                "rounded border px-3 py-1.5 text-xs transition " +
-                (copiedPr
-                  ? "border-emerald-500 text-emerald-300 bg-emerald-500/10"
-                  : "border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500")
-              }
-            >
-              {copiedPr ? "Copied!" : "Copy PR Description"}
-            </button>
-          </div>
+          {patch.prUrl ? (
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-slate-500">Pull request:</span>
+              <a
+                href={patch.prUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 truncate text-xs text-emerald-300 hover:text-emerald-200 underline underline-offset-2"
+              >
+                {patch.prUrl}
+              </a>
+              <a
+                href={patch.prUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="rounded border border-emerald-600 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition"
+              >
+                Open PR ↗
+              </a>
+            </div>
+          ) : (
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-slate-500">PR:</span>
+              <span className="flex-1 text-xs text-amber-400/80 truncate">
+                {patch.prWarning ?? "not opened — copy the description below to open one manually"}
+              </span>
+              <button
+                onClick={onCopyPr}
+                className={
+                  "rounded border px-3 py-1.5 text-xs transition " +
+                  (copiedPr
+                    ? "border-emerald-500 text-emerald-300 bg-emerald-500/10"
+                    : "border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500")
+                }
+              >
+                {copiedPr ? "Copied!" : "Copy PR Description"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>

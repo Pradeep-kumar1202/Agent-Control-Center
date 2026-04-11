@@ -19,7 +19,10 @@ import path from "node:path";
 import simpleGit from "simple-git";
 import { REPOS } from "../../config.js";
 import { askJson } from "../../llm.js";
+import { validateTranslations, type TranslationQualityIssue } from "../../agents/validators.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
+import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../submoduleGit.js";
+import { runRescriptBuild } from "../buildCheck.js";
 
 export interface TranslationSpec {
   keyName: string;
@@ -87,7 +90,10 @@ function insertKeyIntoLocaleFile(filePath: string, keyName: string, value: strin
   return true;
 }
 
-async function translateKey(spec: TranslationSpec, nonEnglishLangs: string[]): Promise<Record<string, string>> {
+async function translateKey(
+  spec: TranslationSpec,
+  nonEnglishLangs: string[],
+): Promise<Record<string, string>> {
   const prompt = `Translate the following UI string into the specified languages.
 Return ONLY a flat JSON object with language codes as keys and translated strings as values.
 
@@ -98,12 +104,13 @@ Context (where this text is used): ${spec.context}
 Target languages (use EXACTLY these codes as JSON keys):
 ${nonEnglishLangs.join(", ")}
 
-Important translation notes:
+Translation requirements:
 - For RTL languages (ar, he): translate naturally, do not add directional markers
 - For regional variants (en-GB, fr-BE, nl-BE, tr-CY): use appropriate regional spellings/vocabulary
 - Keep UI terminology consistent with payment/checkout contexts (card, payment, checkout, etc.)
-- Preserve any {placeholder} tokens if present in the English string
-- Keep translations concise — this is UI text
+- Preserve any {placeholder} tokens (e.g. {amount}, {name}) EXACTLY as-is in every language
+- Keep translations concise — this is UI text, not documentation
+- Every language MUST have a non-empty translation; do not leave any blank
 
 Return ONLY the JSON object, no explanation:
 {
@@ -116,6 +123,72 @@ Return ONLY the JSON object, no explanation:
     model: "opus",
     timeoutMs: 120_000,
   });
+}
+
+/**
+ * Back-translation quality check — translates 5 key languages back to English
+ * and reports any that diverge semantically from the source string.
+ * One extra LLM call, but it catches meaning-drift before writing to disk.
+ */
+async function backTranslateVerify(
+  translations: Record<string, string>,
+  englishValue: string,
+): Promise<{ warnings: string[] }> {
+  // Pick 5 diverse languages for spot-check
+  const checkLangs = ["de", "fr", "ja", "ar", "es"].filter(
+    (l) => translations[l],
+  );
+  if (checkLangs.length === 0) return { warnings: [] };
+
+  const samples = checkLangs
+    .map((l) => `${l}: "${translations[l]}"`)
+    .join("\n");
+
+  const prompt = `You are checking translation quality for a payment UI.
+
+Original English: "${englishValue}"
+
+These are translations of the same string. For each one, translate it BACK to English
+and assess whether the meaning is preserved.
+
+${samples}
+
+Return ONLY JSON:
+{
+  "results": [
+    {
+      "locale": "de",
+      "backTranslation": "<English translation of the German>",
+      "semanticMatch": true,
+      "warning": null
+    }
+  ]
+}
+
+Set semanticMatch: false and provide a warning if the back-translation has a meaningfully
+different meaning from "${englishValue}" (not just different word choice — actual semantic drift).`;
+
+  try {
+    const result = await askJson<{
+      results: Array<{
+        locale: string;
+        backTranslation: string;
+        semanticMatch: boolean;
+        warning: string | null;
+      }>;
+    }>(prompt, { model: "sonnet", timeoutMs: 60_000 });
+
+    const warnings = (result.results ?? [])
+      .filter((r) => !r.semanticMatch && r.warning)
+      .map(
+        (r) =>
+          `[${r.locale}] Semantic drift detected: "${r.backTranslation}" ← expected meaning of "${englishValue}". ${r.warning}`,
+      );
+
+    return { warnings };
+  } catch {
+    return { warnings: [] };
+  }
 }
 
 async function processRepo(
@@ -133,6 +206,8 @@ async function processRepo(
     throw new Error(`No locale files found at ${path.join(repoDir, LOCALES_SUBPATH)}`);
   }
 
+  // Reset submodules to clean state before branching
+  await resetSubmodules(repoDir, repoKey);
   await git.raw(["checkout", "--force", "HEAD"]);
   const defaultBranch = (await git.branch()).current || "main";
   try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
@@ -149,19 +224,30 @@ async function processRepo(
   }
 
   if (filesModified === 0) {
-    await git.checkout(defaultBranch);
+    await forceCheckoutBranch(repoDir, repoKey, defaultBranch);
     try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
     throw new Error(`Key "${spec.keyName}" already exists in all locale files`);
   }
 
-  const diff = await git.diff();
-  const diffStat = await git.diffSummary();
+  // Locale files live inside the shared-code submodule — use submodule-aware
+  // git operations to stage, diff, and commit properly.
+  const { diff, fileCount } = await getDiffWithSubmodules(repoDir, repoKey);
 
-  await git.add(LOCALES_SUBPATH);
-  await git.commit(
-    `i18n: add "${spec.keyName}" translation key (${filesModified} locales)\n\nGenerated by feature-gap-dashboard translator skill`,
-  );
-  await git.checkout(defaultBranch);
+  // Mandatory ReScript build check before committing. Locale JSON edits
+  // shouldn't break the ReScript build, but we run it across the board so
+  // every skill obeys the same "must compile or get rejected" rule.
+  const build = runRescriptBuild(repoDir);
+  if (!build.passed) {
+    await forceCheckoutBranch(repoDir, repoKey, defaultBranch);
+    try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+    throw new Error(
+      `ReScript build failed in ${repoKey} after locale insert — translation rejected. Build output (tail):\n${build.log}`,
+    );
+  }
+
+  const commitMsg = `i18n: add "${spec.keyName}" translation key (${filesModified} locales)\n\nGenerated by feature-gap-dashboard translator skill`;
+  await commitWithSubmodules(repoDir, repoKey, commitMsg);
+  await forceCheckoutBranch(repoDir, repoKey, defaultBranch);
 
   // Build a compact summary showing key + a few sample translations
   const sampleLangs = ["de", "fr", "es", "ja", "ar"].filter((l) => translations[l]);
@@ -179,7 +265,7 @@ async function processRepo(
     branch: branchName,
     summary,
     diff,
-    filesTouched: diffStat.files.length,
+    filesTouched: fileCount,
   };
 }
 
@@ -209,18 +295,47 @@ export async function handleTranslationsSkill(req: Request, res: Response): Prom
       return;
     }
 
-    // Phase 2: Insert into both repos (deterministic, no LLM)
-    const results: Record<string, SkillRepoResult> = {};
+    // Phase 1b: Deterministic quality checks (zero tokens)
+    const qualityIssues: TranslationQualityIssue[] = validateTranslations(
+      translations,
+      spec.englishValue,
+    );
 
-    for (const repoKey of ["web", "mobile"] as const) {
-      try {
-        results[repoKey] = await processRepo(repoKey, spec, translations);
-      } catch (err) {
-        results[repoKey] = {
-          repo: repoKey, branch: "", summary: "", diff: "", filesTouched: 0,
-          error: (err as Error).message,
-        };
-      }
+    // Blocking: empty translations must be caught before writing to disk.
+    // Other issues (too_long, leaked English) are warnings — still write but surface to user.
+    const blockingIssues = qualityIssues.filter((i) => i.type === "empty");
+    if (blockingIssues.length > 0) {
+      res.status(422).json({
+        error: "Translation quality check failed — empty translations detected",
+        qualityIssues: blockingIssues,
+      });
+      return;
+    }
+
+    // Phase 1c: Back-translation spot-check (1 cheap Sonnet call, parallel with Phase 2)
+    const [backTranslationResult, ...repoResults] = await Promise.all([
+      backTranslateVerify(translations, spec.englishValue),
+      // Phase 2: Insert into both repos in parallel (deterministic, no LLM)
+      ...["web", "mobile"].map(async (key) => {
+        const repoKey = key as "web" | "mobile";
+        try {
+          return { key: repoKey, result: await processRepo(repoKey, spec, translations) };
+        } catch (err) {
+          return {
+            key: repoKey,
+            result: {
+              repo: repoKey, branch: "", summary: "", diff: "", filesTouched: 0,
+              error: (err as Error).message,
+            } as SkillRepoResult,
+          };
+        }
+      }),
+    ]);
+
+    const results: Record<string, SkillRepoResult> = {};
+    for (const r of repoResults) {
+      results[(r as { key: string; result: SkillRepoResult }).key] =
+        (r as { key: string; result: SkillRepoResult }).result;
     }
 
     const hasError = Object.values(results).some((r) => r.error);
@@ -234,6 +349,9 @@ export async function handleTranslationsSkill(req: Request, res: Response): Prom
         englishValue: spec.englishValue,
         allTranslations: { en: spec.englishValue, ...translations },
         rtlLangs: nonEnglishLangs.filter((l) => RTL_LANGS.has(l)),
+        // Quality signals — surfaced in UI, not blocking (unless empty)
+        qualityIssues,
+        backTranslationWarnings: (backTranslationResult as { warnings: string[] }).warnings,
       },
     };
     res.json(envelope);
