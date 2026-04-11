@@ -52,6 +52,9 @@ export interface PatchResponse {
   diff: string;
   buildStatus?: "pass" | "fail" | "skipped";
   buildLog?: string;
+  prUrl?: string | null;
+  prNumber?: number | null;
+  prWarning?: string | null;
 }
 
 export interface PatchRow {
@@ -67,6 +70,9 @@ export interface PatchRow {
   diff?: string;
   build_status?: "pass" | "fail" | "skipped" | null;
   build_log?: string | null;
+  pr_url?: string | null;
+  pr_number?: number | null;
+  pr_warning?: string | null;
   // Enriched from JOIN with gaps table
   canonical_name?: string;
   category?: string;
@@ -80,7 +86,19 @@ export interface Health {
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init);
-  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  if (!r.ok) {
+    // Surface the server's error body when present so the UI shows
+    // "build failed: <ReScript error>" instead of an opaque HTTP code.
+    let detail = "";
+    try {
+      const body = await r.json();
+      if (body && typeof body === "object") {
+        if (typeof body.error === "string") detail = body.error;
+        else detail = JSON.stringify(body).slice(0, 300);
+      }
+    } catch { /* body wasn't JSON */ }
+    throw new Error(detail ? `${r.status}: ${detail}` : `${url} → ${r.status}`);
+  }
   return r.json() as Promise<T>;
 }
 
@@ -137,7 +155,61 @@ export const api = {
     skillPost<SkillEnvelope>("translations", spec),
   generateReview: (spec: ReviewSpec) =>
     skillPost<SkillEnvelope>("review", spec),
+  listGapPrs: () => jsonFetch<GapPrRow[]>(`${BASE}/gap-prs`),
+  addGapPr: (gapId: number, prUrl: string) =>
+    jsonFetch<GapPrRow>(`${BASE}/gaps/${gapId}/pr`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pr_url: prUrl }),
+    }),
+  removeGapPr: (prId: number) =>
+    jsonFetch<{ deleted: boolean }>(`${BASE}/gap-prs/${prId}`, {
+      method: "DELETE",
+    }),
+  listReviews: () => jsonFetch<ReviewHistoryRow[]>(`${BASE}/reviews`),
+  getReview: (id: number) => jsonFetch<ReviewHistoryRow>(`${BASE}/reviews/${id}`),
+  deleteReview: (id: number) =>
+    jsonFetch<{ deleted: boolean }>(`${BASE}/reviews/${id}`, { method: "DELETE" }),
+  // Preview lifecycle (demo videos)
+  startPreview: (repoKey: "web" | "mobile", branch: string, kind: PreviewKind) =>
+    jsonFetch<PreviewState>(`${BASE}/preview/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoKey, branch, kind }),
+    }),
+  stopPreview: (repoKey: "web" | "mobile") =>
+    jsonFetch<{ stopped: boolean; state: PreviewState | null }>(
+      `${BASE}/preview/stop`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoKey }),
+      },
+    ),
+  getPreview: (repoKey: "web" | "mobile") =>
+    jsonFetch<PreviewState | null>(`${BASE}/preview/${repoKey}`),
+  getPreviewLogs: (repoKey: "web" | "mobile", since = 0) =>
+    jsonFetch<{ lines: string[]; total: number }>(
+      `${BASE}/preview/${repoKey}/logs?since=${since}`,
+    ),
 };
+
+// ─── Preview manager types ───────────────────────────────────────────────────
+
+export type PreviewKind = "web-dev" | "android-emulator";
+export type PreviewStatus = "starting" | "ready" | "failed" | "stopped";
+
+export interface PreviewState {
+  repoKey: "web" | "mobile";
+  kind: PreviewKind;
+  branch: string;
+  status: PreviewStatus;
+  url?: string;
+  pid?: number;
+  startedAt: number;
+  readyAt?: number;
+  error?: string;
+}
 
 export interface PropSpec {
   propName: string;
@@ -197,4 +269,24 @@ export interface ReviewSpec {
   branch: string;
   baseBranch?: string;
   repo: "web" | "mobile" | "both";
+}
+
+export interface GapPrRow {
+  id: number;
+  canonical_name: string;
+  category: string;
+  missing_in: string;
+  pr_url: string;
+  added_at: string;
+}
+
+export interface ReviewHistoryRow {
+  id: number;
+  branch: string;
+  base_branch: string;
+  repo: string;
+  verdict: "approve" | "request_changes" | "comment" | "error";
+  reviewed_at: string;
+  /** Only present on GET /reviews/:id */
+  result_json?: string;
 }

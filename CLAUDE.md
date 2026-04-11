@@ -26,7 +26,7 @@ Every proposal must be checked against all four:
 1. **No API key.** Max plan only. Everything goes through `claude -p` subprocess.
 2. **No false positives.** Quality is non-negotiable. A real gap buried in noise is worse than a smaller, trustworthy list.
 3. **No token waste.** No bulk Opus+tools passes. Prefer deterministic filtering, cache hits, and on-demand escalation.
-4. **Local-only, shared machine.** No credentials on disk, no GitHub push. Patches are local branches + diff files. **Do not write project context to `~/.claude` — this machine is shared.** All persistent project context goes in this repo (CLAUDE.md, LEARNINGS.md).
+4. **Shared machine, scoped credentials only.** This box is shared across the team — never write per-user credentials, never write project context to `~/.claude`. All persistent project context goes in this repo (CLAUDE.md, LEARNINGS.md). **GitHub push is now allowed via the shared `pradeep120230-creator` bot account only**, authenticated via `gh auth login` (token in `~/.config/gh/hosts.yml`, marked as `keyring`). The patches route uses this to push feature branches to bot forks under `pradeep120230-creator/sdk-agent-*` and open PRs against `juspay/*`. See LEARNINGS.md iteration 5 for the full story. **Do not** generate per-user PATs, do not write tokens into the repo, do not push from any account other than the bot.
 
 ## Known truths about the repos
 

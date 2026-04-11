@@ -64,6 +64,37 @@ db.exec(`
   );
 `);
 
+// PR links table — keyed by (canonical_name, category, missing_in), NOT gap_id,
+// because gap IDs are reassigned on every re-run while the identity triple is stable.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS gap_prs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_name TEXT NOT NULL,
+    category       TEXT NOT NULL,
+    missing_in     TEXT NOT NULL,
+    pr_url         TEXT NOT NULL,
+    added_at       TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_gap_prs_identity
+    ON gap_prs(canonical_name, category, missing_in);
+`);
+
+// Review history table — added as a separate exec so existing DBs get it
+// automatically without needing a full schema drop.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reviews (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch      TEXT NOT NULL,
+    base_branch TEXT NOT NULL DEFAULT 'main',
+    repo        TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_reviews_branch ON reviews(branch);
+  CREATE INDEX IF NOT EXISTS idx_reviews_at ON reviews(reviewed_at DESC);
+`);
+
 // Migrate existing DBs that predate the verified column.
 try {
   db.exec(`ALTER TABLE gaps ADD COLUMN verified INTEGER NOT NULL DEFAULT 0`);
@@ -77,6 +108,18 @@ try {
 } catch { /* already exists */ }
 try {
   db.exec(`ALTER TABLE patches ADD COLUMN build_log TEXT`);
+} catch { /* already exists */ }
+
+// Migrate: add PR fields. Set when the patches route successfully pushes the
+// branch to the bot fork and opens a PR via gh.
+try {
+  db.exec(`ALTER TABLE patches ADD COLUMN pr_url TEXT`);
+} catch { /* already exists */ }
+try {
+  db.exec(`ALTER TABLE patches ADD COLUMN pr_number INTEGER`);
+} catch { /* already exists */ }
+try {
+  db.exec(`ALTER TABLE patches ADD COLUMN pr_warning TEXT`);
 } catch { /* already exists */ }
 
 export function nowIso(): string {
@@ -118,4 +161,42 @@ export type PatchRow = {
   created_at: string;
   build_status: "pass" | "fail" | "skipped" | null;
   build_log: string | null;
+  pr_url: string | null;
+  pr_number: number | null;
+  pr_warning: string | null;
 };
+
+export type ReviewRow = {
+  id: number;
+  branch: string;
+  base_branch: string;
+  repo: string;
+  verdict: "approve" | "request_changes" | "comment" | "error";
+  result_json: string;
+  reviewed_at: string;
+};
+
+export type GapPrRow = {
+  id: number;
+  canonical_name: string;
+  category: string;
+  missing_in: string;
+  pr_url: string;
+  added_at: string;
+};
+
+/** Persist a completed review to the database and return its new row ID. */
+export function saveReview(
+  branch: string,
+  baseBranch: string,
+  repo: string,
+  verdict: ReviewRow["verdict"],
+  resultJson: string,
+): number {
+  const stmt = db.prepare(`
+    INSERT INTO reviews (branch, base_branch, repo, verdict, result_json, reviewed_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const info = stmt.run(branch, baseBranch, repo, verdict, resultJson, nowIso());
+  return info.lastInsertRowid as number;
+}

@@ -1,11 +1,13 @@
 import { Router } from "express";
-import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../config.js";
 import { db, nowIso, type GapRow } from "../db.js";
 import { ask } from "../llm.js";
 import simpleGit from "simple-git";
+import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../skills/submoduleGit.js";
+import { runRescriptBuild } from "../skills/buildCheck.js";
+import { pushBranchToFork, createPullRequest, formatPrBody, pushSubmoduleToFork, rewriteGitmodulesToForks } from "../skills/githubPr.js";
 
 export const patchesRouter = Router();
 
@@ -79,9 +81,16 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
       .replace(/-$/, "");
     const branchName = `feat/gap-${gapId}-${slug}`;
 
-    // Ensure clean working tree
-    await git.raw(["checkout", "--force", "HEAD"]);
-    const defaultBranch = (await git.branch()).current || "main";
+    // Always start fresh from main, regardless of what branch the workspace
+    // happens to be on. Reading "current branch" was a bug — if a previous
+    // failed run left the workspace stuck on a feature branch, the next
+    // patch would be built on top of stale state and the same cleanup path
+    // would re-strand it. main is the only safe ground truth.
+    const defaultBranch = "main";
+
+    // Ensure clean working tree (including submodules) and pin to main.
+    await resetSubmodules(targetDir, targetRepo);
+    await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
 
     // Delete old branch if it exists (from a previous failed attempt)
     try {
@@ -105,7 +114,7 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
     const prompt = `You are implementing a missing feature in the ${repoLabel} repository.
 
 Your current working directory IS the ${targetRepo} repo: ${targetDir}
-You have Edit, Write, Read, Glob, and Grep tools.
+You have Edit, Write, Read, Glob, Grep, and Bash tools.
 
 ## Feature to implement
 
@@ -123,7 +132,7 @@ File: ${sourceFile ?? "unknown"}
 ${sourceContext || "(no source context available)"}
 \`\`\`
 
-## Instructions
+## Instructions — read every step before starting
 
 1. First use Glob and Grep to understand the existing code structure and conventions in THIS repo.
 2. Find the right location to add the feature — follow the repo's existing patterns.
@@ -132,32 +141,67 @@ ${sourceContext || "(no source context available)"}
 5. Do NOT add tests unless the repo has an existing test pattern for similar features.
 6. Keep the implementation minimal but functional.
 
-Important:
-- This is a ${targetRepo === "web" ? "ReScript" : "ReScript"} codebase.
+## ⛔ HARD REQUIREMENT — the task is NOT done until the build is green
+
+This is a ReScript codebase. Type errors and missing-binding errors are common — you MUST verify your edits compile. The server runs the same build check on the back end and will REJECT a patch with build errors, wasting the entire run.
+
+After every meaningful edit (or batch of related edits), run:
+
+\`\`\`bash
+npm run --silent re:build 2>&1
+\`\`\`
+
+When you call the Bash tool, **pass \`timeout: 240000\`** (240 seconds) — the default 2-minute Bash timeout is too short for a cold ReScript build in this repo.
+
+Then:
+- **If the build succeeds** (no error lines, exit code 0): you may produce the JSON summary and stop.
+- **If the build fails**: read the compiler output carefully. ReScript errors are precise — they cite the file, line, column, and the exact type mismatch or missing module. **Fix the issue and re-run the build.** Do not guess; the compiler tells you what's wrong.
+
+You have a budget of **up to 5 build attempts** within this single run. Common iteration loop:
+  edit → \`npm run --silent re:build 2>&1\` → read error → edit → build → ... → green → done.
+
+Do not output the JSON summary until \`npm run --silent re:build\` exits 0.
+
+If after 5 attempts you still cannot make it compile, do NOT pretend it works. Output the JSON summary with the field \`build_status: "failed_after_retries"\` and put the last build error tail in \`notes\`. The server will reject it but at least we'll see what went wrong.
+
+## ReScript-specific gotchas
+
+- Adding a field to a record type means **every constructor of that record** must include the new field. Use Grep to find all the places that build the record.
+- Optional fields are \`option<T>\` and constructed with \`Some(x)\` / \`None\`. Don't write \`undefined\` or \`null\`.
+- New modules need an entry in the source tree that ReScript already includes (check \`bsconfig.json\` / \`rescript.json\` includes).
+- Pattern matches must be exhaustive — adding a variant means updating every \`switch\`.
+
+## Naming and integration
+
 - Follow the naming conventions already used in this repo.
 - If the feature requires backend API integration, add the API call structure but use placeholder endpoints matching the repo's existing patterns.
 
-After implementing, output ONLY a JSON summary (no code fences, no extra text) in this exact format:
+## Output format
 
-{"what": "<one-line description of the feature added>", "files": [{"path": "<relative file path>", "change": "<brief description of what changed in this file>"}], "backward_compatible": true, "notes": "<optional: any caveats, defaults, or integration notes>"}
+After the build is green, output ONLY a JSON summary (no code fences, no extra text) in this exact format:
+
+{"what": "<one-line description of the feature added>", "files": [{"path": "<relative file path>", "change": "<brief description of what changed in this file>"}], "backward_compatible": true, "build_status": "passed", "build_attempts": <number>, "notes": "<optional: any caveats, defaults, or integration notes>"}
 
 Example:
-{"what": "Added hideExpiredPaymentMethods config option", "files": [{"path": "src/types/SdkTypes.res", "change": "Added field to configurationType record, parsed from config dict (default: false)"}], "backward_compatible": true, "notes": "Defaults to false, existing integrations unaffected"}`;
+{"what": "Added hideExpiredPaymentMethods config option", "files": [{"path": "src/types/SdkTypes.res", "change": "Added field to configurationType record, parsed from config dict (default: false)"}], "backward_compatible": true, "build_status": "passed", "build_attempts": 2, "notes": "First attempt missed the parseConfigurationDict update; second attempt fixed it"}`;
 
     const summary = await ask(prompt, {
       model: "opus",
-      timeoutMs: 600_000,
+      // Bumped from 600s → 1500s to give the agent room to iterate on build
+      // failures (up to 5 build attempts × ~120s each + edit time).
+      timeoutMs: 1_500_000,
       cwd: targetDir,
-      allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+      // Bash added so the agent can run `npm run re:build` itself and iterate
+      // until green. Edit/Write/Read/Glob/Grep unchanged.
+      allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
     });
 
-    // ---- Capture diff ----
-    const diff = await git.diff();
-    const diffStat = await git.diffSummary();
+    // ---- Capture diff (submodule-aware for mobile repo) ----
+    const { diff, fileCount } = await getDiffWithSubmodules(targetDir, targetRepo);
 
-    if (!diff || diffStat.files.length === 0) {
+    if (!diff || fileCount === 0) {
       // Opus didn't change any files — reset and bail
-      await git.checkout(defaultBranch);
+      await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
       try {
         await git.deleteLocalBranch(branchName, true);
       } catch { /* */ }
@@ -167,46 +211,111 @@ Example:
       });
     }
 
-    // Save .patch file
+    // Save .patch file (always — even on build failure, so the user can inspect)
     const patchFileName = `${gapId}-${slug}.patch`;
     const patchPath = path.join(PATCHES_DIR, patchFileName);
     fs.writeFileSync(patchPath, diff);
 
-    // Commit changes on the branch so the diff is preserved
-    await git.add(".");
-    await git.commit(`feat: add ${gap.canonical_name}\n\nGenerated by feature-gap-dashboard for gap #${gapId}`);
+    // ---- Mandatory ReScript build check ----
+    // Runs against the agent's edits in the working tree. If it fails the
+    // change is fundamentally broken (missing module, syntax/type error) and
+    // we refuse to commit or persist a patch row — the user can inspect the
+    // diff at `patchPath` and re-run.
+    const build = runRescriptBuild(targetDir);
+    if (!build.passed) {
+      // Leave the agent's edits on disk so they can be inspected, but reset
+      // back to the default branch so the workspace isn't stuck on a broken
+      // feature branch.
+      await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
+      try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+      return res.status(422).json({
+        error: "ReScript build failed — patch rejected. The agent's edits introduced a syntax or type error.",
+        buildStatus: "fail",
+        buildLog: build.log,
+        diff,
+        summary: summary.slice(0, 2000),
+        patchPath,
+      });
+    }
 
-    // ---- Build check ----
-    let buildStatus: "pass" | "fail" | "skipped" = "skipped";
-    let buildLog = "";
+    // Build passed — commit the changes (submodules first, then parent)
+    const commitMsg = `feat: add ${gap.canonical_name}\n\nGenerated by feature-gap-dashboard for gap #${gapId}`;
+    const commitResult = await commitWithSubmodules(targetDir, targetRepo, commitMsg);
 
-    const hasNodeModules = fs.existsSync(path.join(targetDir, "node_modules"));
-    if (hasNodeModules) {
-      try {
-        const output = execSync("npx rescript build 2>&1", {
-          cwd: targetDir,
-          timeout: 120_000,
-          encoding: "utf8",
+    // ---- Push fork + open PR (submodule-aware) ----
+    //
+    // For each submodule the agent committed inside, push that submodule's
+    // commit to its corresponding bot fork. Then rewrite .gitmodules in the
+    // parent so anyone checking out the feature branch from the parent fork
+    // can `git submodule update --init --recursive` and resolve every SHA.
+    // Trade-off: this branch is optimized for "checkout & build", not for
+    // direct merge into juspay upstream — the .gitmodules rewrite is in the
+    // diff, which is non-mainstream. The PR body says so explicitly.
+    let prUrl: string | null = null;
+    let prNumber: number | null = null;
+    let prWarning: string | null = null;
+    const submodulePushSummaries: string[] = [];
+    try {
+      // 1. Push each dirty submodule to its fork.
+      for (const subDir of commitResult.submodulesChanged) {
+        const result = await pushSubmoduleToFork({
+          parentDir: targetDir,
+          subDir,
+          branchName,
         });
-        buildStatus = "pass";
-        buildLog = output.slice(-2000);
-      } catch (err) {
-        buildStatus = "fail";
-        const e = err as { stdout?: string; stderr?: string; message?: string };
-        buildLog = ((e.stdout ?? "") + "\n" + (e.stderr ?? "") + "\n" + (e.message ?? "")).slice(-2000);
+        submodulePushSummaries.push(`${subDir} → ${result.forkUrl} @ ${result.sha.slice(0, 8)}`);
       }
-    } else {
-      buildLog = "Skipped: node_modules not installed. Run `npm install` in the workspace repo to enable build checks.";
+
+      // 2. Rewrite .gitmodules + add it as a follow-up commit on the feature
+      //    branch (only if we actually touched any submodule).
+      if (commitResult.submodulesChanged.length > 0) {
+        const rewritten = rewriteGitmodulesToForks(targetDir, commitResult.submodulesChanged);
+        if (rewritten.length > 0) {
+          const parentGit = simpleGit(targetDir);
+          await parentGit.add([".gitmodules"]);
+          await parentGit.commit(
+            `chore: point submodules at bot forks for build\n\n` +
+              `Automated by feature-gap-dashboard so the feature branch is checkout-buildable.\n` +
+              `Rewritten: ${rewritten.join(", ")}`,
+          );
+        }
+      }
+
+      // 3. Push the parent feature branch to the parent fork.
+      await pushBranchToFork(targetDir, targetRepo, branchName);
+
+      // 4. Open the PR.
+      const body = formatPrBody({
+        gapId,
+        canonicalName: gap.canonical_name,
+        category: gap.category,
+        rationale: gap.rationale,
+        summaryJson: summary,
+        filesTouched: fileCount,
+        buildLog: build.log,
+        submodulePushes: submodulePushSummaries,
+      });
+      const created = await createPullRequest({
+        repoKey: targetRepo,
+        branch: branchName,
+        title: `feat: add ${gap.canonical_name}`,
+        body,
+      });
+      prUrl = created.prUrl;
+      prNumber = created.prNumber;
+    } catch (err) {
+      prWarning = `PR creation failed: ${(err as Error).message}`;
+      console.error(`[patches] PR creation failed for gap ${gapId}:`, err);
     }
 
     // Switch back to default branch (leave the feature branch intact)
-    await git.checkout(defaultBranch);
+    await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
 
     // ---- Save to DB ----
     const patchRow = db
       .prepare(
-        `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log)
-         VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?)`,
+        `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
+         VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         gapId,
@@ -214,32 +323,34 @@ Example:
         branchName,
         patchPath,
         summary.slice(0, 2000),
-        diffStat.files.length,
+        fileCount,
         nowIso(),
-        buildStatus,
-        buildLog,
+        "pass",
+        build.log,
+        prUrl,
+        prNumber,
+        prWarning,
       );
 
     res.json({
       patchId: patchRow.lastInsertRowid,
       branch: branchName,
       repo: targetRepo,
-      filesTouched: diffStat.files.length,
+      filesTouched: fileCount,
       summary: summary.slice(0, 2000),
       diff,
-      buildStatus,
-      buildLog,
+      buildStatus: "pass",
+      buildLog: build.log,
+      prUrl,
+      prNumber,
+      prWarning,
     });
   } catch (err) {
     console.error(`[patches] failed for gap ${gapId}:`, err);
 
     // Try to clean up: go back to default branch
     try {
-      const git = simpleGit(targetDir);
-      const defaultBranch = (await git.branch()).current || "main";
-      if (defaultBranch.startsWith("feat/")) {
-        await git.raw(["checkout", "--force", "main"]);
-      }
+      await forceCheckoutBranch(targetDir, targetRepo, "main");
     } catch { /* best effort */ }
 
     res.status(500).json({ error: (err as Error).message });
