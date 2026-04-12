@@ -1,5 +1,5 @@
 import { getValidateCache, putValidateCache } from "../cache.js";
-import { MODEL_REASON, REPOS, type RepoKey } from "../config.js";
+import { MODEL_REASON, REPOS, type AnalysisRepoKey } from "../config.js";
 import { askJson } from "../llm.js";
 import type { Category, ExtractedFeature } from "./types.js";
 
@@ -11,8 +11,8 @@ import type { Category, ExtractedFeature } from "./types.js";
 export interface ClaimedGap {
   category: Category;
   canonical_name: string;
-  missing_in: RepoKey;
-  present_in: RepoKey;
+  missing_in: AnalysisRepoKey;
+  present_in: AnalysisRepoKey;
   evidence_present: ExtractedFeature; // the smoking gun in `present_in`
 }
 
@@ -62,7 +62,7 @@ export async function validateGaps(
   if (uncached.length === 0) return results;
 
   // Bucket by missing repo so each batch shares one cwd.
-  const byRepo: Record<RepoKey, ClaimedGap[]> = { web: [], mobile: [] };
+  const byRepo: Record<AnalysisRepoKey, ClaimedGap[]> = { web: [], mobile: [] };
   for (const c of uncached) byRepo[c.missing_in].push(c);
 
   for (const repo of ["web", "mobile"] as const) {
@@ -107,21 +107,21 @@ export async function validateGaps(
   return results;
 }
 
-function keyOf(name: string, missingIn: RepoKey): string {
+function keyOf(name: string, missingIn: AnalysisRepoKey): string {
   return `${missingIn}::${name}`;
 }
 
 export function lookupVerdict(
   results: Map<string, ValidationResult>,
   name: string,
-  missingIn: RepoKey,
+  missingIn: AnalysisRepoKey,
 ): ValidationResult | undefined {
   return results.get(keyOf(name, missingIn));
 }
 
 async function validateBatch(
   claims: ClaimedGap[],
-  missingRepo: RepoKey,
+  missingRepo: AnalysisRepoKey,
 ): Promise<ValidationResult[]> {
   const cwd = REPOS[missingRepo].dir;
   const repoLabel =

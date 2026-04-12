@@ -64,7 +64,7 @@ export function SkillShell({
               >
                 {repoTabLabel ? repoTabLabel(key, result) : (
                   <>
-                    {key === "web" ? "Web SDK" : key === "mobile" ? "Mobile SDK" : key}
+                    {key === "web" ? "Web SDK" : key === "mobile" ? "Mobile SDK" : key === "rn_packages" ? "NPM Packages" : key}
                     {result?.error ? (
                       <span className="ml-2 text-red-400 text-xs">error</span>
                     ) : result ? (

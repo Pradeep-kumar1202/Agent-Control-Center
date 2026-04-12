@@ -8,7 +8,7 @@ export interface SkillManifest {
   name: string;
   description: string;
   endpoint: string;
-  repos: Array<"web" | "mobile">;
+  repos: Array<"web" | "mobile" | "rn_packages">;
 }
 
 /** Uniform result shape returned by every skill for each repo it touches. */
@@ -62,5 +62,13 @@ export const SKILLS: SkillManifest[] = [
       "Comprehensive Opus-powered review: correctness, patterns, tests, translations, security, edge cases",
     endpoint: "/skills/review/generate",
     repos: ["web", "mobile"],
+  },
+  {
+    id: "integration",
+    name: "SDK Integration",
+    description:
+      "Implement a native SDK integration across repos with automated review loop",
+    endpoint: "/skills/integration/generate",
+    repos: ["mobile", "rn_packages", "web"],
   },
 ];

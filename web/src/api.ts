@@ -198,3 +198,133 @@ export interface ReviewSpec {
   baseBranch?: string;
   repo: "web" | "mobile" | "both";
 }
+
+// ─── Integration skill (SSE-based) ──────────────────────────────────────────
+
+export interface IntegrationSpec {
+  sdkName: string;
+  sdkDoc: string;
+  /** Optional user hint about the SDK type. Auto-detected from doc if omitted. */
+  sdkTypeHint?: string;
+  repos: Array<"web" | "mobile" | "rn_packages">;
+  platforms: string[];
+  newPackage?: boolean;
+  newPackageName?: string;
+  additionalContext?: string;
+}
+
+export interface IntegrationSSEEvent {
+  type:
+    | "progress"
+    | "classify"
+    | "review_start"
+    | "review_result"
+    | "fix_start"
+    | "repo_done"
+    | "done"
+    | "error";
+  repo?: string;
+  message: string;
+  data?: unknown;
+}
+
+export interface ReviewIssue {
+  file: string;
+  check: string;
+  severity: "blocker" | "warning" | "nit";
+  description: string;
+  suggestedFix: string;
+}
+
+export interface ReviewResult {
+  approved: boolean;
+  issues: ReviewIssue[];
+  summary: string;
+}
+
+export interface SdkClassification {
+  pattern: string;
+  callbackMechanism: string;
+  requiresActivity: boolean;
+  requiresUrlScheme: boolean;
+  hasNativeUI: boolean;
+  notes: string;
+}
+
+export interface IntegrationRepoResult extends SkillRepoResult {
+  reviewLog: Array<{ iteration: number; review: ReviewResult }>;
+}
+
+export interface IntegrationEnvelope {
+  skillId: "integration";
+  status: "ok" | "partial" | "error";
+  results: Record<string, IntegrationRepoResult>;
+  meta?: { sdkName: string; classification: SdkClassification };
+}
+
+/**
+ * Start an integration generation via SSE. Returns an EventSource-like
+ * interface that the Form component can subscribe to.
+ */
+export function generateIntegration(
+  spec: IntegrationSpec,
+  onEvent: (event: IntegrationSSEEvent) => void,
+  onDone: (envelope: IntegrationEnvelope) => void,
+  onError: (msg: string) => void,
+): AbortController {
+  const controller = new AbortController();
+
+  fetch(`${BASE}/skills/integration/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const text = await response.text();
+        onError(`HTTP ${response.status}: ${text}`);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onError("No response body");
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(line.slice(6)) as IntegrationSSEEvent;
+              onEvent(event);
+
+              if (event.type === "done" && event.data) {
+                onDone(event.data as IntegrationEnvelope);
+              }
+            } catch {
+              /* ignore malformed SSE data */
+            }
+          }
+        }
+      }
+    })
+    .catch((err) => {
+      if ((err as Error).name !== "AbortError") {
+        onError((err as Error).message);
+      }
+    });
+
+  return controller;
+}

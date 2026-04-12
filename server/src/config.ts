@@ -13,7 +13,10 @@ export const DB_PATH = path.join(DATA_DIR, "app.db");
 
 export const PORT = Number(process.env.PORT ?? 5174);
 
-export type RepoKey = "web" | "mobile";
+export type RepoKey = "web" | "mobile" | "rn_packages";
+
+/** The two repos used by the gap-analysis pipeline. */
+export type AnalysisRepoKey = "web" | "mobile";
 
 export const REPOS: Record<
   RepoKey,
@@ -28,6 +31,11 @@ export const REPOS: Record<
     name: "hyperswitch-client-core",
     url: "https://github.com/juspay/hyperswitch-client-core.git",
     dir: path.join(WORKSPACE_DIR, "hyperswitch-client-core"),
+  },
+  rn_packages: {
+    name: "react-native-hyperswitch",
+    url: "https://github.com/juspay/react-native-hyperswitch.git",
+    dir: path.join(WORKSPACE_DIR, "react-native-hyperswitch"),
   },
 };
 

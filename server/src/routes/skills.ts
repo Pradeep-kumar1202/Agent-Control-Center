@@ -14,6 +14,7 @@ import { handlePropsSkill } from "../skills/props/index.js";
 import { handleTestsSkill } from "../skills/tests/index.js";
 import { handleTranslationsSkill } from "../skills/translations/index.js";
 import { handleReviewSkill } from "../skills/review/index.js";
+import { handleIntegrationSkill } from "../skills/integration/index.js";
 
 export const skillsRouter = Router();
 
@@ -26,3 +27,4 @@ skillsRouter.post("/skills/props/generate", handlePropsSkill);
 skillsRouter.post("/skills/tests/generate", handleTestsSkill);
 skillsRouter.post("/skills/translations/generate", handleTranslationsSkill);
 skillsRouter.post("/skills/review/generate", handleReviewSkill);
+skillsRouter.post("/skills/integration/generate", handleIntegrationSkill);

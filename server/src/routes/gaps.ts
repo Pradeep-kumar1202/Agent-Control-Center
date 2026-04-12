@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { getValidateCache, putValidateCache } from "../cache.js";
-import { MODEL_REASON, REPOS, type RepoKey } from "../config.js";
+import { MODEL_REASON, REPOS, type AnalysisRepoKey } from "../config.js";
 import { db, type GapRow } from "../db.js";
 import { askJson } from "../llm.js";
 import { syncAllRepos } from "../workspace/repoManager.js";
@@ -35,7 +35,7 @@ gapsRouter.post("/gaps/:id/validate", async (req, res) => {
 
   try {
     const repos = await syncAllRepos();
-    const missingRepo = gap.missing_in as RepoKey;
+    const missingRepo = gap.missing_in as AnalysisRepoKey;
     const missingSha = repos[missingRepo].sha;
 
     let verdict = getValidateCache<VerdictPayload>(
@@ -112,7 +112,7 @@ gapsRouter.get("/gaps/:id/source", async (req, res) => {
     | undefined;
   if (!gap) return res.status(404).json({ error: "gap not found" });
 
-  const presentRepo = gap.present_in as RepoKey;
+  const presentRepo = gap.present_in as AnalysisRepoKey;
   const repoDir = REPOS[presentRepo].dir;
   const evidence = safeParse(gap.evidence) as Array<{ name?: string; file?: string; snippet?: string }> | null;
   const filePath = evidence?.[0]?.file;
@@ -140,7 +140,7 @@ gapsRouter.get("/gaps/:id/source", async (req, res) => {
 
 async function validateOne(
   gap: GapRow,
-  missingRepo: RepoKey,
+  missingRepo: AnalysisRepoKey,
 ): Promise<VerdictPayload> {
   const cwd = REPOS[missingRepo].dir;
   const repoLabel =
