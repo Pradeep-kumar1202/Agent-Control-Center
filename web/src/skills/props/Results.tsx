@@ -100,34 +100,82 @@ function PropFooter({
   copiedPr: boolean;
   onCopiedPr: () => void;
 }) {
+  const [branchCopied, setBranchCopied] = useState(false);
   const repoDir = active.repo === "web" ? "hyperswitch-web" : "hyperswitch-client-core";
   return (
-    <div className="border-t border-slate-700 px-6 py-3 flex items-center gap-3">
-      <span className="text-xs text-slate-500">Branch:</span>
-      <code className="flex-1 rounded bg-slate-800 px-3 py-1.5 text-xs text-indigo-300 font-mono">
-        {active.branch}
-      </code>
-      <button
-        onClick={() => navigator.clipboard.writeText(`cd workspace/${repoDir} && git checkout ${active.branch}`)}
-        className="rounded border border-slate-700 px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200 hover:border-slate-500"
-      >
-        Copy
-      </button>
-      <button
-        onClick={() => {
-          const text = generatePropPR(propName, active);
-          navigator.clipboard.writeText(text);
-          onCopiedPr();
-        }}
-        className={
-          "rounded border px-3 py-1.5 text-xs transition " +
-          (copiedPr
-            ? "border-emerald-500 text-emerald-300 bg-emerald-500/10"
-            : "border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500")
-        }
-      >
-        {copiedPr ? "Copied!" : "Copy PR Description"}
-      </button>
+    <div className="border-t border-slate-700 px-6 py-3 space-y-2">
+      {/* Branch name — prominent one-click-copy chip for easy paste into Test Generator */}
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-slate-500">Branch:</span>
+        <button
+          onClick={() => {
+            navigator.clipboard.writeText(active.branch);
+            setBranchCopied(true);
+            setTimeout(() => setBranchCopied(false), 2000);
+          }}
+          title="Click to copy branch name — paste into Test Generator"
+          className={
+            "flex-1 rounded px-3 py-1.5 text-xs font-mono text-left transition " +
+            (branchCopied
+              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500"
+              : "bg-slate-800 text-indigo-300 border border-slate-700 hover:border-indigo-500 cursor-pointer")
+          }
+        >
+          {branchCopied ? "Copied!" : active.branch}
+        </button>
+        <button
+          onClick={() => navigator.clipboard.writeText(`cd workspace/${repoDir} && git checkout ${active.branch}`)}
+          className="rounded border border-slate-700 px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200 hover:border-slate-500"
+        >
+          Copy checkout cmd
+        </button>
+      </div>
+      {/* PR link or fallback */}
+      <div className="flex items-center gap-3">
+        {active.prUrl ? (
+          <>
+            <span className="text-xs text-slate-500">PR:</span>
+            <a
+              href={active.prUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex-1 truncate text-xs text-emerald-300 hover:text-emerald-200 underline underline-offset-2"
+            >
+              {active.prUrl}
+            </a>
+            <a
+              href={active.prUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rounded border border-emerald-600 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition"
+            >
+              Open PR ↗
+            </a>
+          </>
+        ) : (
+          <>
+            <span className="text-xs text-slate-500">PR:</span>
+            <span className="flex-1 text-xs text-amber-400/80 truncate">
+              {active.prWarning ?? "not opened"}
+            </span>
+            <button
+              onClick={() => {
+                const text = generatePropPR(propName, active);
+                navigator.clipboard.writeText(text);
+                onCopiedPr();
+              }}
+              className={
+                "rounded border px-3 py-1.5 text-xs transition " +
+                (copiedPr
+                  ? "border-emerald-500 text-emerald-300 bg-emerald-500/10"
+                  : "border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500")
+              }
+            >
+              {copiedPr ? "Copied!" : "Copy PR Description"}
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 }

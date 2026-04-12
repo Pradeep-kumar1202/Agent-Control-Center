@@ -19,6 +19,10 @@ export interface SkillRepoResult {
   filesTouched: number;
   summary: string;
   error?: string;
+  /** GitHub PR URL — set when the skill successfully pushed + opened a PR. */
+  prUrl?: string | null;
+  prNumber?: number | null;
+  prWarning?: string | null;
 }
 
 /** Top-level envelope returned by every POST /skills/{id}/generate endpoint. */

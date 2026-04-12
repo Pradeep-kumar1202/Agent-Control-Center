@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { SkillResultsProps } from "../registry";
 import { SkillShell } from "../shared/SkillShell";
 import { DiffSection } from "../shared/DiffSection";
+import { TestRunner } from "./TestRunner";
 
 export function TestsResults({ result, onClose }: SkillResultsProps) {
   const repos = Object.entries(result.results);
@@ -33,27 +34,83 @@ export function TestsResults({ result, onClose }: SkillResultsProps) {
                 <TestSummary summary={active.summary} />
               </div>
               <DiffSection diff={active.diff} />
-              <div className="border-t border-slate-700 px-6 py-3 flex items-center gap-3">
-                <span className="text-xs text-slate-500">Branch:</span>
-                <code className="flex-1 rounded bg-slate-800 px-3 py-1.5 text-xs text-emerald-300 font-mono">
-                  {active.branch}
-                </code>
-                <button
-                  onClick={() => {
-                    const repoDir = active.repo === "web" ? "hyperswitch-web" : "hyperswitch-client-core";
-                    navigator.clipboard.writeText(`cd workspace/${repoDir} && git checkout ${active.branch}`);
-                  }}
-                  className="rounded border border-slate-700 px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200 hover:border-slate-500"
-                >
-                  Copy checkout
-                </button>
+              {/* Branch + PR footer */}
+              <div className="border-t border-slate-700 px-6 py-3 space-y-2">
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-slate-500">Branch:</span>
+                  <code className="flex-1 rounded bg-slate-800 px-3 py-1.5 text-xs text-emerald-300 font-mono">
+                    {active.branch}
+                  </code>
+                  <button
+                    onClick={() => {
+                      const repoDir = active.repo === "web" ? "hyperswitch-web" : "hyperswitch-client-core";
+                      navigator.clipboard.writeText(`cd workspace/${repoDir} && git checkout ${active.branch}`);
+                    }}
+                    className="rounded border border-slate-700 px-3 py-1.5 text-xs text-slate-400 hover:text-slate-200 hover:border-slate-500"
+                  >
+                    Copy checkout
+                  </button>
+                </div>
+                <div className="flex items-center gap-3">
+                  {active.prUrl ? (
+                    <>
+                      <span className="text-xs text-slate-500">PR:</span>
+                      <a
+                        href={active.prUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex-1 truncate text-xs text-emerald-300 hover:text-emerald-200 underline underline-offset-2"
+                      >
+                        {active.prUrl}
+                      </a>
+                      <a
+                        href={active.prUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="rounded border border-emerald-600 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition"
+                      >
+                        Open PR ↗
+                      </a>
+                    </>
+                  ) : active.prWarning ? (
+                    <>
+                      <span className="text-xs text-slate-500">PR:</span>
+                      <span className="flex-1 text-xs text-amber-400/80 truncate">{active.prWarning}</span>
+                    </>
+                  ) : null}
+                </div>
               </div>
+              {/* Run Tests — streams Cypress / Detox output inline.
+                  Only runs the newly generated test file(s), not the entire suite. */}
+              <TestRunner
+                branch={active.branch}
+                repo={active.repo as "web" | "mobile"}
+                testFiles={parseTestFiles(active.summary)}
+              />
             </>
           )}
         </>
       )}
     </SkillShell>
   );
+}
+
+/** Extract test file paths from the agent's JSON summary so we can pass
+ *  them to the runner (run only the new files, not the entire suite). */
+function parseTestFiles(summary: string): string[] {
+  try {
+    const braceStart = summary.indexOf("{");
+    const braceEnd = summary.lastIndexOf("}");
+    if (braceStart >= 0 && braceEnd > braceStart) {
+      const parsed = JSON.parse(summary.slice(braceStart, braceEnd + 1));
+      if (Array.isArray(parsed.files)) {
+        return parsed.files
+          .map((f: { path: string }) => f.path)
+          .filter((p: string) => p.endsWith(".cy.ts") || p.endsWith(".test.ts"));
+      }
+    }
+  } catch { /* fall through */ }
+  return [];
 }
 
 function TestSummary({ summary }: { summary: string }) {

@@ -23,6 +23,9 @@ export interface SkillRepoResultClient {
   filesTouched: number;
   summary: string;
   error?: string;
+  prUrl?: string | null;
+  prNumber?: number | null;
+  prWarning?: string | null;
 }
 
 export interface SkillEnvelopeClient {

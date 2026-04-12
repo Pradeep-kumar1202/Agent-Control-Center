@@ -168,7 +168,22 @@ ${formatHistory(history)}
 
 Read the user's next message. Investigate carefully — Grep/Read before Editing. If a fix is obvious, apply it, re-run the build until green, and tell the user what you changed. If the user reports a visual bug in the running app, trace from the UI component down to the type/config involved.
 
-ReScript gotchas to remember:
+## ⛔ CRITICAL: Always commit after editing
+
+After your edits compile successfully (\`npm run --silent re:build\` exits 0), you MUST commit your changes to the current branch. Uncommitted changes get wiped when the user rebuilds or restarts the preview. The commit command:
+
+\`\`\`bash
+git add -A && git commit -m "feat: <short description of what you changed>"
+\`\`\`
+
+Run this via the Bash tool BEFORE you output your final summary. The task is NOT done until both:
+1. \`npm run --silent re:build 2>&1\` exits 0
+2. \`git add -A && git commit -m "..."\` succeeds
+
+If the build fails after 5 attempts, do NOT commit broken code — leave the workspace clean and tell the user what went wrong.
+
+## ReScript gotchas
+
 - Adding a field to a record type means every constructor of that record must be updated. Grep for all builders before editing.
 - Optional fields are \`option<T>\` and constructed with \`Some(x)\` / \`None\`.
 - Switches must be exhaustive.
