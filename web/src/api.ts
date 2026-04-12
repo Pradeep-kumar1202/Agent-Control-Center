@@ -201,22 +201,85 @@ export interface ReviewSpec {
 
 // ─── Integration skill (SSE-based) ──────────────────────────────────────────
 
+/** A single step in the API call chain that bootstraps the SDK. */
+export interface ApiChainStep {
+  endpoint: string;
+  triggerField?: string;
+  triggerValue?: string;
+  extractedData?: string[];
+}
+
+export type UiEntryPoint =
+  | "branded_button"
+  | "inline_widget"
+  | "invisible"
+  | "utility_ui"
+  | "other";
+
+export type ApiChainKnownPattern =
+  | "session_direct"
+  | "session_post_session"
+  | "confirm_next_action"
+  | "no_api"
+  | "custom";
+
+export type ConfirmTiming =
+  | "post_sdk_with_data"
+  | "post_sdk_status_only"
+  | "pre_sdk"
+  | "not_applicable"
+  | "custom";
+
+export interface SdkClassification {
+  // Technical detection (auto-detected from SDK doc)
+  pattern: string;
+  callbackMechanism: string;
+  requiresActivity: boolean;
+  requiresUrlScheme: boolean;
+  hasNativeUI: boolean;
+  notes: string;
+
+  // UI entry point
+  uiEntryPoint: UiEntryPoint;
+  sdkProvidesButton?: boolean;
+
+  // API chain
+  apiChain: {
+    knownPattern?: ApiChainKnownPattern;
+    steps: ApiChainStep[];
+    description?: string;
+  };
+
+  // Confirm timing
+  confirmTiming: ConfirmTiming;
+
+  // Hyperswitch-specific (user fills in)
+  walletVariant?: string;
+  sdkNextAction?: string;
+  nextActionType?: string;
+  paymentExperience?: string;
+
+  // Reference pattern (auto-derived)
+  referencePattern?: string;
+  targetFiles: string[];
+}
+
 export interface IntegrationSpec {
   sdkName: string;
   sdkDoc: string;
-  /** Optional user hint about the SDK type. Auto-detected from doc if omitted. */
-  sdkTypeHint?: string;
-  repos: Array<"web" | "mobile" | "rn_packages">;
+  classification: SdkClassification;
+  targets: Array<"web" | "mobile">;
   platforms: string[];
   newPackage?: boolean;
   newPackageName?: string;
   additionalContext?: string;
+  /** Which sub-repos to include when target is "mobile". Defaults to both. */
+  mobileSubRepos?: Array<"client_core" | "rn_packages">;
 }
 
 export interface IntegrationSSEEvent {
   type:
     | "progress"
-    | "classify"
     | "review_start"
     | "review_result"
     | "fix_start"
@@ -240,15 +303,6 @@ export interface ReviewResult {
   approved: boolean;
   issues: ReviewIssue[];
   summary: string;
-}
-
-export interface SdkClassification {
-  pattern: string;
-  callbackMechanism: string;
-  requiresActivity: boolean;
-  requiresUrlScheme: boolean;
-  hasNativeUI: boolean;
-  notes: string;
 }
 
 export interface IntegrationRepoResult extends SkillRepoResult {
@@ -312,6 +366,111 @@ export function generateIntegration(
 
               if (event.type === "done" && event.data) {
                 onDone(event.data as IntegrationEnvelope);
+              }
+            } catch {
+              /* ignore malformed SSE data */
+            }
+          }
+        }
+      }
+    })
+    .catch((err) => {
+      if ((err as Error).name !== "AbortError") {
+        onError((err as Error).message);
+      }
+    });
+
+  return controller;
+}
+
+/**
+ * Classify an SDK from its documentation. Returns the SdkClassification
+ * with auto-derived referencePattern and targetFiles.
+ */
+export async function classifySdk(
+  sdkDoc: string,
+  sdkTypeHint?: string,
+): Promise<SdkClassification> {
+  return jsonFetch<SdkClassification>(
+    `${BASE}/skills/integration/classify`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdkDoc, sdkTypeHint }),
+    },
+  );
+}
+
+// ─── Coder skill (SSE-based) ────────────────────────────────────────────────
+
+export interface CoderSpec {
+  repos: Array<"web" | "mobile" | "rn_packages">;
+  task: string;
+  additionalContext?: string;
+}
+
+export type CoderSSEEvent = IntegrationSSEEvent; // Same shape
+
+export interface CoderRepoResult extends SkillRepoResult {
+  reviewLog: Array<{ iteration: number; review: ReviewResult }>;
+}
+
+export interface CoderEnvelope {
+  skillId: "coder";
+  status: "ok" | "partial" | "error";
+  results: Record<string, CoderRepoResult>;
+  meta?: { task: string };
+}
+
+/**
+ * Start a coder task via SSE. Returns an AbortController for cancellation.
+ */
+export function generateCoderTask(
+  spec: CoderSpec,
+  onEvent: (event: CoderSSEEvent) => void,
+  onDone: (envelope: CoderEnvelope) => void,
+  onError: (msg: string) => void,
+): AbortController {
+  const controller = new AbortController();
+
+  fetch(`${BASE}/skills/coder/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const text = await response.text();
+        onError(`HTTP ${response.status}: ${text}`);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onError("No response body");
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(line.slice(6)) as CoderSSEEvent;
+              onEvent(event);
+
+              if (event.type === "done" && event.data) {
+                onDone(event.data as CoderEnvelope);
               }
             } catch {
               /* ignore malformed SSE data */

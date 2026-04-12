@@ -71,4 +71,12 @@ export const SKILLS: SkillManifest[] = [
     endpoint: "/skills/integration/generate",
     repos: ["mobile", "rn_packages", "web"],
   },
+  {
+    id: "coder",
+    name: "Coder",
+    description:
+      "General-purpose coding: bug fixes, refactors, feature changes with automated review loop",
+    endpoint: "/skills/coder/generate",
+    repos: ["mobile", "rn_packages", "web"],
+  },
 ];

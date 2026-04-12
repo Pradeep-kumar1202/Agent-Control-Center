@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { SkillResultsProps, SkillRepoResultClient } from "../registry";
 import { SkillShell } from "../shared/SkillShell";
 import { DiffSection } from "../shared/DiffSection";
-import type { ReviewResult, SdkClassification, UiEntryPoint, ApiChainKnownPattern, ConfirmTiming } from "../../api";
+import type { ReviewResult } from "../../api";
 
 interface ReviewLogEntry {
   iteration: number;
@@ -16,9 +16,8 @@ const MOBILE_SUB_REPOS = [
 ] as const;
 
 /**
- * Derive the top-level tabs from result keys.
- * - `mobile` and `rn_packages` are grouped under a single "Mobile SDK" tab
- * - `web` stays as "Web SDK"
+ * Derive top-level tabs from result keys.
+ * mobile + rn_packages → grouped as "mobile_group"
  */
 function deriveTopTabs(resultKeys: string[]): string[] {
   const tabs: string[] = [];
@@ -28,55 +27,53 @@ function deriveTopTabs(resultKeys: string[]): string[] {
   if (resultKeys.includes("web")) {
     tabs.push("web");
   }
+  // Handle standalone mobile or rn_packages (when only one is present)
+  // If both are present, they're grouped. If only one, still use group.
   return tabs;
 }
 
 function topTabLabel(key: string): string {
-  if (key === "mobile_group") return "Mobile SDK";
+  if (key === "mobile_group") return "Mobile";
   if (key === "web") return "Web SDK";
   return key;
 }
 
-export function IntegrationResults({ result, onClose }: SkillResultsProps) {
+export function CoderResults({ result, onClose }: SkillResultsProps) {
   const allRepoKeys = Object.keys(result.results);
   const topTabs = deriveTopTabs(allRepoKeys);
   const [activeTab, setActiveTab] = useState(topTabs[0] ?? "");
-  const [mobileSubTab, setMobileSubTab] = useState<string>("mobile");
+  const [mobileSubTab, setMobileSubTab] = useState<string>(
+    allRepoKeys.includes("mobile") ? "mobile" : "rn_packages",
+  );
   const [expandedReview, setExpandedReview] = useState<number | null>(null);
 
-  const sdkName = (result.meta?.sdkName as string) ?? "";
-  const classification = result.meta?.classification as SdkClassification | undefined;
+  const task = (result.meta?.task as string) ?? "";
   const reviewLogs = (result.meta?.reviewLogs as Record<string, ReviewLogEntry[]>) ?? {};
 
-  // Resolve which repo key to actually display
+  // Resolve which repo key to display
   const activeRepoKey = activeTab === "mobile_group" ? mobileSubTab : activeTab;
   const active = result.results[activeRepoKey];
   const activeReviewLog = reviewLogs[activeRepoKey] ?? [];
 
-  // Count total repos for subtitle
   const repoCount = allRepoKeys.length;
-  const subtitleParts: string[] = [];
-  if (classification?.uiEntryPoint) subtitleParts.push(formatUiEntry(classification.uiEntryPoint));
-  if (classification?.apiChain?.knownPattern) subtitleParts.push(formatApiChain(classification.apiChain.knownPattern));
-  if (classification?.confirmTiming) subtitleParts.push(formatConfirmTiming(classification.confirmTiming));
-  subtitleParts.push(`${repoCount} repo${repoCount > 1 ? "s" : ""}`);
-  const subtitle = subtitleParts.join(" | ");
+  const subtitle = `${repoCount} repo${repoCount > 1 ? "s" : ""}`;
 
-  // Mobile file count across both sub-repos
+  // Mobile combined file count
   const mobileFileCount = (result.results.mobile?.filesTouched ?? 0) + (result.results.rn_packages?.filesTouched ?? 0);
   const mobileHasError = result.results.mobile?.error || result.results.rn_packages?.error;
 
   return (
     <SkillShell
-      title={`Integration: ${sdkName}`}
+      title={task.length > 60 ? `${task.slice(0, 57)}...` : task || "Coder Task"}
       subtitle={subtitle}
       repoKeys={topTabs}
       activeRepo={activeTab}
       onRepoChange={(key) => {
         setActiveTab(key);
         setExpandedReview(null);
-        // Reset mobile sub-tab when switching to mobile group
-        if (key === "mobile_group") setMobileSubTab("mobile");
+        if (key === "mobile_group") {
+          setMobileSubTab(allRepoKeys.includes("mobile") ? "mobile" : "rn_packages");
+        }
       }}
       onClose={onClose}
       repoTabLabel={(key) => (
@@ -98,7 +95,7 @@ export function IntegrationResults({ result, onClose }: SkillResultsProps) {
       results={result.results}
     >
       {/* Mobile sub-tab bar */}
-      {activeTab === "mobile_group" && (
+      {activeTab === "mobile_group" && allRepoKeys.includes("mobile") && allRepoKeys.includes("rn_packages") && (
         <div className="flex border-b border-slate-800 px-6 bg-slate-900/50">
           {MOBILE_SUB_REPOS.map((sub) => {
             const subResult = result.results[sub.key];
@@ -112,7 +109,7 @@ export function IntegrationResults({ result, onClose }: SkillResultsProps) {
                 className={
                   "px-3 py-1.5 text-xs font-medium border-b-2 transition " +
                   (mobileSubTab === sub.key
-                    ? "border-orange-500 text-orange-300"
+                    ? "border-indigo-500 text-indigo-300"
                     : "border-transparent text-slate-500 hover:text-slate-300")
                 }
               >
@@ -134,7 +131,7 @@ export function IntegrationResults({ result, onClose }: SkillResultsProps) {
         <div className="flex-1 overflow-y-auto">
           {active.error ? (
             <div className="p-6 text-red-300">
-              <div className="font-medium mb-2">Generation failed</div>
+              <div className="font-medium mb-2">Task failed</div>
               <pre className="text-xs whitespace-pre-wrap">{active.error}</pre>
             </div>
           ) : (
@@ -224,7 +221,7 @@ export function IntegrationResults({ result, onClose }: SkillResultsProps) {
               <DiffSection diff={active.diff} />
 
               {/* Footer */}
-              <IntegrationFooter sdkName={sdkName} active={active} />
+              <CoderFooter active={active} />
             </>
           )}
         </div>
@@ -255,7 +252,7 @@ function RepoSummary({ result }: { result: SkillRepoResultClient }) {
                   {parsed.files.map(
                     (f: { path: string; change: string }, i: number) => (
                       <tr key={i} className="hover:bg-slate-800/50">
-                        <td className="px-3 py-2 font-mono text-orange-300 whitespace-nowrap">
+                        <td className="px-3 py-2 font-mono text-indigo-300 whitespace-nowrap">
                           {f.path}
                         </td>
                         <td className="px-3 py-2 text-slate-400">{f.change}</td>
@@ -275,16 +272,9 @@ function RepoSummary({ result }: { result: SkillRepoResultClient }) {
   return <div className="text-sm text-slate-300">{result.summary}</div>;
 }
 
-function IntegrationFooter({
-  sdkName,
-  active,
-}: {
-  sdkName: string;
-  active: SkillRepoResultClient;
-}) {
+function CoderFooter({ active }: { active: SkillRepoResultClient }) {
   const [copied, setCopied] = useState(false);
 
-  // Map repo key to workspace path (namespaced directories)
   const workspacePath =
     active.repo === "web"
       ? "workspace/web/hyperswitch-web"
@@ -294,10 +284,12 @@ function IntegrationFooter({
           ? "workspace/mobile/react-native-hyperswitch"
           : `workspace/${active.repo}`;
 
+  if (!active.branch) return null;
+
   return (
     <div className="border-t border-slate-700 px-6 py-3 flex items-center gap-3">
       <span className="text-xs text-slate-500">Branch:</span>
-      <code className="flex-1 rounded bg-slate-800 px-3 py-1.5 text-xs text-orange-300 font-mono">
+      <code className="flex-1 rounded bg-slate-800 px-3 py-1.5 text-xs text-indigo-300 font-mono">
         {active.branch}
       </code>
       <button
@@ -319,42 +311,4 @@ function IntegrationFooter({
       </button>
     </div>
   );
-}
-
-// ─── Formatting helpers ──────────────────────────────────────────────────────
-
-const UI_ENTRY_LABELS: Record<UiEntryPoint, string> = {
-  branded_button: "Branded Button",
-  inline_widget: "Inline Widget",
-  invisible: "Invisible",
-  utility_ui: "Utility UI",
-  other: "Other",
-};
-
-const API_CHAIN_LABELS: Record<ApiChainKnownPattern, string> = {
-  session_direct: "Session Direct",
-  session_post_session: "Session+PostSession",
-  confirm_next_action: "Confirm+NextAction",
-  no_api: "No API",
-  custom: "Custom Chain",
-};
-
-const CONFIRM_TIMING_LABELS: Record<ConfirmTiming, string> = {
-  post_sdk_with_data: "Post-SDK w/ Data",
-  post_sdk_status_only: "Post-SDK Status",
-  pre_sdk: "Pre-SDK",
-  not_applicable: "N/A",
-  custom: "Custom",
-};
-
-function formatUiEntry(v: UiEntryPoint): string {
-  return UI_ENTRY_LABELS[v] ?? v;
-}
-
-function formatApiChain(v: ApiChainKnownPattern): string {
-  return API_CHAIN_LABELS[v] ?? v;
-}
-
-function formatConfirmTiming(v: ConfirmTiming): string {
-  return CONFIRM_TIMING_LABELS[v] ?? v;
 }

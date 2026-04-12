@@ -15,6 +15,8 @@ import { ReviewForm } from "./review/Form";
 import { ReviewResults } from "./review/Results";
 import { IntegrationForm } from "./integration/Form";
 import { IntegrationResults } from "./integration/Results";
+import { CoderForm } from "./coder/Form";
+import { CoderResults } from "./coder/Results";
 
 // ─── Shared types ────────────────────────────────────────────────────────────
 
@@ -96,5 +98,13 @@ export const SKILLS_REGISTRY: SkillConfig[] = [
     activeTabClass: "border-orange-500 text-orange-300",
     FormComponent: IntegrationForm,
     ResultsComponent: IntegrationResults,
+  },
+  {
+    id: "coder",
+    name: "Coder",
+    description: "General-purpose coding: bugs, refactors, features",
+    activeTabClass: "border-indigo-500 text-indigo-300",
+    FormComponent: CoderForm,
+    ResultsComponent: CoderResults,
   },
 ];

@@ -1,3 +1,9 @@
+---
+paths:
+  - "server/**"
+  - "web/**"
+  - "data/**"
+---
 # Feature Gap Dashboard — context for Claude
 
 This file is auto-loaded by Claude Code when working in this directory. It exists so Claude picks up project context without re-deriving it every session. Before making changes, **also read `LEARNINGS.md`** — it contains the running iteration log and the "things we already tried and know don't work" list.
