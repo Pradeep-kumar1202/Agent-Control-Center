@@ -10,6 +10,7 @@
 
 import { Router } from "express";
 import { SKILLS } from "../skills/registry.js";
+import { db, type SkillRunRow } from "../db.js";
 import { handlePropsSkill } from "../skills/props/index.js";
 import { handleTestsSkill } from "../skills/tests/index.js";
 import { handleTranslationsSkill } from "../skills/translations/index.js";
@@ -29,6 +30,40 @@ skillsRouter.post("/skills/props/generate", handlePropsSkill);
 skillsRouter.post("/skills/tests/generate", handleTestsSkill);
 skillsRouter.post("/skills/translations/generate", handleTranslationsSkill);
 skillsRouter.post("/skills/review/generate", handleReviewSkill);
+
+// ─── Skill run history ────────────────────────────────────────────────────
+
+/** List past runs for a skill (newest first). Omits result_json for performance. */
+skillsRouter.get("/skills/:skillId/runs", (req, res) => {
+  const skillId = req.params.skillId;
+  const rows = db
+    .prepare(
+      `SELECT id, skill_id, status, input_json, created_at
+       FROM skill_runs
+       WHERE skill_id = ?
+       ORDER BY created_at DESC
+       LIMIT 50`,
+    )
+    .all(skillId);
+  res.json(rows);
+});
+
+/** Get a single run with full result_json. */
+skillsRouter.get("/skills/:skillId/runs/:runId", (req, res) => {
+  const row = db
+    .prepare("SELECT * FROM skill_runs WHERE id = ? AND skill_id = ?")
+    .get(Number(req.params.runId), req.params.skillId) as SkillRunRow | undefined;
+  if (!row) return res.status(404).json({ error: "run not found" });
+  res.json(row);
+});
+
+/** Delete a run. */
+skillsRouter.delete("/skills/:skillId/runs/:runId", (req, res) => {
+  const info = db
+    .prepare("DELETE FROM skill_runs WHERE id = ? AND skill_id = ?")
+    .run(Number(req.params.runId), req.params.skillId);
+  res.json({ deleted: info.changes > 0 });
+});
 
 /**
  * Run a generated test suite and stream the output as NDJSON.

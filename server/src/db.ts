@@ -113,6 +113,23 @@ db.exec(`
     ON chat_messages(patch_id, turn, id);
 `);
 
+// Unified skill run history. Every skill (props, tests, translations, review)
+// persists its full SkillEnvelope here so results survive modal close and
+// page refresh. The list endpoint omits result_json for performance; full
+// result is loaded on demand when the user clicks "View" in the history tab.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS skill_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id    TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    input_json  TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_skill_runs_skill
+    ON skill_runs(skill_id, created_at DESC);
+`);
+
 // Migrate existing DBs that predate the verified column.
 try {
   db.exec(`ALTER TABLE gaps ADD COLUMN verified INTEGER NOT NULL DEFAULT 0`);
@@ -212,6 +229,29 @@ export type ChatMessageRow = {
   tool_name: string | null;
   created_at: string;
 };
+
+export type SkillRunRow = {
+  id: number;
+  skill_id: string;
+  status: string;
+  input_json: string;
+  result_json: string;
+  created_at: string;
+};
+
+/** Persist any skill's result envelope so it survives modal close + page refresh. */
+export function saveSkillRun(
+  skillId: string,
+  status: string,
+  inputJson: string,
+  resultJson: string,
+): number {
+  const stmt = db.prepare(`
+    INSERT INTO skill_runs (skill_id, status, input_json, result_json, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  return stmt.run(skillId, status, inputJson, resultJson, nowIso()).lastInsertRowid as number;
+}
 
 /** Persist a completed review to the database and return its new row ID. */
 export function saveReview(

@@ -16,6 +16,7 @@ import path from "node:path";
 import simpleGit from "simple-git";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../../config.js";
 import { ask } from "../../llm.js";
+import { saveSkillRun } from "../../db.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
 import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../submoduleGit.js";
 import { pushBranchToFork, pushSubmoduleToFork, rewriteGitmodulesToForks, createPullRequest } from "../githubPr.js";
@@ -475,6 +476,8 @@ export async function handlePropsSkill(req: Request, res: Response): Promise<voi
       results,
       meta: { propName },
     };
+    const runId = saveSkillRun("props", envelope.status, JSON.stringify(spec), JSON.stringify(envelope));
+    envelope.meta = { ...envelope.meta, runId };
     res.json(envelope);
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

@@ -66,6 +66,18 @@ export interface ChatStreamChunk {
   turn?: number;
 }
 
+export interface SkillRunSummary {
+  id: number;
+  skill_id: string;
+  status: string;
+  input_json: string;
+  created_at: string;
+}
+
+export interface SkillRunRow extends SkillRunSummary {
+  result_json: string;
+}
+
 export interface PatchResponse {
   patchId: number;
   branch: string;
@@ -162,6 +174,15 @@ export const api = {
       `${BASE}/gaps/${gapId}/source`,
     ),
   listPatches: () => jsonFetch<PatchRow[]>(`${BASE}/patches`),
+  // ─── Skill run history ───────────────────────────────────────────────────
+  listSkillRuns: (skillId: string) =>
+    jsonFetch<SkillRunSummary[]>(`${BASE}/skills/${skillId}/runs`),
+  getSkillRun: (skillId: string, runId: number) =>
+    jsonFetch<SkillRunRow>(`${BASE}/skills/${skillId}/runs/${runId}`),
+  deleteSkillRun: (skillId: string, runId: number) =>
+    jsonFetch<{ deleted: boolean }>(`${BASE}/skills/${skillId}/runs/${runId}`, {
+      method: "DELETE",
+    }),
   // ─── Chat-with-the-patch-agent ───────────────────────────────────────────
   getChatMessages: (patchId: number) =>
     jsonFetch<{ patchId: number; messages: ChatMessageRow[] }>(

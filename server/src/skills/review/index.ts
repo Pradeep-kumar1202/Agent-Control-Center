@@ -26,7 +26,7 @@ import type { Request, Response } from "express";
 import simpleGit from "simple-git";
 import { REPOS } from "../../config.js";
 import { ask, askJson } from "../../llm.js";
-import { saveReview, type ReviewRow } from "../../db.js";
+import { saveReview, saveSkillRun, type ReviewRow } from "../../db.js";
 import {
   buildReviewSummary,
   computeVerdict,
@@ -582,6 +582,10 @@ export async function handleReviewSkill(
       );
       envelope.meta = { ...envelope.meta, reviewId };
     } catch { /* DB save failure must never block the response */ }
+    try {
+      const runId = saveSkillRun("review", envelope.status, JSON.stringify(spec), JSON.stringify(envelope));
+      envelope.meta = { ...envelope.meta, runId };
+    } catch { /* non-blocking */ }
 
     res.json(envelope);
   } catch (err) {

@@ -20,6 +20,7 @@ import {
   type TestValidationIssue,
 } from "../../agents/validators.js";
 import type { RepoKey } from "../../config.js";
+import { saveSkillRun } from "../../db.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
 import { pushBranchToFork, createPullRequest } from "../githubPr.js";
 
@@ -511,6 +512,8 @@ export async function handleTestsSkill(req: Request, res: Response): Promise<voi
       results,
       meta: { branch: spec.branch },
     };
+    const runId = saveSkillRun("tests", envelope.status, JSON.stringify(spec), JSON.stringify(envelope));
+    envelope.meta = { ...envelope.meta, runId };
     res.json(envelope);
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

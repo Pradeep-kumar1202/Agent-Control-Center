@@ -18,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import simpleGit from "simple-git";
 import { REPOS } from "../../config.js";
+import { saveSkillRun } from "../../db.js";
 import { askJson } from "../../llm.js";
 import { validateTranslations, type TranslationQualityIssue } from "../../agents/validators.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
@@ -354,6 +355,8 @@ export async function handleTranslationsSkill(req: Request, res: Response): Prom
         backTranslationWarnings: (backTranslationResult as { warnings: string[] }).warnings,
       },
     };
+    const runId = saveSkillRun("translations", envelope.status, JSON.stringify(spec), JSON.stringify(envelope));
+    envelope.meta = { ...envelope.meta, runId };
     res.json(envelope);
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

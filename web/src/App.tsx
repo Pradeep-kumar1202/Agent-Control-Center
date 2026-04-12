@@ -7,6 +7,14 @@ import { RunButton } from "./components/RunButton";
 import { SourceViewer } from "./components/SourceViewer";
 import { SKILLS_REGISTRY, type SkillEnvelopeClient } from "./skills/registry";
 import { ReviewHistory } from "./skills/review/History";
+import { SkillHistory } from "./skills/shared/SkillHistory";
+import { PropsResults } from "./skills/props/Results";
+import { TestsResults } from "./skills/tests/Results";
+
+const SKILL_HISTORY_CONFIG: Record<string, { name: string; formatLabel: (input: Record<string, unknown>) => string; ResultsComponent: React.ComponentType<{ result: SkillEnvelopeClient; onClose: () => void }> }> = {
+  props: { name: "Add Prop", formatLabel: (i) => `Prop: ${i.propName ?? "?"}`, ResultsComponent: PropsResults },
+  tests: { name: "Test Writer", formatLabel: (i) => `Tests for ${i.branch ?? "?"}`, ResultsComponent: TestsResults },
+};
 
 type StatusFilter = "all" | "verified" | "unverified" | "platform_specific" | "patched";
 
@@ -417,6 +425,17 @@ export default function App() {
           >
             Review History
           </button>
+          <button
+            onClick={() => setActiveTab("skill-history")}
+            className={
+              "px-4 py-2 text-sm font-medium border-b-2 transition " +
+              (activeTab === "skill-history"
+                ? "border-teal-400 text-teal-300"
+                : "border-transparent text-slate-500 hover:text-slate-300")
+            }
+          >
+            Skill History
+          </button>
         </div>
       </header>
 
@@ -433,13 +452,16 @@ export default function App() {
             {skillResult && (
               <ResultsComponent
                 result={skillResult}
-                onClose={() =>
+                onClose={() => {
+                  // Keep the result in memory so re-opening the tab shows
+                  // the last result. The data is also persisted in skill_runs
+                  // DB table, so even on page refresh the History tab has it.
                   setSkillResults((prev) => {
                     const next = new Map(prev);
                     next.delete(skill.id);
                     return next;
-                  })
-                }
+                  });
+                }}
               />
             )}
           </div>
@@ -455,6 +477,26 @@ export default function App() {
             </p>
           </div>
           <ReviewHistory />
+        </div>
+      )}
+
+      {activeTab === "skill-history" && (
+        <div className="mt-2 space-y-6">
+          <div className="mb-4">
+            <h2 className="text-lg font-semibold">Skill History</h2>
+            <p className="text-slate-400 text-sm mt-0.5">
+              All past skill runs. Click "View" to reopen the full results with diff, PR link, and branch.
+            </p>
+          </div>
+          {Object.entries(SKILL_HISTORY_CONFIG).map(([id, cfg]) => (
+            <SkillHistory
+              key={id}
+              skillId={id}
+              skillName={cfg.name}
+              formatLabel={cfg.formatLabel}
+              ResultsComponent={cfg.ResultsComponent}
+            />
+          ))}
         </div>
       )}
 
