@@ -95,6 +95,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reviews_at ON reviews(reviewed_at DESC);
 `);
 
+// Chat-with-the-patch-agent thread history. Each row is one "message" in
+// the conversation. Tool uses get their own rows so the UI can render them
+// as distinct chips without re-parsing blobs. Dropping a patch cascades
+// the thread away with it.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    patch_id   INTEGER NOT NULL REFERENCES patches(id) ON DELETE CASCADE,
+    turn       INTEGER NOT NULL,
+    role       TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
+    content    TEXT NOT NULL,
+    tool_name  TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_chat_patch_turn
+    ON chat_messages(patch_id, turn, id);
+`);
+
 // Migrate existing DBs that predate the verified column.
 try {
   db.exec(`ALTER TABLE gaps ADD COLUMN verified INTEGER NOT NULL DEFAULT 0`);
@@ -183,6 +201,16 @@ export type GapPrRow = {
   missing_in: string;
   pr_url: string;
   added_at: string;
+};
+
+export type ChatMessageRow = {
+  id: number;
+  patch_id: number;
+  turn: number;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  tool_name: string | null;
+  created_at: string;
 };
 
 /** Persist a completed review to the database and return its new row ID. */

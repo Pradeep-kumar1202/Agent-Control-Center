@@ -15,6 +15,7 @@ import http from "node:http";
 import path from "node:path";
 import { REPOS, type RepoKey } from "../config.js";
 import { forceCheckoutBranch } from "./submoduleGit.js";
+import { ensureMockServer, stopMockServer } from "./mockServerManager.js";
 import { ensureWsScrcpy, stopWsScrcpy } from "./wsScrcpyManager.js";
 
 export type PreviewKind = "web-dev" | "android-emulator";
@@ -39,17 +40,39 @@ interface PreviewSlot extends PreviewState {
 
 const LOG_RING_SIZE = 200;
 const WEB_PORT = 9050;
+const METRO_PORT = 8081;
 const WEB_READY_TIMEOUT_MS = 120_000;
 const ANDROID_READY_TIMEOUT_MS = 600_000;
 const EMULATOR_BOOT_TIMEOUT_MS = 180_000;
-const PREVIEW_AVD = process.env.PREVIEW_AVD ?? "Medium_Phone";
+const METRO_READY_TIMEOUT_MS = 90_000;
+const RESCRIPT_BUILD_TIMEOUT_MS = 240_000;
+const PREVIEW_AVD = process.env.PREVIEW_AVD ?? "Pixel_9_Pro";
 const ANDROID_HOME = process.env.ANDROID_HOME ?? "/home/sdk/android-sdk";
+// Override defaults (6 GB RAM, 4 CPU cores). config.ini-level values get
+// ignored by the emulator in a few edge cases; the CLI flags win every
+// time. Env-var escape hatches in case the host is tight on memory.
+const EMULATOR_MEMORY_MB = Number(process.env.PREVIEW_EMU_MEMORY_MB ?? 6144);
+const EMULATOR_CORES = Number(process.env.PREVIEW_EMU_CORES ?? 4);
 
 const slots = new Map<RepoKey, PreviewSlot>();
 
 // The emulator is intentionally module-scoped so it survives across previews
 // — booting an AVD takes ~30s and we don't want to pay that on every patch.
 let emulatorProc: ChildProcess | null = null;
+
+// Same logic for Metro (the React Native dev server). Metro is what serves
+// the compiled JS bundle to the running APK via HTTP on port 8081. Without
+// it, the app launches and then fails to load any JS. We keep one Metro
+// alive per repo and reuse it across previews so "reload app" on the
+// emulator picks up chat-agent edits without a full restart.
+let metroProc: ChildProcess | null = null;
+let metroRepoDir: string | null = null;
+// Metro's stdout/stderr listeners are bound once at spawn time, but we
+// want their output to land in the *currently active* preview slot, not
+// the original slot from the first preview (which may have been destroyed
+// and replaced). This ref is updated by ensureMetro on every call so
+// subsequent previews keep seeing live Metro output in their log panel.
+let metroActiveSlot: PreviewSlot | null = null;
 
 function pushLog(slot: PreviewSlot, chunk: string): void {
   for (const line of chunk.split("\n")) {
@@ -66,6 +89,192 @@ function publicState(slot: PreviewSlot): PreviewState {
 
 function adbPath(): string {
   return path.join(ANDROID_HOME, "platform-tools", "adb");
+}
+
+/**
+ * Run `yarn re:build` (= `rescript`) once in the repo to compile .res → .bs.js.
+ * Blocks until the compile exits. Streams both stdout and stderr into the
+ * slot's log buffer so the user sees it in the drawer. Not a real-time
+ * watcher — just one pass. Metro handles subsequent rebuilds once the agent
+ * edits files through chat + re-runs `npm run re:build` via Bash.
+ */
+async function buildRescript(slot: PreviewSlot, repoDir: string): Promise<void> {
+  pushLog(slot, `[re:build] compiling ReScript in ${path.basename(repoDir)}…`);
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn("npm", ["run", "--silent", "re:build"], {
+      cwd: repoDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, FORCE_COLOR: "0" },
+    });
+    const timer = setTimeout(() => {
+      proc.kill("SIGKILL");
+      reject(new Error(`re:build timed out after ${RESCRIPT_BUILD_TIMEOUT_MS / 1000}s`));
+    }, RESCRIPT_BUILD_TIMEOUT_MS);
+    proc.stdout?.on("data", (b) => pushLog(slot, `[re:build] ${b.toString().trimEnd()}`));
+    proc.stderr?.on("data", (b) => pushLog(slot, `[re:build] ${b.toString().trimEnd()}`));
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        pushLog(slot, `[re:build] finished clean`);
+        resolve();
+      } else {
+        reject(new Error(`re:build exited with code ${code}`));
+      }
+    });
+  });
+}
+
+/**
+ * Physically remove Metro's disk caches before a fresh spawn.
+ *
+ * In theory `react-native start --reset-cache` wipes these. In practice
+ * we've seen Metro serve stale bundles across restarts — the transform
+ * cache at /tmp/metro-cache accumulates hundreds of subdirs keyed by
+ * content hash, and the haste-map snapshot at /tmp/metro-file-map-* is
+ * occasionally preserved across restarts. Deleting both before each
+ * spawn guarantees Metro starts with zero on-disk memory.
+ *
+ * Safe to run while Metro is NOT running (unused files just get removed).
+ * Never run while Metro IS running — you'll corrupt the live haste-map.
+ */
+async function nukeMetroDiskCache(log: (line: string) => void): Promise<void> {
+  const fsp = await import("node:fs/promises");
+  const targets = [
+    "/tmp/metro-cache",
+    // metro-file-map-<hash>-<another-hash> ← hashes vary per project. Use
+    // a glob-ish scan so we catch all of them.
+  ];
+  let removed = 0;
+  for (const t of targets) {
+    try {
+      await fsp.rm(t, { recursive: true, force: true });
+      removed++;
+    } catch { /* already gone */ }
+  }
+  try {
+    const entries = await fsp.readdir("/tmp");
+    for (const name of entries) {
+      if (name.startsWith("metro-file-map-")) {
+        try {
+          await fsp.rm(`/tmp/${name}`, { force: true });
+          removed++;
+        } catch { /* */ }
+      }
+    }
+  } catch { /* */ }
+  log(`[metro] nuked disk cache (${removed} paths)`);
+}
+
+/**
+ * Ensure Metro (the React Native dev server) is running and bound to
+ * METRO_PORT for this repo. Idempotent — returns immediately if a Metro
+ * for this repo is already alive. If a Metro is running for a *different*
+ * repo, we tear it down first (Metro binds the port, only one at a time).
+ *
+ * Ready detection: ping port 8081 until it responds.
+ */
+async function ensureMetro(slot: PreviewSlot, repoDir: string): Promise<void> {
+  // Every call routes Metro's background logs to whichever slot is the
+  // caller. Without this, the stdout handler captured the first-ever slot
+  // in a closure and subsequent previews never saw Metro output.
+  metroActiveSlot = slot;
+
+  // Already running for the same repo? Just check the port.
+  if (metroProc && metroProc.exitCode === null && metroRepoDir === repoDir) {
+    if (await pingWebPort(METRO_PORT)) {
+      pushLog(slot, `[metro] reusing existing process pid=${metroProc.pid} (port ${METRO_PORT} live)`);
+      return;
+    }
+    // Process alive but port not responding — something's wrong, kill it.
+    pushLog(slot, `[metro] existing process is not responding on ${METRO_PORT}, restarting`);
+    try { process.kill(-metroProc.pid!, "SIGKILL"); } catch { /* */ }
+    metroProc = null;
+    metroRepoDir = null;
+  }
+
+  // Different repo or not running — start fresh.
+  if (metroProc && metroProc.exitCode === null) {
+    pushLog(slot, `[metro] stopping existing process for ${metroRepoDir}`);
+    try { process.kill(-metroProc.pid!, "SIGTERM"); } catch { /* */ }
+    await new Promise((r) => setTimeout(r, 500));
+    metroProc = null;
+    metroRepoDir = null;
+  }
+
+  // Orphan detection: if port 8081 is already bound but `metroProc` is
+  // null, it's a Metro from a previous tsx-watch iteration (our server
+  // reloaded, losing the ref). Adopting it silently is WORSE than killing
+  // it because the orphan's haste-map / bundle cache is frozen from
+  // whenever it started — any .bs.js files written after that point won't
+  // appear in its output. Kill and respawn.
+  if (await pingWebPort(METRO_PORT)) {
+    const owner = await findPortOwnerPid(METRO_PORT);
+    pushLog(
+      slot,
+      `[metro] port ${METRO_PORT} is bound by an orphan (pid=${owner ?? "unknown"}) — killing for a fresh start with current .bs.js`,
+    );
+    if (owner) {
+      try { process.kill(owner, "SIGTERM"); } catch { /* */ }
+      await new Promise((r) => setTimeout(r, 1000));
+      // If it's still there, escalate.
+      if (await pingWebPort(METRO_PORT)) {
+        try { process.kill(owner, "SIGKILL"); } catch { /* */ }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+  }
+
+  // Wipe Metro's on-disk caches before spawning so --reset-cache doesn't
+  // have to rely on its own invalidation (which has been unreliable in
+  // practice). Only safe when Metro is *not* running — the orphan kill
+  // above guarantees that.
+  await nukeMetroDiskCache((line) => pushLog(slot, line));
+
+  pushLog(slot, `[metro] starting in ${path.basename(repoDir)}`);
+  const proc = spawn("npm", ["run", "start"], {
+    cwd: repoDir,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, FORCE_COLOR: "0", CI: "1" },
+  });
+  metroProc = proc;
+  metroRepoDir = repoDir;
+  // These handlers read `metroActiveSlot` from module scope, NOT the
+  // captured `slot` parameter, so they always write to the current
+  // preview's log buffer — even across multiple preview runs.
+  proc.stdout?.on("data", (b) => {
+    if (metroActiveSlot) pushLog(metroActiveSlot, `[metro] ${b.toString().trimEnd()}`);
+  });
+  proc.stderr?.on("data", (b) => {
+    if (metroActiveSlot) pushLog(metroActiveSlot, `[metro!] ${b.toString().trimEnd()}`);
+  });
+  proc.on("exit", (code, signal) => {
+    if (metroActiveSlot) {
+      pushLog(metroActiveSlot, `[metro] exited code=${code} signal=${signal}`);
+    }
+    if (metroProc === proc) {
+      metroProc = null;
+      metroRepoDir = null;
+    }
+  });
+
+  // Wait for the port to answer.
+  const deadline = Date.now() + METRO_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (await pingWebPort(METRO_PORT)) {
+      pushLog(slot, `[metro] ready on ${METRO_PORT}`);
+      return;
+    }
+    if (proc.exitCode !== null) {
+      throw new Error(`metro exited early with code ${proc.exitCode}`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(`metro did not become ready within ${METRO_READY_TIMEOUT_MS / 1000}s`);
 }
 
 function emulatorBin(): string {
@@ -112,7 +321,10 @@ async function prepareAndroidDevice(slot: PreviewSlot): Promise<void> {
   if (emulatorProc && emulatorProc.exitCode === null) {
     pushLog(slot, `[emulator] reusing existing emulator pid=${emulatorProc.pid}`);
   } else {
-    pushLog(slot, `[emulator] booting AVD ${PREVIEW_AVD} headless`);
+    pushLog(
+      slot,
+      `[emulator] booting AVD ${PREVIEW_AVD} headless (memory=${EMULATOR_MEMORY_MB}MB cores=${EMULATOR_CORES})`,
+    );
     emulatorProc = spawn(
       emulatorBin(),
       [
@@ -124,6 +336,10 @@ async function prepareAndroidDevice(slot: PreviewSlot): Promise<void> {
         "-no-boot-anim",
         "-gpu",
         "swiftshader_indirect",
+        "-memory",
+        String(EMULATOR_MEMORY_MB),
+        "-cores",
+        String(EMULATOR_CORES),
       ],
       {
         detached: true,
@@ -158,6 +374,59 @@ async function prepareAndroidDevice(slot: PreviewSlot): Promise<void> {
   throw new Error(
     `emulator failed to reach sys.boot_completed=1 within ${EMULATOR_BOOT_TIMEOUT_MS / 1000}s`,
   );
+}
+
+/**
+ * Find the PID of whatever process is listening on a local TCP port. Used
+ * for orphan cleanup — if Metro (or any sidecar) is bound to the port but
+ * we don't own the handle, we need to kill the owner before spawning a
+ * replacement.
+ *
+ * Implementation: reads /proc/net/tcp + /proc/net/tcp6 to find the inode
+ * for the listening socket, then walks /proc/<pid>/fd to find the process
+ * that has that inode open. No external dependencies.
+ */
+async function findPortOwnerPid(port: number): Promise<number | null> {
+  const portHex = port.toString(16).toUpperCase().padStart(4, "0");
+  // Listen state = 0A in /proc/net/tcp. Local address column is "ip:port".
+  const fs = await import("node:fs");
+  let inode: string | null = null;
+  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    try {
+      const content = fs.readFileSync(file, "utf8");
+      for (const line of content.split("\n").slice(1)) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 10) continue;
+        const [, local, , state, , , , , , ino] = cols;
+        if (state !== "0A") continue; // listen
+        if (!local?.endsWith(":" + portHex)) continue;
+        inode = ino;
+        break;
+      }
+    } catch { /* */ }
+    if (inode) break;
+  }
+  if (!inode) return null;
+  // Walk /proc/*/fd/* looking for a symlink to "socket:[<inode>]".
+  const target = `socket:[${inode}]`;
+  let pids: string[] = [];
+  try {
+    pids = fs.readdirSync("/proc").filter((n) => /^\d+$/.test(n));
+  } catch {
+    return null;
+  }
+  for (const pid of pids) {
+    try {
+      const fdDir = `/proc/${pid}/fd`;
+      for (const fd of fs.readdirSync(fdDir)) {
+        try {
+          const link = fs.readlinkSync(`${fdDir}/${fd}`);
+          if (link === target) return Number(pid);
+        } catch { /* */ }
+      }
+    } catch { /* */ }
+  }
+  return null;
 }
 
 async function pingWebPort(port: number): Promise<boolean> {
@@ -202,6 +471,7 @@ export async function startPreview(
   slots.set(repoKey, slot);
 
   if (kind === "android-emulator") {
+    pushLog(slot, `── phase 1/5: emulator ────────────────────────────`);
     try {
       await prepareAndroidDevice(slot);
     } catch (err) {
@@ -215,6 +485,35 @@ export async function startPreview(
     void ensureWsScrcpy().catch((e) =>
       pushLog(slot, `[ws-scrcpy] failed to start: ${(e as Error).message}`),
     );
+
+    pushLog(slot, `── phase 2/5: ReScript compile ────────────────────`);
+    try {
+      await buildRescript(slot, repoDir);
+    } catch (err) {
+      slot.status = "failed";
+      slot.error = `ReScript build failed: ${(err as Error).message}`;
+      return publicState(slot);
+    }
+
+    pushLog(slot, `── phase 3/5: Metro dev server (port ${METRO_PORT}) ──`);
+    try {
+      await ensureMetro(slot, repoDir);
+    } catch (err) {
+      slot.status = "failed";
+      slot.error = `Metro did not start: ${(err as Error).message}`;
+      return publicState(slot);
+    }
+
+    pushLog(slot, `── phase 4/5: mock merchant server (port 5252) ────`);
+    try {
+      await ensureMockServer(repoKey, (line) => pushLog(slot, line));
+    } catch (err) {
+      slot.status = "failed";
+      slot.error = `mock merchant server did not start: ${(err as Error).message}`;
+      return publicState(slot);
+    }
+
+    pushLog(slot, `── phase 5/5: install + launch APK ─────────────────`);
   }
 
   const cmd = "npm";
@@ -325,6 +624,59 @@ async function killSlot(slot: PreviewSlot): Promise<void> {
   }
 }
 
+/**
+ * Force a clean restart of Metro for the mobile repo. Kills the current
+ * Metro (process group + orphan scan for safety), then spawns a fresh one
+ * via ensureMetro. Since the npm script is `react-native start
+ * --reset-cache --client-logs`, the new process re-crawls the entire file
+ * tree and rebuilds the haste-map from scratch — guarantees the next
+ * bundle fetch reflects every .bs.js / .res edit on disk.
+ *
+ * Used by /preview/mobile/recompile after the chat agent has edited files
+ * and we need to be SURE Metro picks them up (its filesystem watcher
+ * races the agent on fast edits and sometimes loses).
+ */
+export async function forceRestartMetro(repoDir: string): Promise<void> {
+  // Kill our own process group reference first.
+  if (metroProc && metroProc.exitCode === null && metroProc.pid) {
+    try {
+      process.kill(-metroProc.pid, "SIGTERM");
+    } catch {
+      try { metroProc.kill("SIGTERM"); } catch { /* */ }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+    if (metroProc && metroProc.exitCode === null && metroProc.pid) {
+      try { process.kill(-metroProc.pid, "SIGKILL"); } catch { /* */ }
+    }
+  }
+  metroProc = null;
+  metroRepoDir = null;
+
+  // Also look for and kill any orphaned Metro listening on the port
+  // (tsx-watch reload residue, test spawns, etc). ensureMetro's own
+  // orphan-detection handles this, but doing it here too avoids a race
+  // where ensureMetro sees our just-killed process's TIME_WAIT state.
+  if (await pingWebPort(METRO_PORT)) {
+    const owner = await findPortOwnerPid(METRO_PORT);
+    if (owner) {
+      try { process.kill(owner, "SIGKILL"); } catch { /* */ }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  // Respawn via the normal path. If there's an active slot we route logs
+  // into it; otherwise fall back to a stub slot that drops logs.
+  const activeSlot = metroActiveSlot ?? {
+    repoKey: "mobile" as RepoKey,
+    kind: "android-emulator" as PreviewKind,
+    branch: "",
+    status: "starting" as PreviewStatus,
+    startedAt: Date.now(),
+    logs: [],
+  };
+  await ensureMetro(activeSlot, repoDir);
+}
+
 export async function stopPreview(repoKey: RepoKey): Promise<PreviewState | null> {
   const slot = slots.get(repoKey);
   if (!slot) return null;
@@ -363,6 +715,19 @@ export async function stopAllPreviews(): Promise<void> {
     }
   }
   emulatorProc = null;
+  // And Metro.
+  if (metroProc && metroProc.exitCode === null && metroProc.pid) {
+    try {
+      process.kill(-metroProc.pid, "SIGTERM");
+    } catch {
+      try { metroProc.kill("SIGTERM"); } catch { /* */ }
+    }
+  }
+  metroProc = null;
+  metroRepoDir = null;
+  metroActiveSlot = null;
+  // And the mock merchant server.
+  await stopMockServer();
   // And the ws-scrcpy sidecar.
   await stopWsScrcpy();
 }

@@ -48,6 +48,8 @@ export default function App() {
     branch: string;
     prUrl?: string | null;
     prWarning?: string | null;
+    patchId?: number | null;
+    gapName?: string;
   } | null>(null);
   const [verifyAllProgress, setVerifyAllProgress] = useState<{
     current: number;
@@ -607,11 +609,14 @@ export default function App() {
             onRemovePr={onRemovePr}
             onOpenPreview={(repoKey, branch, gapId) => {
               const p = gapId != null ? patchData.get(gapId) : undefined;
+              const gap = gaps.find((g) => g.id === gapId);
               setActivePreview({
                 repoKey,
                 branch,
                 prUrl: p?.prUrl ?? null,
                 prWarning: p?.prWarning ?? null,
+                patchId: p?.patchId ?? null,
+                gapName: gap?.canonical_name,
               });
             }}
           />
@@ -632,6 +637,8 @@ export default function App() {
           branch={activePreview.branch}
           prUrl={activePreview.prUrl}
           prWarning={activePreview.prWarning}
+          patchId={activePreview.patchId}
+          gapName={activePreview.gapName}
           onClose={() => setActivePreview(null)}
         />
       )}

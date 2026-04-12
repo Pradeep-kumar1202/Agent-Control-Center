@@ -43,6 +43,29 @@ export type ValidateResponse =
       gap: Gap;
     };
 
+export interface ChatMessageRow {
+  id: number;
+  patch_id: number;
+  turn: number;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  tool_name: string | null;
+  created_at: string;
+}
+
+/**
+ * One event from the POST /patches/:id/chat NDJSON stream. Mirrors
+ * server/src/llm.ts → StreamChunk but with the wire field names.
+ */
+export interface ChatStreamChunk {
+  type: "text" | "tool_use" | "tool_result" | "done" | "error";
+  text?: string;
+  tool?: { name: string; input?: unknown; id?: string };
+  toolResult?: { id: string; content?: string; isError?: boolean };
+  error?: string;
+  turn?: number;
+}
+
 export interface PatchResponse {
   patchId: number;
   branch: string;
@@ -139,6 +162,15 @@ export const api = {
       `${BASE}/gaps/${gapId}/source`,
     ),
   listPatches: () => jsonFetch<PatchRow[]>(`${BASE}/patches`),
+  // ─── Chat-with-the-patch-agent ───────────────────────────────────────────
+  getChatMessages: (patchId: number) =>
+    jsonFetch<{ patchId: number; messages: ChatMessageRow[] }>(
+      `${BASE}/patches/${patchId}/chat`,
+    ),
+  clearChat: (patchId: number) =>
+    jsonFetch<{ deleted: number }>(`${BASE}/patches/${patchId}/chat`, {
+      method: "DELETE",
+    }),
   // Legacy props endpoint (backward compat)
   generateProp: (spec: PropSpec) =>
     jsonFetch<PropGenerateResponse>(`${BASE}/props/generate`, {

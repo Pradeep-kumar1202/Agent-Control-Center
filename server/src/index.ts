@@ -3,6 +3,7 @@ import express from "express";
 import { PORT } from "./config.js";
 import { db } from "./db.js";
 import { analyzeRouter } from "./routes/analyze.js";
+import { chatRouter } from "./routes/chat.js";
 import { gapsRouter } from "./routes/gaps.js";
 import { patchesRouter } from "./routes/patches.js";
 import { previewRouter } from "./routes/preview.js";
@@ -25,6 +26,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.use(analyzeRouter);
+app.use(chatRouter);     // /patches/:id/chat (iteration 8 — in-drawer chat)
 app.use(gapsRouter);
 app.use(patchesRouter);
 app.use(previewRouter);  // /preview/* (dev-server lifecycle for demo videos)
