@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { DATA_DIR, DB_PATH, PATCHES_DIR } from "./config.js";
+import { DATA_DIR, DB_PATH, PATCHES_DIR, PROJECT_ROOT } from "./config.js";
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(PATCHES_DIR, { recursive: true });
@@ -156,6 +156,91 @@ try {
 try {
   db.exec(`ALTER TABLE patches ADD COLUMN pr_warning TEXT`);
 } catch { /* already exists */ }
+
+// ── Seed import ─────────────────────────────────────────────────────────────
+// On a fresh clone the DB is empty. If seed/verified-gaps.json and
+// seed/dismissed-gaps.json exist (checked into git), auto-import them so
+// the new user starts with the curated, verified gap list — no need to
+// re-run the full analysis pipeline.
+(function importSeedIfEmpty() {
+  const gapCount = (db.prepare("SELECT COUNT(*) AS n FROM gaps").get() as { n: number }).n;
+  if (gapCount > 0) return; // DB already has data — skip
+
+  const seedDir = path.join(PROJECT_ROOT, "seed");
+  const verifiedPath = path.join(seedDir, "verified-gaps.json");
+  const dismissedPath = path.join(seedDir, "dismissed-gaps.json");
+
+  if (!fs.existsSync(verifiedPath)) return; // no seed files — skip
+
+  console.log("[seed] empty DB detected — importing seed data");
+
+  // Create a placeholder report row so gaps have a report_id FK
+  const reportId = (
+    db
+      .prepare(
+        `INSERT INTO reports (created_at, web_sha, mobile_sha, status)
+         VALUES (?, 'seed', 'seed', 'done')`,
+      )
+      .run(new Date().toISOString()).lastInsertRowid as number
+  );
+
+  // Import verified gaps
+  try {
+    const gaps = JSON.parse(fs.readFileSync(verifiedPath, "utf8")) as Array<Record<string, unknown>>;
+    const stmt = db.prepare(
+      `INSERT INTO gaps (report_id, category, canonical_name, missing_in, present_in,
+        evidence, rationale, severity, platform_specific, verified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const tx = db.transaction((rows: Array<Record<string, unknown>>) => {
+      for (const g of rows) {
+        stmt.run(
+          reportId,
+          g.category,
+          g.canonical_name,
+          g.missing_in,
+          g.present_in,
+          g.evidence,
+          g.rationale,
+          g.severity,
+          g.platform_specific ?? 0,
+          g.verified ?? 1,
+        );
+      }
+    });
+    tx(gaps);
+    console.log(`[seed] imported ${gaps.length} verified gaps`);
+  } catch (err) {
+    console.error("[seed] failed to import verified gaps:", err);
+  }
+
+  // Import dismissed gaps
+  if (fs.existsSync(dismissedPath)) {
+    try {
+      const dismissed = JSON.parse(fs.readFileSync(dismissedPath, "utf8")) as Array<Record<string, unknown>>;
+      const stmt = db.prepare(
+        `INSERT OR IGNORE INTO dismissed_gaps (category, canonical_name, missing_in, reason, found_in_missing, dismissed_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      const tx = db.transaction((rows: Array<Record<string, unknown>>) => {
+        for (const d of rows) {
+          stmt.run(
+            d.category,
+            d.canonical_name,
+            d.missing_in,
+            d.reason ?? "imported from seed",
+            d.found_in_missing ?? null,
+            new Date().toISOString(),
+          );
+        }
+      });
+      tx(dismissed);
+      console.log(`[seed] imported ${dismissed.length} dismissed gaps`);
+    } catch (err) {
+      console.error("[seed] failed to import dismissed gaps:", err);
+    }
+  }
+})();
 
 export function nowIso(): string {
   return new Date().toISOString();
