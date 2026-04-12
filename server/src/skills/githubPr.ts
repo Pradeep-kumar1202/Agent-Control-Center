@@ -218,9 +218,19 @@ function escapeRegex(s: string): string {
 }
 
 /**
- * Open a pull request from the bot's fork against juspay:main using `gh pr
- * create`. The gh CLI is already authenticated as the bot (see `gh auth
- * status`), so no token plumbing is needed here.
+ * Open a pull request **inside the bot's own fork** — i.e. the head is the
+ * feature branch, the base is the fork's own `main`. We deliberately do
+ * NOT target juspay:main because:
+ *
+ *   1. The bot doesn't have merge permission on juspay/* — any PR there
+ *      would sit open waiting for upstream maintainers.
+ *   2. Testing our dashboard end-to-end needs a PR the user can merge
+ *      themselves, exercising the full "build → PR → review → merge"
+ *      story without cross-org approval.
+ *
+ * `gh pr create` inside a single repo doesn't need the `owner:branch`
+ * prefix for `--head` — we pass just the branch name. The base is `main`
+ * of the same fork.
  */
 export async function createPullRequest(args: {
   repoKey: RepoKey;
@@ -228,8 +238,7 @@ export async function createPullRequest(args: {
   title: string;
   body: string;
 }): Promise<{ prUrl: string; prNumber: number }> {
-  const upstream = upstreamSlug(args.repoKey);
-  const head = `${FORK_CONFIG.owner}:${args.branch}`;
+  const fork = forkSlug(args.repoKey);
 
   // gh pr create prints the PR URL to stdout on success.
   const url = await run(
@@ -238,9 +247,9 @@ export async function createPullRequest(args: {
       "pr",
       "create",
       "--repo",
-      upstream,
+      fork,
       "--head",
-      head,
+      args.branch,
       "--base",
       "main",
       "--title",
@@ -256,6 +265,27 @@ export async function createPullRequest(args: {
     throw new Error(`gh pr create returned unexpected output: ${url}`);
   }
   return { prUrl: url, prNumber: Number(match[1]) };
+}
+
+/**
+ * Return the number of commits on `branch` that are ahead of the bot fork's
+ * `main`. Used as a post-commit sanity check: if we're about to push a
+ * branch that has zero new commits, something earlier failed silently —
+ * abort loudly instead of opening an empty PR.
+ */
+export async function commitsAheadOfForkMain(
+  repoDir: string,
+  branch: string,
+): Promise<number> {
+  const git = simpleGit(repoDir);
+  try {
+    // Use main@origin if local main is ahead; otherwise plain main.
+    const out = await git.raw(["rev-list", "--count", `main..${branch}`]);
+    const n = Number(out.trim());
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** Build a PR markdown body from agent summary + build log + branch info. */

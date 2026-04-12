@@ -134,6 +134,207 @@ export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
 }
 
 /**
+ * Streaming variant of `ask`. Spawns `claude -p --output-format stream-json`
+ * and invokes `onChunk` as events arrive, so a caller can forward them to an
+ * HTTP response (NDJSON) or a websocket in real time.
+ *
+ * The chunk shape is our own, not Anthropic's — we normalize their stream-
+ * json into four categories the chat route cares about: plain text from the
+ * assistant, tool_use calls, tool_result responses, and a terminal "done"
+ * marker. Errors surface as a single `{type: "error"}` chunk before the
+ * returned promise rejects.
+ *
+ * Note: `--output-format stream-json` requires `--verbose` to actually emit
+ * per-event lines (the CLI is strict about this).
+ */
+export interface StreamChunk {
+  type: "text" | "tool_use" | "tool_result" | "done" | "error";
+  /** Assistant text delta (type: "text"). */
+  text?: string;
+  /** Tool call details (type: "tool_use"). */
+  tool?: { name: string; input?: unknown; id?: string };
+  /** Tool result from a tool_use by id (type: "tool_result"). */
+  toolResult?: { id: string; content?: string; isError?: boolean };
+  /** Human-readable error when the stream can't be parsed or the CLI dies. */
+  error?: string;
+}
+
+export function askStream(
+  prompt: string,
+  opts: AskOptions,
+  onChunk: (chunk: StreamChunk) => void,
+): Promise<void> {
+  const {
+    model = "sonnet",
+    timeoutMs = 180_000,
+    system,
+    cwd,
+    allowedTools,
+  } = opts;
+
+  const args = [
+    "-p",
+    "--model",
+    model,
+    "--output-format",
+    "stream-json",
+    // stream-json requires verbose mode to actually emit incremental events.
+    "--verbose",
+    "--no-session-persistence",
+  ];
+  if (system) args.push("--append-system-prompt", system);
+  if (allowedTools && allowedTools.length > 0) {
+    args.push("--allowed-tools", allowedTools.join(" "));
+    args.push("--permission-mode", "bypassPermissions");
+  } else {
+    args.push("--tools", "");
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("claude", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+      cwd,
+    });
+    activeChildren.add(child);
+
+    let buf = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      onChunk({ type: "error", error: `claude CLI timed out after ${timeoutMs}ms` });
+      reject(new LLMError(`claude CLI timed out after ${timeoutMs}ms`, stderr));
+    }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      activeChildren.delete(child);
+    };
+
+    child.stdout.on("data", (raw) => {
+      buf += raw.toString();
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const evt = JSON.parse(line) as StreamEvent;
+          for (const chunk of mapStreamEvent(evt)) onChunk(chunk);
+        } catch {
+          onChunk({ type: "error", error: `unparseable stream-json line: ${line.slice(0, 200)}` });
+        }
+      }
+    });
+    child.stderr.on("data", (raw) => (stderr += raw.toString()));
+
+    child.on("error", (err) => {
+      cleanup();
+      onChunk({ type: "error", error: `failed to spawn claude: ${err.message}` });
+      reject(new LLMError(`failed to spawn claude: ${err.message}`, stderr));
+    });
+
+    child.on("close", (code, signal) => {
+      cleanup();
+      // Drain any trailing line without a newline.
+      if (buf.trim()) {
+        try {
+          const evt = JSON.parse(buf.trim()) as StreamEvent;
+          for (const chunk of mapStreamEvent(evt)) onChunk(chunk);
+        } catch { /* ignore trailing noise */ }
+      }
+      if (signal === "SIGKILL") {
+        onChunk({ type: "error", error: "claude CLI cancelled (SIGKILL)" });
+        reject(new LLMError("claude CLI cancelled (SIGKILL)"));
+        return;
+      }
+      if (code !== 0) {
+        onChunk({ type: "error", error: `claude CLI exited with code ${code}` });
+        reject(new LLMError(`claude CLI exited with code ${code}`, stderr));
+        return;
+      }
+      onChunk({ type: "done" });
+      resolve();
+    });
+
+    child.stdin.write(prompt);
+    child.stdin.end();
+  });
+}
+
+// ─── stream-json event mapping ──────────────────────────────────────────────
+//
+// The CLI's stream-json shape is loosely based on Anthropic's Messages API
+// streaming events. We only care about a handful of variants; everything
+// else is ignored. These types are narrow on purpose — anything unknown is
+// skipped by mapStreamEvent rather than blowing up the chat.
+
+interface StreamEvent {
+  type?: string;
+  subtype?: string;
+  message?: {
+    content?: Array<
+      | { type: "text"; text: string }
+      | { type: "tool_use"; id?: string; name?: string; input?: unknown }
+      | { type: "tool_result"; tool_use_id?: string; content?: unknown; is_error?: boolean }
+    >;
+  };
+}
+
+function mapStreamEvent(evt: StreamEvent): StreamChunk[] {
+  const out: StreamChunk[] = [];
+  if (!evt || typeof evt !== "object") return out;
+
+  // assistant message: text + tool_use blocks.
+  if (evt.type === "assistant" && evt.message?.content) {
+    for (const block of evt.message.content) {
+      if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
+        out.push({ type: "text", text: block.text });
+      } else if (block.type === "tool_use") {
+        out.push({
+          type: "tool_use",
+          tool: {
+            name: block.name ?? "unknown",
+            input: block.input,
+            id: block.id,
+          },
+        });
+      }
+    }
+    return out;
+  }
+
+  // user message (from the CLI's side): carries tool_result entries for
+  // tool_use blocks the assistant just emitted.
+  if (evt.type === "user" && evt.message?.content) {
+    for (const block of evt.message.content) {
+      if (block.type === "tool_result") {
+        const content = typeof block.content === "string"
+          ? block.content
+          : JSON.stringify(block.content ?? null);
+        out.push({
+          type: "tool_result",
+          toolResult: {
+            id: block.tool_use_id ?? "",
+            content,
+            isError: block.is_error === true,
+          },
+        });
+      }
+    }
+    return out;
+  }
+
+  // terminal event — we signal done ourselves on process exit, but treat
+  // the CLI's explicit result event as a hint.
+  if (evt.type === "result") {
+    return out; // handled on exit
+  }
+
+  return out;
+}
+
+/**
  * Ask the model and parse a JSON response. Strips ```json fences if present.
  */
 export async function askJson<T = unknown>(

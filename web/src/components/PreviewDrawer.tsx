@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type PreviewKind, type PreviewState } from "../api";
+import { ChatPanel } from "./ChatPanel";
 
 interface Props {
   repoKey: "web" | "mobile";
@@ -8,6 +9,10 @@ interface Props {
   prUrl?: string | null;
   /** Warning text from the patches table when PR creation failed. */
   prWarning?: string | null;
+  /** Patch row ID — required for chat. Undefined hides the chat panel. */
+  patchId?: number | null;
+  /** Canonical name of the gap, shown in the chat panel header. */
+  gapName?: string;
   onClose: () => void;
 }
 
@@ -68,7 +73,7 @@ function defaultKindFor(repoKey: "web" | "mobile"): PreviewKind {
  * Logs from previewManager are tailed live below the viewport so the user
  * can watch builds and emulator boot output without leaving the drawer.
  */
-export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, onClose }: Props) {
+export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, patchId, gapName, onClose }: Props) {
   const kind = defaultKindFor(repoKey);
   const [state, setState] = useState<PreviewState | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -76,6 +81,11 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, onClose }: Pr
   const [shotTick, setShotTick] = useState(0);
   const [tapRipple, setTapRipple] = useState<{ x: number; y: number; id: number } | null>(null);
   const [mirrorPort, setMirrorPort] = useState<number | null>(null);
+  // Collapsed by default for recording — viewport gets all vertical space.
+  // User can expand if they want to debug logs during a run.
+  const [logsExpanded, setLogsExpanded] = useState(false);
+  const [recompileBusy, setRecompileBusy] = useState(false);
+  const [reloadBusy, setReloadBusy] = useState(false);
   const [mirrorError, setMirrorError] = useState<string | null>(null);
   const pollTimer = useRef<number | null>(null);
   const shotTimer = useRef<number | null>(null);
@@ -210,8 +220,8 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, onClose }: Pr
   })();
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-black/50">
-      <div className="w-full sm:w-[60vw] h-full bg-slate-900 border-l border-slate-700 shadow-2xl flex flex-col">
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/60">
+      <div className="w-full lg:w-[92vw] xl:w-[88vw] h-full bg-slate-900 border-l border-slate-700 shadow-2xl flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-700 px-5 py-3">
           <div className="min-w-0">
@@ -277,8 +287,10 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, onClose }: Pr
           </div>
         </div>
 
-        {/* Viewport */}
-        <div className="flex-1 min-h-0 flex flex-col">
+        {/* Body: viewport column (left) + chat panel (right) */}
+        <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
+        {/* Viewport column */}
+        <div className="flex-1 min-h-0 flex flex-col lg:w-[65%]">
           <div className="flex-1 min-h-0 bg-slate-950 flex items-center justify-center overflow-hidden">
             {error && (
               <div className="text-sm text-red-400 max-w-md text-center px-4">
@@ -366,50 +378,55 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, onClose }: Pr
             )}
           </div>
 
-          {/* Mobile-only nav bar: back/home buttons for the screenshot
-              fallback. Hidden when ws-scrcpy is active because the iframe
-              has its own touch/keyboard controls. */}
-          {kind === "android-emulator" && state?.status === "ready" && !mirrorPort && (
-            <div className="border-t border-slate-800 bg-slate-950/60 px-4 py-1.5 flex items-center gap-2">
-              <button
-                onClick={() =>
-                  fetch("/api/preview/mobile/key", {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ keycode: "KEYCODE_BACK" }),
-                  }).catch(() => {})
-                }
-                className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 hover:border-fuchsia-500 hover:text-fuchsia-300"
-                title="Send back key (KEYCODE_BACK)"
-              >
-                ◀ Back
-              </button>
-              <button
-                onClick={() =>
-                  fetch("/api/preview/mobile/key", {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ keycode: "KEYCODE_HOME" }),
-                  }).catch(() => {})
-                }
-                className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 hover:border-fuchsia-500 hover:text-fuchsia-300"
-                title="Send home key"
-              >
-                ● Home
-              </button>
-              <button
-                onClick={() =>
-                  fetch("/api/preview/mobile/key", {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ keycode: "KEYCODE_APP_SWITCH" }),
-                  }).catch(() => {})
-                }
-                className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 hover:border-fuchsia-500 hover:text-fuchsia-300"
-                title="App switcher"
-              >
-                ▣ Apps
-              </button>
+          {/* Mobile nav bar — always visible when android preview is ready.
+              Back/Home/Apps are only for the screenshot fallback (ws-scrcpy
+              iframe has its own touch + key controls), but Reload JS,
+              Compile & reload, and Relaunch app are always relevant. */}
+          {kind === "android-emulator" && state?.status === "ready" && (
+            <div className="border-t border-slate-800 bg-slate-950/60 px-4 py-1.5 flex items-center gap-2 flex-wrap">
+              {!mirrorPort && (
+                <>
+                  <button
+                    onClick={() =>
+                      fetch("/api/preview/mobile/key", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ keycode: "KEYCODE_BACK" }),
+                      }).catch(() => {})
+                    }
+                    className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 hover:border-fuchsia-500 hover:text-fuchsia-300"
+                    title="Send back key (KEYCODE_BACK)"
+                  >
+                    ◀ Back
+                  </button>
+                  <button
+                    onClick={() =>
+                      fetch("/api/preview/mobile/key", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ keycode: "KEYCODE_HOME" }),
+                      }).catch(() => {})
+                    }
+                    className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 hover:border-fuchsia-500 hover:text-fuchsia-300"
+                    title="Send home key"
+                  >
+                    ● Home
+                  </button>
+                  <button
+                    onClick={() =>
+                      fetch("/api/preview/mobile/key", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ keycode: "KEYCODE_APP_SWITCH" }),
+                      }).catch(() => {})
+                    }
+                    className="rounded border border-slate-700 px-2 py-0.5 text-[10px] text-slate-300 hover:border-fuchsia-500 hover:text-fuchsia-300"
+                    title="App switcher"
+                  >
+                    ▣ Apps
+                  </button>
+                </>
+              )}
               <button
                 onClick={() =>
                   fetch("/api/preview/mobile/launch-app", { method: "POST" }).catch(() => {})
@@ -419,21 +436,75 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, onClose }: Pr
               >
                 ↻ Relaunch app
               </button>
-              <span className="text-[10px] text-slate-500 ml-auto">
-                tip: click anywhere on the screen to tap
-              </span>
+              <button
+                onClick={async () => {
+                  setReloadBusy(true);
+                  try { await fetch("/api/preview/mobile/metro-reload", { method: "POST" }); } catch { /* */ }
+                  setReloadBusy(false);
+                }}
+                disabled={reloadBusy}
+                className="rounded border border-sky-700 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300 hover:bg-sky-500/20 disabled:opacity-50"
+                title="Tell Metro to broadcast a reload — app re-fetches the current JS bundle without restarting. Use after a chat-agent edit that was followed by re:build."
+              >
+                {reloadBusy ? "reloading…" : "↻ Reload JS"}
+              </button>
+              <button
+                onClick={async () => {
+                  setRecompileBusy(true);
+                  try {
+                    const r = await fetch("/api/preview/mobile/recompile", { method: "POST" });
+                    if (!r.ok) {
+                      const body = await r.json().catch(() => ({}));
+                      setError((body as { error?: string }).error ?? `recompile failed (${r.status})`);
+                    }
+                  } catch (e) {
+                    setError((e as Error).message);
+                  }
+                  setRecompileBusy(false);
+                }}
+                disabled={recompileBusy}
+                className="rounded border border-fuchsia-700 bg-fuchsia-500/10 px-2 py-0.5 text-[10px] text-fuchsia-300 hover:bg-fuchsia-500/20 disabled:opacity-50"
+                title="Run yarn re:build in the mobile workspace, then tell Metro to reload. One click to apply any manual edits to the running app."
+              >
+                {recompileBusy ? "compiling…" : "⟳ Compile & reload"}
+              </button>
+              {!mirrorPort && (
+                <span className="text-[10px] text-slate-500 ml-auto">
+                  click screen to tap
+                </span>
+              )}
             </div>
           )}
 
-          {/* Log tail */}
+          {/* Log tail — collapsible. Default is collapsed during recording
+              so the viewport gets maximum vertical space. One click to
+              expand when you need to debug a build. */}
           <div className="border-t border-slate-800 bg-slate-950/80">
-            <div className="px-4 py-1.5 text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800">
-              logs ({logs.length} lines)
-            </div>
-            <pre className="px-4 py-2 text-[11px] leading-tight text-slate-400 font-mono whitespace-pre-wrap max-h-56 overflow-y-auto">
-              {logs.join("\n") || "(no output yet)"}
-            </pre>
+            <button
+              onClick={() => setLogsExpanded((v) => !v)}
+              className="w-full px-4 py-1.5 text-[10px] uppercase tracking-wider text-slate-500 hover:text-slate-300 border-b border-slate-800 flex items-center justify-between"
+              title={logsExpanded ? "Hide logs" : "Show logs"}
+            >
+              <span>logs ({logs.length} lines)</span>
+              <span className="text-slate-400">{logsExpanded ? "▼ collapse" : "▶ expand"}</span>
+            </button>
+            {logsExpanded && (
+              <pre className="px-4 py-2 text-[11px] leading-tight text-slate-400 font-mono whitespace-pre-wrap max-h-56 overflow-y-auto">
+                {logs.join("\n") || "(no output yet)"}
+              </pre>
+            )}
           </div>
+        </div>
+        {/* Chat panel — only when we have a patch to chat about. */}
+        {patchId != null && (
+          <div className="flex-1 min-h-0 lg:w-[35%] lg:min-w-[320px] lg:max-w-[560px] h-80 lg:h-auto">
+            <ChatPanel
+              patchId={patchId}
+              branch={branch}
+              canonicalName={gapName ?? branch}
+            />
+          </div>
+        )}
         </div>
       </div>
     </div>

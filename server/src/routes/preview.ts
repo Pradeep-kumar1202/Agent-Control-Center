@@ -1,12 +1,14 @@
 import { Router } from "express";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import path from "node:path";
-import type { RepoKey } from "../config.js";
+import { REPOS, type RepoKey } from "../config.js";
 import {
   startPreview,
   stopPreview,
   getPreview,
   getPreviewLogs,
+  forceRestartMetro,
   type PreviewKind,
 } from "../skills/previewManager.js";
 import { ensureWsScrcpy, wsScrcpyInfo } from "../skills/wsScrcpyManager.js";
@@ -107,27 +109,165 @@ previewRouter.post("/preview/mobile/tap", (req, res) => {
 });
 
 /**
- * Re-launch the hyperswitch demo app on the emulator. Useful when the user
- * has navigated to the launcher (or pressed Home in the drawer) and wants
- * to get back into the app without restarting the whole preview.
+ * Ask Metro to broadcast a reload command to every connected client.
+ * Equivalent to pressing `R` twice or tapping "Reload" in the RN dev menu —
+ * the running app re-fetches its JS bundle from Metro without reinstalling
+ * the APK. Used during a chat-agent iteration when the agent has just
+ * edited .res files and re-run `npm run re:build`; Metro already has the
+ * new bundle but the app is still running the old one.
+ */
+previewRouter.post("/preview/mobile/metro-reload", (_req, res) => {
+  const req = http.request(
+    { host: "127.0.0.1", port: 8081, path: "/reload", method: "POST", timeout: 3000 },
+    (r) => {
+      let body = "";
+      r.on("data", (c) => (body += c.toString()));
+      r.on("end", () => {
+        if ((r.statusCode ?? 0) >= 200 && (r.statusCode ?? 0) < 300) {
+          res.json({ ok: true, metro: body.trim() || "OK" });
+        } else {
+          res.status(503).json({ error: `metro returned ${r.statusCode}: ${body.slice(0, 200)}` });
+        }
+      });
+    },
+  );
+  req.on("error", (err) => {
+    if (!res.headersSent) res.status(503).json({ error: err.message });
+  });
+  req.on("timeout", () => {
+    req.destroy();
+    if (!res.headersSent) res.status(504).json({ error: "metro /reload timed out" });
+  });
+  req.end();
+});
+
+/**
+ * The "bulletproof apply" button. Does the full sequence end-to-end,
+ * blocking until the app is visibly running the fresh bundle:
+ *
+ *   1. yarn re:build                             (~1-3s)
+ *   2. adb am force-stop io.hyperswitch.demoapp  (~0.3s) — frees the app's
+ *      in-memory JS context. WITHOUT this, the running VM keeps the old
+ *      bundle around forever.
+ *   3. forceRestartMetro                         (~5-8s) — kill + respawn
+ *      with --reset-cache so the haste-map is rebuilt from scratch and
+ *      any .bs.js the agent just wrote is picked up even if the watcher
+ *      missed it.
+ *   4. adb am start .../MainActivity             (~0.5s) — cold launch of
+ *      the app, which reconnects to fresh Metro and fetches the fresh
+ *      bundle.
+ *
+ * Total: ~8-12 s. Client UI shows a spinner the whole time. Blocking
+ * response so the frontend only un-busys when the app is actually back.
+ *
+ * Order matters: force-stop BEFORE killing Metro, so the user doesn't
+ * see a red "unable to connect" flash mid-process.
+ */
+previewRouter.post("/preview/mobile/recompile", (_req, res) => {
+  const repoDir = REPOS.mobile.dir;
+  const adb = path.join(ANDROID_HOME, "platform-tools", "adb");
+
+  const runAdb = (args: string[]): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const p = spawn(adb, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      p.stderr.on("data", (b) => (stderr += b.toString()));
+      p.on("error", reject);
+      p.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `adb exited ${code}`));
+      });
+    });
+
+  const runReBuild = (): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const proc = spawn("npm", ["run", "--silent", "re:build"], {
+        cwd: repoDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, FORCE_COLOR: "0" },
+      });
+      let log = "";
+      proc.stdout.on("data", (b) => (log += b.toString()));
+      proc.stderr.on("data", (b) => (log += b.toString()));
+      const timer = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch { /* */ }
+        reject(new Error("re:build timed out"));
+      }, 240_000);
+      proc.on("exit", (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve(log);
+        else {
+          const err = new Error(`re:build exited with code ${code}`);
+          (err as Error & { log?: string }).log = log;
+          reject(err);
+        }
+      });
+    });
+
+  (async () => {
+    let phase = "re:build";
+    try {
+      console.log("[recompile] phase 1/4: re:build");
+      const buildLog = await runReBuild();
+
+      phase = "force-stop";
+      console.log("[recompile] phase 2/4: force-stop app");
+      try { await runAdb(["shell", "am", "force-stop", "io.hyperswitch.demoapp"]); } catch { /* non-fatal */ }
+
+      phase = "metro restart";
+      console.log("[recompile] phase 3/4: restart Metro with --reset-cache");
+      await forceRestartMetro(repoDir);
+
+      phase = "relaunch";
+      console.log("[recompile] phase 4/4: launch app fresh");
+      await runAdb(["shell", "am", "start", "-n", "io.hyperswitch.demoapp/.MainActivity"]);
+
+      console.log("[recompile] done");
+      res.json({
+        ok: true,
+        log: buildLog.split("\n").slice(-10).join("\n"),
+      });
+    } catch (err) {
+      const e = err as Error & { log?: string };
+      if (res.headersSent) return;
+      res.status(phase === "re:build" ? 422 : 500).json({
+        error: `${phase} failed: ${e.message}`,
+        log: e.log ? e.log.split("\n").slice(-40).join("\n") : undefined,
+      });
+    }
+  })();
+});
+
+/**
+ * Re-launch the hyperswitch demo app on the emulator: force-stop, then
+ * am start. Force-stop is critical — `am start` on an already-running
+ * activity just brings it to foreground without killing the process, so
+ * the JS bundle the app already loaded stays in memory. Force-stop kills
+ * the whole process group, so the subsequent am start causes a cold
+ * launch that re-fetches the bundle from Metro.
  */
 previewRouter.post("/preview/mobile/launch-app", (_req, res) => {
   const adb = path.join(ANDROID_HOME, "platform-tools", "adb");
-  const proc = spawn(
-    adb,
-    ["shell", "am", "start", "-n", "io.hyperswitch.demoapp/.MainActivity"],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  let stderr = "";
-  proc.stderr.on("data", (b) => (stderr += b.toString()));
-  proc.on("error", (err) => {
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-  });
-  proc.on("exit", (code) => {
-    if (res.headersSent) return;
-    if (code === 0) res.json({ ok: true });
-    else res.status(503).json({ error: stderr.trim() || `adb exited ${code}` });
-  });
+  const runAdb = (args: string[]): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const p = spawn(adb, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      p.stderr.on("data", (b) => (stderr += b.toString()));
+      p.on("error", reject);
+      p.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `adb exited ${code}`));
+      });
+    });
+  (async () => {
+    try {
+      await runAdb(["shell", "am", "force-stop", "io.hyperswitch.demoapp"]);
+      await runAdb(["shell", "am", "start", "-n", "io.hyperswitch.demoapp/.MainActivity"]);
+      res.json({ ok: true });
+    } catch (err) {
+      if (!res.headersSent) res.status(500).json({ error: (err as Error).message });
+    }
+  })();
 });
 
 /**
