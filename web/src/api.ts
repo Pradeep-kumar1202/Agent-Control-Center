@@ -66,6 +66,27 @@ export interface ChatStreamChunk {
   turn?: number;
 }
 
+/**
+ * Final chunk emitted by POST /gaps/:id/patch/stream on success.
+ * All prior chunks are plain ChatStreamChunk (text/tool_use/tool_result).
+ */
+export interface PatchDoneChunk {
+  type: "patch_done";
+  patchId: number;
+  branch: string;
+  repo: string;
+  filesTouched: number;
+  summary: string;
+  diff: string;
+  buildStatus: "pass";
+  buildLog: string;
+  prUrl: string | null;
+  prNumber: number | null;
+  prWarning: string | null;
+}
+
+export type PatchStreamChunk = ChatStreamChunk | PatchDoneChunk;
+
 export interface SkillRunSummary {
   id: number;
   skill_id: string;
@@ -166,6 +187,11 @@ export const api = {
   generatePatch: (gapId: number) =>
     jsonFetch<PatchResponse>(`${BASE}/gaps/${gapId}/patch`, {
       method: "POST",
+    }),
+  streamPatch: (gapId: number, signal?: AbortSignal): Promise<Response> =>
+    fetch(`${BASE}/gaps/${gapId}/patch/stream`, {
+      method: "POST",
+      signal,
     }),
   getPatch: (patchId: number) =>
     jsonFetch<PatchRow>(`${BASE}/patches/${patchId}`),

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type Gap, type GapPrRow, type PatchResponse, type PatchRow, type Report } from "./api";
 import { DiffViewer } from "./components/DiffViewer";
 import { GapTable } from "./components/GapTable";
+import { PatchGenerationPanel } from "./components/PatchGenerationPanel";
 import { PreviewDrawer } from "./components/PreviewDrawer";
 import { RunButton } from "./components/RunButton";
 import { SourceViewer } from "./components/SourceViewer";
@@ -48,6 +49,10 @@ export default function App() {
   const [patchData, setPatchData] = useState<Map<number, PatchResponse>>(new Map());
   const [activePatch, setActivePatch] = useState<{
     patch: PatchResponse;
+    gapName: string;
+  } | null>(null);
+  const [activePatchGen, setActivePatchGen] = useState<{
+    gapId: number;
     gapName: string;
   } | null>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
@@ -193,50 +198,21 @@ export default function App() {
     }
   };
 
-  const onPatchGap = async (id: number) => {
+  const onPatchGap = (id: number) => {
     const gap = gaps.find((g) => g.id === id);
     if (!gap) return;
 
-    // If already patched, open review instead of regenerating
+    // If already patched, open review instead of regenerating.
     if (patchedGaps.has(id)) {
       onReviewPatch(id);
       return;
     }
 
-    setPatching((prev) => {
-      const next = new Set(prev);
-      next.add(id);
-      return next;
-    });
-    try {
-      const result = await api.generatePatch(id);
-      setPatchedGaps((prev) => {
-        const next = new Set(prev);
-        next.add(id);
-        return next;
-      });
-      if (result.buildStatus) {
-        setPatchBuildStatus((prev) => {
-          const next = new Map(prev);
-          next.set(id, result.buildStatus!);
-          return next;
-        });
-      }
-      setPatchData((prev) => {
-        const next = new Map(prev);
-        next.set(id, result);
-        return next;
-      });
-      setActivePatch({ patch: result, gapName: gap.canonical_name });
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setPatching((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-    }
+    // Open the streaming panel — it handles generation internally and calls
+    // onSuccess when the patch is ready.
+    setActivePatchGen({ gapId: id, gapName: gap.canonical_name });
+    // Mark as patching so the table button shows "Generating…"
+    setPatching((prev) => { const s = new Set(prev); s.add(id); return s; });
   };
 
   const onReviewPatch = async (gapId: number) => {
@@ -670,6 +646,29 @@ export default function App() {
           patch={activePatch.patch}
           gapName={activePatch.gapName}
           onClose={() => setActivePatch(null)}
+        />
+      )}
+
+      {activePatchGen && (
+        <PatchGenerationPanel
+          gapId={activePatchGen.gapId}
+          gapName={activePatchGen.gapName}
+          onClose={() => {
+            // Clear the "Generating…" spinner on the button whether success or cancel.
+            setPatching((prev) => { const s = new Set(prev); s.delete(activePatchGen.gapId); return s; });
+            setActivePatchGen(null);
+          }}
+          onSuccess={(patch) => {
+            const id = activePatchGen.gapId;
+            setPatchedGaps((prev) => { const s = new Set(prev); s.add(id); return s; });
+            setPatchBuildStatus((prev) => { const m = new Map(prev); m.set(id, "pass"); return m; });
+            setPatchData((prev) => { const m = new Map(prev); m.set(id, patch); return m; });
+            setActivePatch({ patch, gapName: activePatchGen.gapName });
+            setPatching((prev) => { const s = new Set(prev); s.delete(id); return s; });
+            setActivePatchGen(null);
+            // Refresh so the patched badge appears in the table.
+            refresh();
+          }}
         />
       )}
 

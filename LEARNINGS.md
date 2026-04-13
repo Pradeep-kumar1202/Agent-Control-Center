@@ -297,4 +297,58 @@ The (b) requirement forced **constraint #4 to be relaxed**: GitHub push is now a
 - Surface `build_status: failed_after_retries` distinctly in the UI when the agent explicitly gives up — currently it just becomes a generic 422 with the build log.
 - Two-stage upstream-merge PR orchestration (variant B from iteration 5) — still on the back burner.
 
+### 2026-04-13 — Iteration 7: Streaming patch generation + two-phase source analysis
+
+**Two root causes fixed:**
+
+**Root cause 1 — The patch agent never analysed the source repo.**
+The blocking endpoint read `evidence[0].file` server-side (≤8000 chars), injected it as raw text, and set `cwd` to the target repo. The agent had no path to the source repo, never explored it, and was essentially guessing from a single truncated file. For features spanning type definitions + parsers + components across 4–6 files, this was catastrophically insufficient.
+
+**Root cause 2 — The agent was invisible.**
+`ask()` is a blocking call returning after up to 25 minutes with just the final text. The user saw nothing. With no streaming, Opus looked like a frozen process and felt like a "dumb model" — even when it was actually iterating on build errors internally.
+
+**Fixes (three parts):**
+
+**Part A — Streaming endpoint `POST /gaps/:id/patch/stream`** (`routes/patches.ts`):
+- Uses `askStream()` instead of `ask()`. Every tool call (Read, Grep, Bash) and every text chunk streams immediately to the browser as NDJSON.
+- New two-phase prompt:
+  - **Phase 1**: Agent is given `sourceDir` and `targetDir` as absolute paths. Told to use Read/Grep/Glob with absolute paths on `sourceDir` to find the type declaration, config parser, state threading, and rendering component before touching the target.
+  - **Phase 2**: Implement the equivalent pattern in `targetDir` using what Phase 1 revealed. No source code copy-paste; adapt to target idioms.
+  - No attempt limit — "iterate until green within the full time budget." The 5-attempt ceiling is gone.
+  - Diagnosis structure added: list ALL errors → root cause → fix → re-run.
+- Old blocking `POST /gaps/:id/patch` endpoint: **unchanged** (backward compat).
+- Final NDJSON chunk: `{type:"patch_done", patchId, prUrl, diff, buildStatus:"pass", ...}` or `{type:"error", error}`.
+- On build failure: still 422 (agent must ship green — no draft patches).
+
+**Part B — `PatchGenerationPanel.tsx`** (new frontend component):
+- Right-edge drawer (62vw) that opens the moment "Generate Patch" is clicked.
+- Streams `POST /api/gaps/:id/patch/stream` via `readNdjson` — same NDJSON pattern as the chat drawer.
+- Shows tool-call chips in real-time: Read/Grep calls into the source repo (Phase 1), Edit/Write into the target (Phase 2), Bash re:build runs.
+- Phase badge in header: "Phase 1 — Analysing source…" → "Phase 2 — Implementing…" → "Building…" → "Done".
+- Build in-progress indicator (amber pulsing dot) when a Bash re:build call is in flight.
+- On `patch_done`: success card with files-changed count, branch, PR link, and "View Diff & Chat →" button.
+- On error: red error block with the build log tail.
+- "Cancel" button aborts the stream (AbortController).
+
+**Part C — Bash + build self-check for Tests and Props** (`skills/tests/index.ts`, `skills/props/index.ts`):
+- Added `"Bash"` to `allowedTools` for web test agent, mobile test agent, and web/mobile ReScript props agent.
+- Added build verification instruction to each prompt: run `npm run --silent re:build 2>&1` with Bash timeout 240000 after writing files; iterate until green; no attempt limit.
+- Android/iOS native prop agents: read-back syntax verification (no build runner for Kotlin/Swift layers).
+
+**Files changed:**
+- `server/src/routes/patches.ts` — `askStream` import, new streaming endpoint, two-phase prompt.
+- `server/src/skills/tests/index.ts` — Bash added to both web and mobile agents + build check instructions.
+- `server/src/skills/props/index.ts` — Bash added to ReScript agent + build check instructions.
+- `web/src/api.ts` — `PatchDoneChunk` type, `PatchStreamChunk` union, `streamPatch()` method.
+- `web/src/components/PatchGenerationPanel.tsx` (new) — streaming drawer with live tool chips, phase indicator, build pulsing dot, success card.
+- `web/src/App.tsx` — `activePatchGen` state; `onPatchGap` now opens the panel instead of blocking API call; success handler updates patchedGaps/patchData and opens DiffViewer.
+
+**Verification:** `tsc --noEmit` clean for both server and web.
+
+**What the next session needs to know:**
+- The old blocking `POST /gaps/:id/patch` endpoint still exists and is unchanged. The UI now calls `/stream` exclusively, but the blocking version is there if needed for scripting or testing.
+- The two-phase prompt structure is the key change. Phase 1 forces Opus to read the source repo in depth before touching the target. If a gap has no `evidence[0].file`, the prompt tells Opus to discover the entry point with Grep — it still works, just takes longer.
+- The `PatchGenerationPanel` auto-starts streaming on mount (no user button). The panel is the new UX for patch generation — the old "wait 25 minutes with no feedback" pattern is gone.
+- Test Writer and Props Agent now have Bash access. Watch for any unintended side effects (e.g., agent running git commands). The workspace is disposable, but worth monitoring on first run.
+
 <!-- Append new iterations below this line. Never edit history. -->

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../config.js";
 import { db, nowIso, type GapRow } from "../db.js";
-import { ask } from "../llm.js";
+import { ask, askStream } from "../llm.js";
 import simpleGit from "simple-git";
 import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../skills/submoduleGit.js";
 import { runRescriptBuild } from "../skills/buildCheck.js";
@@ -384,6 +384,330 @@ Example:
     } catch { /* best effort */ }
 
     res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+/**
+ * Streaming patch generation.
+ * POST /gaps/:id/patch/stream
+ *
+ * Same pre-flight as POST /gaps/:id/patch, but uses askStream() so the agent's
+ * tool calls and reasoning stream to the browser as NDJSON in real-time.
+ *
+ * Agent flow (new two-phase prompt):
+ *   Phase 1 — Analyse the feature fully in the SOURCE repo (Grep/Read with
+ *              absolute paths into sourceDir, even though cwd = targetDir).
+ *   Phase 2 — Implement the equivalent pattern in the TARGET repo; iterate on
+ *              build errors until green (no attempt limit, full 25-min budget).
+ *
+ * Final NDJSON line is always one of:
+ *   {type:"patch_done", patchId, prUrl, diff, buildStatus:"pass", ...}
+ *   {type:"error", error:"<message>"}
+ */
+patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
+  const gapId = Number(req.params.id);
+  if (!Number.isFinite(gapId)) {
+    return res.status(400).json({ error: "bad id" });
+  }
+
+  const gap = db.prepare("SELECT * FROM gaps WHERE id = ?").get(gapId) as
+    | GapRow
+    | undefined;
+  if (!gap) return res.status(404).json({ error: "gap not found" });
+
+  const existing = db
+    .prepare(
+      `SELECT p.* FROM patches p
+       WHERE p.gap_id = ?
+       UNION
+       SELECT p.* FROM patches p
+       JOIN gaps g ON g.id = p.gap_id
+       WHERE g.canonical_name = ? AND g.category = ? AND g.missing_in = ?
+       LIMIT 1`,
+    )
+    .get(gapId, gap.canonical_name, gap.category, gap.missing_in);
+  if (existing) {
+    return res.status(409).json({ error: "patch already exists", patch: existing });
+  }
+
+  const targetRepo = gap.missing_in as RepoKey;
+  const sourceRepo = gap.present_in as RepoKey;
+  const targetDir = REPOS[targetRepo].dir;
+  const sourceDir = REPOS[sourceRepo].dir;
+
+  // Set streaming headers before any write.
+  res.setHeader("Content-Type", "application/x-ndjson");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering if behind a proxy
+  res.flushHeaders();
+
+  let clientClosed = false;
+  req.on("close", () => { clientClosed = true; });
+
+  const writeLine = (obj: unknown) => {
+    if (!clientClosed && !res.writableEnded) {
+      res.write(JSON.stringify(obj) + "\n");
+    }
+  };
+
+  try {
+    await withRepoLock(targetRepo, async () => {
+      // ---- Branch setup (identical to blocking endpoint) ----
+      const evidence = safeParseEvidence(gap.evidence);
+      const sourceFile = evidence?.[0]?.file;
+
+      const git = simpleGit(targetDir);
+      const slug = gap.canonical_name
+        .replace(/[^a-z0-9]+/gi, "-")
+        .slice(0, 40)
+        .replace(/-$/, "");
+      const branchName = `feat/gap-${gapId}-${slug}`;
+
+      await resetSubmodules(targetDir, targetRepo);
+      await forceCheckoutBranch(targetDir, targetRepo, "main");
+      try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+      await git.checkoutLocalBranch(branchName);
+
+      // ---- Two-phase prompt: source analysis + target implementation ----
+      const repoLabel =
+        targetRepo === "web"
+          ? "hyperswitch-web (ReScript web SDK)"
+          : "hyperswitch-client-core (ReScript mobile SDK)";
+      const sourceLabel =
+        sourceRepo === "web"
+          ? "hyperswitch-web (ReScript web SDK)"
+          : "hyperswitch-client-core (ReScript mobile SDK)";
+
+      const sourceEntryPath = sourceFile
+        ? `${sourceDir}/${sourceFile}`
+        : `${sourceDir} (discover the entry point with Grep)`;
+
+      const prompt = `You are implementing a missing feature in the ${repoLabel} repository.
+
+SOURCE repo (${sourceRepo}): ${sourceDir}
+TARGET repo (${targetRepo}): ${targetDir}   ← your cwd
+
+## Feature to implement
+
+Name: ${gap.canonical_name}
+Category: ${gap.category}
+Rationale: ${gap.rationale}
+Starting point in source: ${sourceEntryPath}
+
+## Phase 1 — Understand how this feature works in the SOURCE repo
+
+Before writing any code in the target, fully analyse the feature in the source repo.
+Use Read, Grep, and Glob with ABSOLUTE PATHS to explore ${sourceDir}.
+
+1. Start at ${sourceEntryPath} as your entry point.
+2. Follow imports and references to find EVERY file involved in this feature:
+   - Where is the TYPE declared? (Record field, variant type, type alias)
+   - Where is it PARSED from config? (Which parser reads it from the JS options dict?)
+   - How does the value FLOW? (Config → state → props → component → render branch)
+   - Which COMPONENT renders differently based on this feature?
+3. Grep ${sourceDir} for "${gap.canonical_name}" and related names to find all callsites.
+4. Before moving to Phase 2, state clearly in your response:
+   - The TYPE of the feature (e.g., option<bool> defaulted to None = false)
+   - The config KEY name (how integrators set it in the JS options object)
+   - ALL files in the source that contain code for this feature
+   - What the feature DOES behaviourally or visually
+
+Do NOT edit the target repo until Phase 2.
+
+## Phase 2 — Implement the equivalent pattern in TARGET
+
+Your cwd is ${targetDir}. The target is ${repoLabel}.
+
+Using what you learned in Phase 1:
+1. Find the TARGET equivalent of each source file:
+   - Source type file → target type file (same layer in the architecture)
+   - Source parser → target parser
+   - Source component → target component
+2. Apply the same LOGICAL change in each target file, adapted to the target's idioms and naming conventions.
+3. Do NOT copy source code verbatim — the two repos have different architectures.
+4. Only touch files that need to change. No unrelated refactors.
+
+## ⛔ HARD REQUIREMENT — build must be green before finishing
+
+After every meaningful batch of edits, run:
+  npm run --silent re:build 2>&1
+Pass Bash timeout: 240000 (cold builds take up to 120 seconds in this repo).
+
+Iterate until exit code 0. There is NO attempt limit — use the full time budget.
+
+When a build fails:
+  a. List ALL errors: file path, line number, error message.
+  b. Find the root cause — one missing record-field update often produces 3+ error lines.
+  c. Fix the root cause first, re-run, then handle any remaining secondary errors.
+  d. "The module or file X can't be found": check rescript.json "sources" — new .res files may need to be listed there.
+
+ReScript-specific pitfalls:
+- Adding a field to a record → EVERY constructor of that record must include it.
+  Grep for the record type name BEFORE editing to find all construction sites.
+- Optional fields: option<T> with Some(x) / None. Never undefined or null.
+- New variants → every switch on that type must be exhaustive. Check all switch sites.
+- open ModuleName can shadow built-ins — prefer Belt.* qualified names.
+- Use Belt.Option.getWithDefault, not Option.getOrElse (Belt stdlib, not JS conventions).
+
+## Output (only after build exits 0)
+
+Output ONLY this JSON — no code fences, no extra text:
+{"what":"<one-line description>","files":[{"path":"<path relative to target repo>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<optional caveats>"}`;
+
+      // ---- Stream the agent in real-time ----
+      let agentText = "";
+      await askStream(
+        prompt,
+        {
+          model: "opus",
+          timeoutMs: 1_500_000,
+          cwd: targetDir,
+          allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
+        },
+        (chunk) => {
+          writeLine(chunk);
+          if (chunk.type === "text" && chunk.text) agentText += chunk.text;
+        },
+      );
+
+      // ---- Post-processing (deterministic, same as blocking endpoint) ----
+      const { diff, fileCount } = await getDiffWithSubmodules(targetDir, targetRepo);
+
+      if (!diff || fileCount === 0) {
+        await forceCheckoutBranch(targetDir, targetRepo, "main");
+        try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+        writeLine({ type: "error", error: "Agent did not produce any file changes" });
+        res.end();
+        return;
+      }
+
+      const patchFileName = `${gapId}-${slug}.patch`;
+      const patchPath = path.join(PATCHES_DIR, patchFileName);
+      fs.writeFileSync(patchPath, diff);
+
+      writeLine({ type: "text", text: "\n---\nRunning post-build verification…" });
+
+      const build = runRescriptBuild(targetDir);
+      if (!build.passed) {
+        await forceCheckoutBranch(targetDir, targetRepo, "main");
+        try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+        writeLine({
+          type: "error",
+          error: `Build failed — patch rejected.\n\nBuild log:\n${build.log.slice(-3000)}`,
+        });
+        res.end();
+        return;
+      }
+
+      writeLine({ type: "text", text: "Build passed. Committing…" });
+
+      const commitMsg = `feat: add ${gap.canonical_name}\n\nGenerated by feature-gap-dashboard for gap #${gapId}`;
+      const commitResult = await commitWithSubmodules(targetDir, targetRepo, commitMsg);
+
+      const aheadCount = await commitsAheadOfForkMain(targetDir, branchName);
+      if (aheadCount === 0 && commitResult.submodulesChanged.length === 0) {
+        await forceCheckoutBranch(targetDir, targetRepo, "main");
+        try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+        writeLine({ type: "error", error: "commitWithSubmodules produced zero commits — staged paths may not match" });
+        res.end();
+        return;
+      }
+
+      writeLine({ type: "text", text: "Pushing to fork and opening PR…" });
+
+      let prUrl: string | null = null;
+      let prNumber: number | null = null;
+      let prWarning: string | null = null;
+      const submodulePushSummaries: string[] = [];
+      try {
+        for (const subDir of commitResult.submodulesChanged) {
+          const result = await pushSubmoduleToFork({ parentDir: targetDir, subDir, branchName });
+          submodulePushSummaries.push(`${subDir} → ${result.forkUrl} @ ${result.sha.slice(0, 8)}`);
+        }
+        if (commitResult.submodulesChanged.length > 0) {
+          const rewritten = rewriteGitmodulesToForks(targetDir, commitResult.submodulesChanged);
+          if (rewritten.length > 0) {
+            const parentGit = simpleGit(targetDir);
+            await parentGit.add([".gitmodules"]);
+            await parentGit.commit(
+              `chore: point submodules at bot forks for build\n\nAutomated by feature-gap-dashboard.\nRewritten: ${rewritten.join(", ")}`,
+            );
+          }
+        }
+        await pushBranchToFork(targetDir, targetRepo, branchName);
+        const body = formatPrBody({
+          gapId,
+          canonicalName: gap.canonical_name,
+          category: gap.category,
+          rationale: gap.rationale,
+          summaryJson: agentText,
+          filesTouched: fileCount,
+          buildLog: build.log,
+          submodulePushes: submodulePushSummaries,
+        });
+        const created = await createPullRequest({
+          repoKey: targetRepo,
+          branch: branchName,
+          title: `feat: add ${gap.canonical_name}`,
+          body,
+        });
+        prUrl = created.prUrl;
+        prNumber = created.prNumber;
+      } catch (err) {
+        prWarning = `PR creation failed: ${(err as Error).message}`;
+        console.error(`[patches/stream] PR creation failed for gap ${gapId}:`, err);
+      }
+
+      await forceCheckoutBranch(targetDir, targetRepo, "main");
+
+      // ---- Save to DB ----
+      const patchRow = db
+        .prepare(
+          `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
+           VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          gapId,
+          targetRepo,
+          branchName,
+          patchPath,
+          agentText.slice(0, 2000),
+          fileCount,
+          nowIso(),
+          "pass",
+          build.log,
+          prUrl,
+          prNumber,
+          prWarning,
+        );
+
+      // ---- Emit final success chunk ----
+      writeLine({
+        type: "patch_done",
+        patchId: Number(patchRow.lastInsertRowid),
+        branch: branchName,
+        repo: targetRepo,
+        filesTouched: fileCount,
+        summary: agentText.slice(0, 2000),
+        diff,
+        buildStatus: "pass",
+        buildLog: build.log,
+        prUrl,
+        prNumber,
+        prWarning,
+      });
+
+      res.end();
+    }); // close withRepoLock
+  } catch (err) {
+    console.error(`[patches/stream] failed for gap ${gapId}:`, err);
+    try {
+      await withRepoLock(targetRepo, () =>
+        forceCheckoutBranch(targetDir, targetRepo, "main"),
+      );
+    } catch { /* best effort */ }
+    writeLine({ type: "error", error: (err as Error).message });
+    if (!res.writableEnded) res.end();
   }
 });
 

@@ -282,18 +282,34 @@ function emulatorBin(): string {
 }
 
 /** True if `adb devices` lists at least one line that ends in "device". */
-function hasReadyDevice(): boolean {
+/**
+ * Returns the serials of ALL ready ADB devices/emulators.
+ */
+function getReadyDeviceSerials(): string[] {
   try {
     const out = spawnSync(adbPath(), ["devices"], { encoding: "utf8" });
-    if (out.status !== 0) return false;
+    if (out.status !== 0) return [];
     return out.stdout
       .split("\n")
       .slice(1)
-      .some((line) => /\sdevice$/.test(line.trim()));
+      .filter((line) => /\sdevice$/.test(line.trim()))
+      .map((line) => line.trim().split(/\s+/)[0]);
   } catch {
-    return false;
+    return [];
   }
 }
+
+/**
+ * Returns the serial of the first ready ADB device, or null if none.
+ * Used when we don't need to be picky (e.g. checking if anything is online).
+ */
+function getReadyDeviceSerial(): string | null {
+  return getReadyDeviceSerials()[0] ?? null;
+}
+
+// Serial of the emulator we are using for the current/last preview.
+// Set by prepareAndroidDevice, consumed by startPreview to pass --deviceId.
+let activeEmulatorSerial: string | null = null;
 
 /**
  * Make sure an Android device is online before we hand off to react-native.
@@ -312,9 +328,15 @@ async function prepareAndroidDevice(slot: PreviewSlot): Promise<void> {
   // Best-effort: idempotent.
   spawnSync(adbPath(), ["start-server"], { stdio: "ignore" });
 
-  if (hasReadyDevice()) {
-    pushLog(slot, `[emulator] device already connected, skipping boot`);
-    return;
+  // Check if our specific AVD (PREVIEW_AVD = e.g. Pixel_9_Pro) is already running.
+  for (const serial of getReadyDeviceSerials()) {
+    const avdName = spawnSync(adbPath(), ["-s", serial, "emu", "avd", "name"], { encoding: "utf8" });
+    const name = avdName.stdout.split("\n")[0].trim();
+    if (name === PREVIEW_AVD) {
+      pushLog(slot, `[emulator] ${PREVIEW_AVD} already running on ${serial}, skipping boot`);
+      activeEmulatorSerial = serial;
+      return;
+    }
   }
 
   // Reuse an emulator we previously spawned if it's still alive.
@@ -355,17 +377,23 @@ async function prepareAndroidDevice(slot: PreviewSlot): Promise<void> {
     });
   }
 
-  // Block until adb sees the device AND it reports sys.boot_completed=1.
+  // Block until adb sees OUR AVD specifically and it reports sys.boot_completed=1.
+  // We match by querying each connected emulator's AVD name so we don't
+  // accidentally latch onto a Medium_Phone or any other concurrently running AVD.
   const deadline = Date.now() + EMULATOR_BOOT_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (hasReadyDevice()) {
+    for (const serial of getReadyDeviceSerials()) {
+      const avdName = spawnSync(adbPath(), ["-s", serial, "emu", "avd", "name"], { encoding: "utf8" });
+      const name = avdName.stdout.split("\n")[0].trim(); // first line is the AVD name
+      if (name !== PREVIEW_AVD) continue; // not our AVD, skip
       const boot = spawnSync(
         adbPath(),
-        ["shell", "getprop", "sys.boot_completed"],
+        ["-s", serial, "shell", "getprop", "sys.boot_completed"],
         { encoding: "utf8" },
       );
       if (boot.status === 0 && boot.stdout.trim() === "1") {
-        pushLog(slot, `[emulator] boot completed`);
+        pushLog(slot, `[emulator] boot completed — ${PREVIEW_AVD} on ${serial}`);
+        activeEmulatorSerial = serial;
         return;
       }
     }
@@ -519,11 +547,28 @@ export async function startPreview(
   const cmd = "npm";
   const args = kind === "web-dev" ? ["start"] : ["run", "android"];
 
+  // ANDROID_SERIAL pins ADB, Gradle, and React Native to one specific device.
+  // This is the only reliable way to handle multiple simultaneous emulators —
+  // --deviceId only affects the RN launcher, not the Gradle installDebug task,
+  // so without ANDROID_SERIAL both emulators still get the APK and then RN
+  // trips over "adb: more than one device/emulator" or "adb: forward takes
+  // two arguments" when it tries to port-forward for each one in turn.
+  const androidEnv: Record<string, string> = {
+    FORCE_COLOR: "0",
+    ANDROID_HOME,
+    ANDROID_SDK_ROOT: ANDROID_HOME,
+    ...(activeEmulatorSerial ? { ANDROID_SERIAL: activeEmulatorSerial } : {}),
+  };
+
+  if (activeEmulatorSerial) {
+    pushLog(slot, `[android] ANDROID_SERIAL=${activeEmulatorSerial} — targeting ${PREVIEW_AVD} only`);
+  }
+
   const proc = spawn(cmd, args, {
     cwd: repoDir,
     detached: true, // own process group so we can kill the whole tree
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, FORCE_COLOR: "0", ANDROID_HOME, ANDROID_SDK_ROOT: ANDROID_HOME },
+    env: { ...process.env, ...androidEnv },
   });
 
   slot.proc = proc;

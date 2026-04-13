@@ -176,6 +176,13 @@ ${patternCards}
 
 6. Every it() block MUST have at least one cy.should() or expect() assertion.
 
+## Build verification
+
+After writing the test file(s), run:
+  npm run --silent re:build 2>&1
+(Bash timeout: 240000) to confirm the SDK still compiles. Test files often import from
+the SDK source — a bad import path breaks the build. Fix any errors before finishing.
+
 After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path from repo root>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
@@ -183,7 +190,7 @@ After writing the test file(s), output ONLY a JSON summary:
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
-    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
   });
 
   // Stage ALL changes (including brand-new untracked files) BEFORE checking
@@ -384,6 +391,13 @@ ${patternApiUtils}
    But prefer Detox element assertions wherever possible — they are more
    reliable and closer to how the user experiences the app.
 
+## Build verification
+
+After writing the test file(s), run:
+  npm run --silent re:build 2>&1
+(Bash timeout: 240000) to confirm the SDK still compiles — test files can import SDK
+types. Fix any ReScript compilation errors before finishing.
+
 After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path from repo root>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
@@ -391,7 +405,7 @@ After writing the test file(s), output ONLY a JSON summary:
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
-    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
   });
 
   // Stage first so new (untracked) test files are visible in the diff.

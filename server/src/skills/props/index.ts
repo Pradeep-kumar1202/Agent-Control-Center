@@ -99,6 +99,14 @@ Important:
 - Follow the EXACT naming conventions used in this repo (camelCase for ReScript fields).
 - Look at how similar props (like hideExpiredPaymentMethods, displaySavedPaymentMethods) are wired as examples.
 
+## Build verification
+
+After implementing, run:
+  npm run --silent re:build 2>&1
+(Bash timeout: 240000). Iterate until exit code 0 before finishing.
+When a build fails: list all errors, find the root cause (usually a missing record field
+constructor site), fix it, re-run. There is no attempt limit — use the full time budget.
+
 After implementing, output ONLY a JSON summary (no code fences):
 {"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what changed>"}], "backward_compatible": true, "notes": "<any caveats>"}`;
 }
@@ -136,6 +144,13 @@ Important:
 - This is a ReScript codebase. Use ReScript syntax.
 - Follow the EXACT naming conventions used in this repo.
 - Look at how similar props (like hideExpiredPaymentMethods, displayDefaultSavedPaymentIcon) are wired.
+
+## Build verification
+
+After implementing, run:
+  npm run --silent re:build 2>&1
+(Bash timeout: 240000). Iterate until exit code 0 before finishing.
+When a build fails: list all errors, find the root cause, fix it, re-run. No attempt limit.
 
 After implementing, output ONLY a JSON summary (no code fences):
 {"what": "<one-line description>", "files": [{"path": "<relative path>", "change": "<what changed>"}], "backward_compatible": true, "notes": "<any caveats>"}`;
@@ -223,7 +238,7 @@ export async function runPropAgent(
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
-    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
+    allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
   });
 
   // Submodule-aware diff: excludes dirty submodule pointer noise,
