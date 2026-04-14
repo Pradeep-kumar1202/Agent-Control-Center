@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Gap, type GapPrRow, type PatchResponse, type PatchRow, type Report } from "./api";
+import { api, type Gap, type GapPrRow, type PatchDoneChunk, type PatchResponse, type PatchRow, type Report } from "./api";
+import { AgentPanel } from "./components/AgentPanel";
 import { DiffViewer } from "./components/DiffViewer";
 import { GapTable } from "./components/GapTable";
-import { PatchGenerationPanel } from "./components/PatchGenerationPanel";
 import { PreviewDrawer } from "./components/PreviewDrawer";
-import { RunButton } from "./components/RunButton";
 import { SourceViewer } from "./components/SourceViewer";
 import { SKILLS_REGISTRY, type SkillEnvelopeClient } from "./skills/registry";
 import { ReviewHistory } from "./skills/review/History";
@@ -12,12 +11,30 @@ import { SkillHistory } from "./skills/shared/SkillHistory";
 import { PropsResults } from "./skills/props/Results";
 import { TestsResults } from "./skills/tests/Results";
 
-const SKILL_HISTORY_CONFIG: Record<string, { name: string; formatLabel: (input: Record<string, unknown>) => string; ResultsComponent: React.ComponentType<{ result: SkillEnvelopeClient; onClose: () => void }> }> = {
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type StatusFilter = "all" | "verified" | "unverified" | "platform_specific" | "patched";
+
+type ActiveAgent = {
+  gapId: number;
+  gapName: string;
+  mode: "patch" | "chat";
+  existingPatchId?: number;
+} | null;
+
+const SKILL_HISTORY_CONFIG: Record<
+  string,
+  {
+    name: string;
+    formatLabel: (input: Record<string, unknown>) => string;
+    ResultsComponent: React.ComponentType<{ result: SkillEnvelopeClient; onClose: () => void }>;
+  }
+> = {
   props: { name: "Add Prop", formatLabel: (i) => `Prop: ${i.propName ?? "?"}`, ResultsComponent: PropsResults },
   tests: { name: "Test Writer", formatLabel: (i) => `Tests for ${i.branch ?? "?"}`, ResultsComponent: TestsResults },
 };
 
-type StatusFilter = "all" | "verified" | "unverified" | "platform_specific" | "patched";
+// ─── Helper ───────────────────────────────────────────────────────────────────
 
 function patchRowToResponse(p: PatchRow): PatchResponse {
   return {
@@ -35,6 +52,109 @@ function patchRowToResponse(p: PatchRow): PatchResponse {
   };
 }
 
+// ─── Sidebar icons ────────────────────────────────────────────────────────────
+
+function IconGrid() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+      <rect x="1" y="1" width="12" height="12" rx="2"/>
+      <line x1="1" y1="5.5" x2="13" y2="5.5"/>
+      <line x1="5" y1="5.5" x2="5" y2="13"/>
+    </svg>
+  );
+}
+function IconPlus() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+      <rect x="1" y="1" width="12" height="12" rx="2"/>
+      <line x1="7" y1="4.5" x2="7" y2="9.5"/>
+      <line x1="4.5" y1="7" x2="9.5" y2="7"/>
+    </svg>
+  );
+}
+function IconCheck() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="7" cy="7" r="5.5"/>
+      <polyline points="4.5,7 6.5,9 9.5,5"/>
+    </svg>
+  );
+}
+function IconGlobe() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+      <circle cx="7" cy="7" r="5.5"/>
+      <path d="M7 1.5c-1.5 2-2 3.5-2 5.5s.5 3.5 2 5.5M7 1.5c1.5 2 2 3.5 2 5.5s-.5 3.5-2 5.5" strokeWidth="1"/>
+      <line x1="1.5" y1="7" x2="12.5" y2="7"/>
+    </svg>
+  );
+}
+function IconPR() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+      <circle cx="3.5" cy="3.5" r="1.5"/>
+      <circle cx="3.5" cy="10.5" r="1.5"/>
+      <circle cx="10.5" cy="6.5" r="1.5"/>
+      <line x1="3.5" y1="5" x2="3.5" y2="9"/>
+      <path d="M5 3.5h2.5a1.5 1.5 0 011.5 1.5V7"/>
+    </svg>
+  );
+}
+function IconClock() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+      <circle cx="7" cy="7" r="5.5"/>
+      <polyline points="7,4 7,7 9,8.5"/>
+    </svg>
+  );
+}
+function IconList() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
+      <line x1="3" y1="4" x2="11" y2="4"/>
+      <line x1="3" y1="7" x2="11" y2="7"/>
+      <line x1="3" y1="10" x2="8" y2="10"/>
+    </svg>
+  );
+}
+function IconFlow() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1" y="1.5" width="4" height="3" rx="1"/>
+      <rect x="9" y="5.5" width="4" height="3" rx="1"/>
+      <rect x="1" y="9.5" width="4" height="3" rx="1"/>
+      <path d="M5 3H7.5a1 1 0 011 1v2.5M5 11h2.5a1 1 0 001-1V8"/>
+    </svg>
+  );
+}
+function IconBolt() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="8.5,1.5 4.5,7 7,7 5.5,12.5 9.5,6.5 7,6.5"/>
+    </svg>
+  );
+}
+function IconGrid4() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round">
+      <rect x="1.5" y="1.5" width="4" height="4" rx="1"/>
+      <rect x="8.5" y="1.5" width="4" height="4" rx="1"/>
+      <rect x="1.5" y="8.5" width="4" height="4" rx="1"/>
+      <rect x="8.5" y="8.5" width="4" height="4" rx="1"/>
+    </svg>
+  );
+}
+
+function skillIcon(id: string) {
+  if (id === "props")        return <IconPlus />;
+  if (id === "tests")        return <IconCheck />;
+  if (id === "translations") return <IconGlobe />;
+  if (id === "review")       return <IconPR />;
+  return <IconGrid />;
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+
 export default function App() {
   const [report, setReport] = useState<Report | null>(null);
   const [gaps, setGaps] = useState<Gap[]>([]);
@@ -47,14 +167,8 @@ export default function App() {
   const [patchedGaps, setPatchedGaps] = useState<Set<number>>(new Set());
   const [patchBuildStatus, setPatchBuildStatus] = useState<Map<number, "pass" | "fail" | "skipped">>(new Map());
   const [patchData, setPatchData] = useState<Map<number, PatchResponse>>(new Map());
-  const [activePatch, setActivePatch] = useState<{
-    patch: PatchResponse;
-    gapName: string;
-  } | null>(null);
-  const [activePatchGen, setActivePatchGen] = useState<{
-    gapId: number;
-    gapName: string;
-  } | null>(null);
+  const [activePatch, setActivePatch] = useState<{ patch: PatchResponse; gapName: string } | null>(null);
+  const [activeAgent, setActiveAgent] = useState<ActiveAgent>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
   const [activePreview, setActivePreview] = useState<{
     repoKey: "web" | "mobile";
@@ -71,10 +185,12 @@ export default function App() {
   } | null>(null);
   const [activeTab, setActiveTab] = useState<string>("gaps");
   const [skillResults, setSkillResults] = useState<Map<string, SkillEnvelopeClient>>(new Map());
-  /** Map from "canonical_name:category:missing_in" → linked PR rows */
   const [gapPrs, setGapPrs] = useState<Map<string, GapPrRow[]>>(new Map());
+  const [seedResetting, setSeedResetting] = useState(false);
   const verifyAllAbort = useRef(false);
   const pollTimer = useRef<number | null>(null);
+
+  // ─── Data loading ──────────────────────────────────────────────────────────
 
   const refresh = useCallback(async () => {
     try {
@@ -87,7 +203,6 @@ export default function App() {
           api.listGapPrs(),
         ]);
 
-        // Build PR map keyed by identity triple (stable across re-runs)
         const prMap = new Map<string, GapPrRow[]>();
         for (const pr of prRows) {
           const key = `${pr.canonical_name}:${pr.category}:${pr.missing_in}`;
@@ -98,28 +213,18 @@ export default function App() {
         setGapPrs(prMap);
         setGaps(list);
 
-        // Match patches to current gaps by (canonical_name, category, missing_in)
-        // because gap IDs change across re-runs but these fields stay stable.
         const patchedIds = new Set<number>();
         const buildMap = new Map<number, "pass" | "fail" | "skipped">();
         const dataMap = new Map<number, PatchResponse>();
 
         for (const p of patches) {
-          // Find the current gap that matches this patch's original gap identity
           const matchingGap = list.find(
-            (g) =>
-              g.canonical_name === p.canonical_name &&
-              g.category === p.category &&
-              g.missing_in === p.missing_in,
+            (g) => g.canonical_name === p.canonical_name && g.category === p.category && g.missing_in === p.missing_in,
           );
           const gapId = matchingGap?.id ?? p.gap_id;
-
-          // Only track if this gap exists in the current report
           if (matchingGap) {
             patchedIds.add(gapId);
-            if (p.build_status) {
-              buildMap.set(gapId, p.build_status as "pass" | "fail" | "skipped");
-            }
+            if (p.build_status) buildMap.set(gapId, p.build_status as "pass" | "fail" | "skipped");
             dataMap.set(gapId, { ...patchRowToResponse(p), _patchId: p.id } as PatchResponse & { _patchId: number });
           }
         }
@@ -133,130 +238,62 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  useEffect(() => { refresh(); }, [refresh]);
 
-  // Poll while a report is running.
   useEffect(() => {
     if (report?.status === "running") {
       pollTimer.current = window.setInterval(refresh, 2000);
-      return () => {
-        if (pollTimer.current) window.clearInterval(pollTimer.current);
-      };
+      return () => { if (pollTimer.current) window.clearInterval(pollTimer.current); };
     }
   }, [report?.status, refresh]);
+
+  // ─── Actions ───────────────────────────────────────────────────────────────
 
   const onRun = async () => {
     try {
       await api.runAnalysis();
-      // Optimistically flip to running so the UI starts polling immediately.
       setReport((r) =>
-        r
-          ? { ...r, status: "running" }
-          : {
-              id: 0,
-              created_at: new Date().toISOString(),
-              web_sha: "",
-              mobile_sha: "",
-              status: "running",
-              error: null,
-            },
+        r ? { ...r, status: "running" }
+          : { id: 0, created_at: new Date().toISOString(), web_sha: "", mobile_sha: "", status: "running", error: null },
       );
       refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    } catch (e) { setError((e as Error).message); }
   };
 
-  const status: "idle" | "running" | "done" | "failed" = report
-    ? report.status
-    : "idle";
+  const onSeedReset = async () => {
+    if (!window.confirm("Reset analysis data to seed? Patches will be preserved.")) return;
+    setSeedResetting(true);
+    try { await api.seedReset(); await refresh(); }
+    catch (e) { setError((e as Error).message); }
+    finally { setSeedResetting(false); }
+  };
 
   const onVerifyGap = async (id: number) => {
-    setVerifying((prev) => {
-      const next = new Set(prev);
-      next.add(id);
-      return next;
-    });
+    setVerifying((prev) => { const s = new Set(prev); s.add(id); return s; });
     try {
       const result = await api.validateGap(id);
-      if (result.removed) {
-        // false positive — drop it from the list
-        setGaps((prev) => prev.filter((g) => g.id !== id));
-      } else {
-        setGaps((prev) => prev.map((g) => (g.id === id ? result.gap : g)));
-      }
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setVerifying((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-    }
+      if (result.removed) setGaps((prev) => prev.filter((g) => g.id !== id));
+      else setGaps((prev) => prev.map((g) => (g.id === id ? result.gap : g)));
+    } catch (e) { setError((e as Error).message); }
+    finally { setVerifying((prev) => { const s = new Set(prev); s.delete(id); return s; }); }
   };
 
   const onPatchGap = (id: number) => {
     const gap = gaps.find((g) => g.id === id);
     if (!gap) return;
-
-    // If already patched, open review instead of regenerating.
     if (patchedGaps.has(id)) {
-      onReviewPatch(id);
+      const existing = patchData.get(id);
+      const patchId = (existing as (PatchResponse & { _patchId?: number }) | undefined)?._patchId;
+      setActiveAgent({ gapId: id, gapName: gap.canonical_name, mode: "chat", existingPatchId: patchId });
       return;
     }
-
-    // Open the streaming panel — it handles generation internally and calls
-    // onSuccess when the patch is ready.
-    setActivePatchGen({ gapId: id, gapName: gap.canonical_name });
-    // Mark as patching so the table button shows "Generating…"
+    setActiveAgent({ gapId: id, gapName: gap.canonical_name, mode: "patch" });
     setPatching((prev) => { const s = new Set(prev); s.add(id); return s; });
   };
 
-  const onReviewPatch = async (gapId: number) => {
-    const gap = gaps.find((g) => g.id === gapId);
-    if (!gap) return;
-
-    // Check if we already have patch data with diff in memory
-    const existing = patchData.get(gapId);
-    if (existing && existing.diff) {
-      setActivePatch({ patch: existing, gapName: gap.canonical_name });
-      return;
-    }
-
-    // Need to fetch the full diff from server
-    try {
-      const patches = await api.listPatches();
-      // Match by canonical_name since gap_id may differ across re-runs
-      const row = patches.find(
-        (p) =>
-          p.canonical_name === gap.canonical_name &&
-          p.category === gap.category &&
-          p.missing_in === gap.missing_in,
-      );
-      if (row) {
-        const fullRow = await api.getPatch(row.id);
-        const patch = patchRowToResponse(fullRow);
-        setPatchData((prev) => {
-          const next = new Map(prev);
-          next.set(gapId, patch);
-          return next;
-        });
-        setActivePatch({ patch, gapName: gap.canonical_name });
-      }
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  };
-
   const onVerifyAll = async () => {
-    const unverified = gaps.filter(
-      (g) => g.verified === 0 && g.platform_specific === 0,
-    );
+    const unverified = gaps.filter((g) => g.verified === 0 && g.platform_specific === 0);
     if (unverified.length === 0) return;
-
     verifyAllAbort.current = false;
     setVerifyAllProgress({ current: 0, total: unverified.length, currentName: "" });
 
@@ -264,34 +301,15 @@ export default function App() {
       if (verifyAllAbort.current) break;
       const g = unverified[i];
       setVerifyAllProgress({ current: i + 1, total: unverified.length, currentName: g.canonical_name });
-      setVerifying((prev) => {
-        const next = new Set(prev);
-        next.add(g.id);
-        return next;
-      });
+      setVerifying((prev) => { const s = new Set(prev); s.add(g.id); return s; });
       try {
         const result = await api.validateGap(g.id);
-        if (result.removed) {
-          setGaps((prev) => prev.filter((x) => x.id !== g.id));
-        } else {
-          setGaps((prev) => prev.map((x) => (x.id === g.id ? result.gap : x)));
-        }
-      } catch (e) {
-        setError((e as Error).message);
-        break;
-      } finally {
-        setVerifying((prev) => {
-          const next = new Set(prev);
-          next.delete(g.id);
-          return next;
-        });
-      }
+        if (result.removed) setGaps((prev) => prev.filter((x) => x.id !== g.id));
+        else setGaps((prev) => prev.map((x) => (x.id === g.id ? result.gap : x)));
+      } catch (e) { setError((e as Error).message); break; }
+      finally { setVerifying((prev) => { const s = new Set(prev); s.delete(g.id); return s; }); }
     }
     setVerifyAllProgress(null);
-  };
-
-  const onCancelVerifyAll = () => {
-    verifyAllAbort.current = true;
   };
 
   const onAddPr = async (gapId: number, prUrl: string) => {
@@ -299,347 +317,445 @@ export default function App() {
     const key = `${newRow.canonical_name}:${newRow.category}:${newRow.missing_in}`;
     setGapPrs((prev) => {
       const next = new Map(prev);
-      const arr = [...(next.get(key) ?? []), newRow];
-      next.set(key, arr);
+      next.set(key, [...(next.get(key) ?? []), newRow]);
       return next;
     });
   };
 
-  const onRemovePr = async (prId: number, _gapId: number) => {
+  const onRemovePr = async (prId: number) => {
     await api.removeGapPr(prId);
     setGapPrs((prev) => {
       const next = new Map(prev);
       for (const [key, prs] of next) {
         const filtered = prs.filter((p) => p.id !== prId);
-        if (filtered.length !== prs.length) {
-          next.set(key, filtered);
-          break;
-        }
+        if (filtered.length !== prs.length) { next.set(key, filtered); break; }
       }
       return next;
     });
   };
 
-  // Payment methods are loaded dynamically from backend responses in the
-  // mobile SDK, so static extraction always flags them as missing even when
-  // they aren't. Hide them by default; user can opt back in with the toggle.
-  const categoryFilteredGaps = gaps.filter(
-    (g) => showPaymentMethods || g.category !== "payment_method",
-  );
+  // ─── Derived state ─────────────────────────────────────────────────────────
 
-  const sideFilteredGaps = categoryFilteredGaps.filter((g) =>
-    filter === "all" ? true : g.missing_in === filter,
-  );
+  const status: "idle" | "running" | "done" | "failed" = report ? report.status : "idle";
 
+  const categoryFilteredGaps = gaps.filter((g) => showPaymentMethods || g.category !== "payment_method");
+  const sideFilteredGaps = categoryFilteredGaps.filter((g) => filter === "all" ? true : g.missing_in === filter);
   const visibleGaps = sideFilteredGaps.filter((g) => {
     switch (statusFilter) {
-      case "verified":
-        return g.verified === 1;
-      case "unverified":
-        return g.verified === 0 && g.platform_specific === 0;
-      case "platform_specific":
-        return g.platform_specific === 1;
-      case "patched":
-        return patchedGaps.has(g.id);
-      default:
-        return true;
+      case "verified":          return g.verified === 1;
+      case "unverified":        return g.verified === 0 && g.platform_specific === 0;
+      case "platform_specific": return g.platform_specific === 1;
+      case "patched":           return patchedGaps.has(g.id);
+      default:                  return true;
     }
   });
 
   const counts = {
-    total: categoryFilteredGaps.length,
-    mobile: categoryFilteredGaps.filter((g) => g.missing_in === "mobile")
-      .length,
-    web: categoryFilteredGaps.filter((g) => g.missing_in === "web").length,
-    hiddenPaymentMethods: gaps.filter((g) => g.category === "payment_method")
-      .length,
+    total:               categoryFilteredGaps.length,
+    mobile:              categoryFilteredGaps.filter((g) => g.missing_in === "mobile").length,
+    web:                 categoryFilteredGaps.filter((g) => g.missing_in === "web").length,
+    verified:            gaps.filter((g) => g.verified === 1).length,
+    unverified:          gaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length,
+    platformSpecific:    gaps.filter((g) => g.platform_specific === 1).length,
+    patched:             patchedGaps.size,
+    hiddenPaymentMethods:gaps.filter((g) => g.category === "payment_method").length,
   };
 
+  const activeTabLabel =
+    activeTab === "gaps"             ? "Gap Analysis"
+    : activeTab === "review-history" ? "Review History"
+    : activeTab === "skill-history"  ? "Skill History"
+    : SKILLS_REGISTRY.find((s) => s.id === activeTab)?.name ?? activeTab;
+
+  // ─── Render ────────────────────────────────────────────────────────────────
+
   return (
-    <div className="min-h-screen p-8 max-w-6xl mx-auto">
-      <header className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight">
-          Agent Orchestrator
-        </h1>
-        <p className="text-slate-400 mt-1">
-          hyperswitch-web ↔ hyperswitch-client-core
-        </p>
-        <div className="flex gap-1 mt-4 border-b border-slate-800">
-          <button
-            onClick={() => setActiveTab("gaps")}
-            className={
-              "px-4 py-2 text-sm font-medium border-b-2 transition " +
-              (activeTab === "gaps"
-                ? "border-indigo-500 text-indigo-300"
-                : "border-transparent text-slate-500 hover:text-slate-300")
-            }
-          >
-            Gap Analysis
-          </button>
-          {SKILLS_REGISTRY.map((skill) => (
-            <button
-              key={skill.id}
-              onClick={() => setActiveTab(skill.id)}
-              className={
-                "px-4 py-2 text-sm font-medium border-b-2 transition " +
-                (activeTab === skill.id
-                  ? skill.activeTabClass
-                  : "border-transparent text-slate-500 hover:text-slate-300")
-              }
-            >
-              {skill.name}
+    <div className="shell">
+
+      {/* ══════════════════════════ TOPBAR ══════════════════════════════════ */}
+      <header className="topbar">
+        <div className="topbar-logo">S</div>
+        <span className="topbar-title">SDK Agent</span>
+        <div className="topbar-divider" />
+        <span className="topbar-crumb">{activeTabLabel}</span>
+        <div className="topbar-spacer" />
+        <div className="topbar-status">
+          <div className={`status-dot ${status}`} title={status} />
+          {status === "done" && report && (
+            <span className="topbar-sha">
+              web {report.web_sha.slice(0, 7)} · mob {report.mobile_sha.slice(0, 7)}
+            </span>
+          )}
+          {status === "running" && <span className="topbar-sha">Running…</span>}
+        </div>
+        <div className="topbar-actions">
+          {status === "running" && (
+            <button className="btn btn-red btn-sm" onClick={async () => { await api.cancelAnalysis(); refresh(); }}>
+              Cancel
             </button>
-          ))}
+          )}
           <button
-            onClick={() => setActiveTab("review-history")}
-            className={
-              "px-4 py-2 text-sm font-medium border-b-2 transition " +
-              (activeTab === "review-history"
-                ? "border-violet-400 text-violet-300"
-                : "border-transparent text-slate-500 hover:text-slate-300")
-            }
+            className={`btn btn-sm ${status !== "running" ? "btn-accent" : ""}`}
+            disabled={status === "running"}
+            onClick={onRun}
           >
-            Review History
-          </button>
-          <button
-            onClick={() => setActiveTab("skill-history")}
-            className={
-              "px-4 py-2 text-sm font-medium border-b-2 transition " +
-              (activeTab === "skill-history"
-                ? "border-teal-400 text-teal-300"
-                : "border-transparent text-slate-500 hover:text-slate-300")
-            }
-          >
-            Skill History
+            {status === "running" ? "Running…" : "Run analysis"}
           </button>
         </div>
+        {error && (
+          <div style={{
+            position: "fixed", top: 48, left: 220, right: 0,
+            padding: "6px 20px", background: "var(--red-dim)",
+            borderBottom: "1px solid rgba(248,113,113,.2)",
+            fontSize: 12, color: "var(--red)", zIndex: 100,
+            display: "flex", alignItems: "center", gap: 8,
+          }}>
+            {error}
+            <button
+              onClick={() => setError(null)}
+              style={{ marginLeft: "auto", background: "none", border: "none", color: "inherit", cursor: "pointer", opacity: 0.6, fontSize: 14 }}
+            >
+              ✕
+            </button>
+          </div>
+        )}
       </header>
 
-      {SKILLS_REGISTRY.map((skill) => {
-        if (activeTab !== skill.id) return null;
-        const { FormComponent, ResultsComponent } = skill;
-        const skillResult = skillResults.get(skill.id);
-        return (
-          <div key={skill.id}>
-            <FormComponent
-              onResult={(r) => setSkillResults((prev) => new Map(prev).set(skill.id, r))}
-              onError={(msg) => setError(msg)}
-            />
-            {skillResult && (
-              <ResultsComponent
-                result={skillResult}
-                onClose={() => {
-                  // Keep the result in memory so re-opening the tab shows
-                  // the last result. The data is also persisted in skill_runs
-                  // DB table, so even on page refresh the History tab has it.
-                  setSkillResults((prev) => {
-                    const next = new Map(prev);
-                    next.delete(skill.id);
-                    return next;
-                  });
-                }}
-              />
-            )}
-          </div>
-        );
-      })}
+      {/* ══════════════════════════ WORKSPACE ═══════════════════════════════ */}
+      <div className="workspace">
 
-      {activeTab === "review-history" && (
-        <div className="mt-2">
-          <div className="mb-4">
-            <h2 className="text-lg font-semibold">Review History</h2>
-            <p className="text-slate-400 text-sm mt-0.5">
-              All past PR reviews. Click any row to reopen the full analysis.
-            </p>
-          </div>
-          <ReviewHistory />
-        </div>
-      )}
+        {/* ── Left sidebar ─────────────────────────────────────────────── */}
+        <nav className="sidebar">
 
-      {activeTab === "skill-history" && (
-        <div className="mt-2 space-y-6">
-          <div className="mb-4">
-            <h2 className="text-lg font-semibold">Skill History</h2>
-            <p className="text-slate-400 text-sm mt-0.5">
-              All past skill runs. Click "View" to reopen the full results with diff, PR link, and branch.
-            </p>
+          <div className="sidebar-section-label">Analyze</div>
+          <div className={`sidebar-item ${activeTab === "gaps" ? "active" : ""}`} onClick={() => setActiveTab("gaps")}>
+            <IconGrid />
+            <span className="sidebar-item-label">Gap Analysis</span>
+            {counts.total > 0 && <span className="sidebar-badge">{counts.total}</span>}
           </div>
-          {Object.entries(SKILL_HISTORY_CONFIG).map(([id, cfg]) => (
-            <SkillHistory
-              key={id}
-              skillId={id}
-              skillName={cfg.name}
-              formatLabel={cfg.formatLabel}
-              ResultsComponent={cfg.ResultsComponent}
-            />
+
+          <div className="sidebar-section-label">Agents</div>
+          {SKILLS_REGISTRY.map((skill) => (
+            <div
+              key={skill.id}
+              className={`sidebar-item ${activeTab === skill.id ? "active" : ""}`}
+              onClick={() => setActiveTab(skill.id)}
+            >
+              {skillIcon(skill.id)}
+              <span className="sidebar-item-label">{skill.name}</span>
+            </div>
           ))}
-        </div>
-      )}
 
-      {activeTab === "gaps" && (<>
-      <section className="rounded-xl border border-slate-800 bg-slate-900/50 p-6 mb-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-sm text-slate-400">Status</div>
-            <div className="text-lg font-medium">
-              <StatusPill status={status} />
+          <div className="sidebar-section-label">History</div>
+          <div className={`sidebar-item ${activeTab === "review-history" ? "active" : ""}`} onClick={() => setActiveTab("review-history")}>
+            <IconClock />
+            <span className="sidebar-item-label">Review History</span>
+          </div>
+          <div className={`sidebar-item ${activeTab === "skill-history" ? "active" : ""}`} onClick={() => setActiveTab("skill-history")}>
+            <IconList />
+            <span className="sidebar-item-label">Skill History</span>
+          </div>
+
+          <div className="sidebar-section-label">Coming soon</div>
+          <div className="sidebar-item soon">
+            <IconFlow />
+            <span className="sidebar-item-label">Workflows</span>
+            <span className="sidebar-badge">soon</span>
+          </div>
+          <div className="sidebar-item soon">
+            <IconBolt />
+            <span className="sidebar-item-label">Triggers</span>
+            <span className="sidebar-badge">soon</span>
+          </div>
+          <div className="sidebar-item soon">
+            <IconGrid4 />
+            <span className="sidebar-item-label">Integrations</span>
+            <span className="sidebar-badge">soon</span>
+          </div>
+
+        </nav>
+
+        {/* ── Main content ─────────────────────────────────────────────── */}
+        <div className="main">
+
+          {/* Page header — Gap Analysis */}
+          {activeTab === "gaps" && (
+            <div className="page-header">
+              <div className="page-header-row">
+                <div>
+                  <div className="page-title">Gap Analysis</div>
+                  <div className="page-subtitle">
+                    hyperswitch-web ↔ hyperswitch-client-core
+                    {report?.status === "done" && ` · ${counts.total} gap${counts.total !== 1 ? "s" : ""}`}
+                  </div>
+                </div>
+                {report?.status === "done" && (
+                  <div className="page-header-actions">
+                    <button
+                      className="btn btn-sm btn-green"
+                      disabled={verifyAllProgress !== null || counts.unverified === 0}
+                      onClick={onVerifyAll}
+                    >
+                      {verifyAllProgress
+                        ? `Verifying ${verifyAllProgress.current}/${verifyAllProgress.total}…`
+                        : `Verify all (${counts.unverified})`}
+                    </button>
+                    <button className="btn btn-sm" disabled={seedResetting} onClick={onSeedReset} title="Reset to seed data">
+                      {seedResetting ? "Resetting…" : "↺ Seed"}
+                    </button>
+                  </div>
+                )}
+              </div>
+
               {report?.status === "done" && (
-                <span className="ml-3 text-sm text-slate-500 font-mono">
-                  web {report.web_sha.slice(0, 8)} · mobile{" "}
-                  {report.mobile_sha.slice(0, 8)}
-                </span>
+                <div className="filter-tabs">
+                  <button
+                    className={`filter-tab ${filter === "all" && statusFilter === "all" ? "active" : ""}`}
+                    onClick={() => { setFilter("all"); setStatusFilter("all"); }}
+                  >
+                    All <span className="filter-tab-count">{counts.total}</span>
+                  </button>
+                  <button
+                    className={`filter-tab ${filter === "mobile" ? "active" : ""}`}
+                    onClick={() => { setFilter("mobile"); setStatusFilter("all"); }}
+                  >
+                    Mobile <span className="filter-tab-count">{counts.mobile}</span>
+                  </button>
+                  <button
+                    className={`filter-tab ${filter === "web" ? "active" : ""}`}
+                    onClick={() => { setFilter("web"); setStatusFilter("all"); }}
+                  >
+                    Web <span className="filter-tab-count">{counts.web}</span>
+                  </button>
+                  <div className="filter-tab-sep" />
+                  <button
+                    className={`filter-tab ${statusFilter === "verified" ? "active" : ""}`}
+                    onClick={() => { setFilter("all"); setStatusFilter(statusFilter === "verified" ? "all" : "verified"); }}
+                  >
+                    Verified <span className="filter-tab-count">{counts.verified}</span>
+                  </button>
+                  <button
+                    className={`filter-tab ${statusFilter === "unverified" ? "active" : ""}`}
+                    onClick={() => { setFilter("all"); setStatusFilter(statusFilter === "unverified" ? "all" : "unverified"); }}
+                  >
+                    Unverified <span className="filter-tab-count">{counts.unverified}</span>
+                  </button>
+                  <button
+                    className={`filter-tab ${statusFilter === "platform_specific" ? "active" : ""}`}
+                    onClick={() => { setFilter("all"); setStatusFilter(statusFilter === "platform_specific" ? "all" : "platform_specific"); }}
+                  >
+                    Platform-specific <span className="filter-tab-count">{counts.platformSpecific}</span>
+                  </button>
+                  <button
+                    className={`filter-tab ${statusFilter === "patched" ? "active" : ""}`}
+                    onClick={() => { setFilter("all"); setStatusFilter(statusFilter === "patched" ? "all" : "patched"); }}
+                  >
+                    Patched <span className="filter-tab-count">{counts.patched}</span>
+                  </button>
+                  {counts.hiddenPaymentMethods > 0 && (
+                    <>
+                      <div className="filter-tab-sep" />
+                      <button
+                        className={`filter-tab ${showPaymentMethods ? "active" : ""}`}
+                        onClick={() => setShowPaymentMethods((v) => !v)}
+                      >
+                        Payments <span className="filter-tab-count">{counts.hiddenPaymentMethods}</span>
+                      </button>
+                    </>
+                  )}
+                </div>
               )}
             </div>
-            {error && (
-              <div className="text-sm text-red-400 mt-1">{error}</div>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            {status === "running" && (
-              <button
-                onClick={async () => {
-                  await api.cancelAnalysis();
-                  refresh();
-                }}
-                className="rounded-lg border border-red-700 bg-red-950/40 hover:bg-red-900/40 text-red-300 px-4 py-2.5 text-sm font-medium"
-              >
-                Cancel
-              </button>
-            )}
-            <RunButton status={status} onClick={onRun} />
-          </div>
-        </div>
+          )}
 
-        {report?.status === "done" && (
-          <div className="grid grid-cols-3 gap-4 mt-6">
-            <Stat label="Total gaps" value={counts.total} />
-            <Stat label="Missing in mobile" value={counts.mobile} />
-            <Stat label="Missing in web" value={counts.web} />
-          </div>
-        )}
-        {report?.status === "done" && (
-          <div className="grid grid-cols-4 gap-4 mt-4">
-            <MiniStat label="Verified" value={gaps.filter((g) => g.verified === 1).length} total={gaps.length} color="emerald" active={statusFilter === "verified"} onClick={() => setStatusFilter(statusFilter === "verified" ? "all" : "verified")} />
-            <MiniStat label="Unverified" value={gaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length} total={gaps.length} color="slate" active={statusFilter === "unverified"} onClick={() => setStatusFilter(statusFilter === "unverified" ? "all" : "unverified")} />
-            <MiniStat label="Platform-specific" value={gaps.filter((g) => g.platform_specific === 1).length} total={gaps.length} color="amber" active={statusFilter === "platform_specific"} onClick={() => setStatusFilter(statusFilter === "platform_specific" ? "all" : "platform_specific")} />
-            <MiniStat label="Patched" value={patchedGaps.size} total={gaps.length} color="indigo" active={statusFilter === "patched"} onClick={() => setStatusFilter(statusFilter === "patched" ? "all" : "patched")} />
-          </div>
-        )}
-      </section>
-
-      {report?.status === "done" && (
-        <>
-          {/* Verify All progress bar */}
-          {verifyAllProgress && (
-            <div className="mb-3 rounded-lg border border-indigo-500/30 bg-indigo-500/5 px-4 py-3">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-sm text-indigo-200">
-                  Verifying {verifyAllProgress.current}/{verifyAllProgress.total}
-                  <span className="text-indigo-400 ml-2 font-mono text-xs">
-                    {verifyAllProgress.currentName}
-                  </span>
-                </span>
-                <button
-                  onClick={onCancelVerifyAll}
-                  className="rounded border border-red-700 px-2 py-0.5 text-xs text-red-300 hover:bg-red-900/30"
-                >
-                  Stop
-                </button>
+          {/* Page header — Skill */}
+          {SKILLS_REGISTRY.find((s) => s.id === activeTab) && (() => {
+            const skill = SKILLS_REGISTRY.find((s) => s.id === activeTab)!;
+            return (
+              <div className="page-header">
+                <div className="page-header-row" style={{ marginBottom: 16 }}>
+                  <div>
+                    <div className="page-title">{skill.name}</div>
+                    <div className="page-subtitle">{skill.description}</div>
+                  </div>
+                </div>
               </div>
-              <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-indigo-500 transition-all duration-300"
-                  style={{ width: `${(verifyAllProgress.current / verifyAllProgress.total) * 100}%` }}
-                />
+            );
+          })()}
+
+          {/* Page header — History */}
+          {(activeTab === "review-history" || activeTab === "skill-history") && (
+            <div className="page-header">
+              <div className="page-header-row" style={{ marginBottom: 16 }}>
+                <div>
+                  <div className="page-title">
+                    {activeTab === "review-history" ? "Review History" : "Skill History"}
+                  </div>
+                  <div className="page-subtitle">
+                    {activeTab === "review-history" ? "All past PR reviews." : "All past agent skill runs."}
+                  </div>
+                </div>
               </div>
             </div>
           )}
 
-          <div className="mb-3 flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <FilterPill
-                label="All"
-                active={filter === "all"}
-                onClick={() => setFilter("all")}
-              />
-              <FilterPill
-                label={`Missing in mobile (${counts.mobile})`}
-                active={filter === "mobile"}
-                onClick={() => setFilter("mobile")}
-              />
-              <FilterPill
-                label={`Missing in web (${counts.web})`}
-                active={filter === "web"}
-                onClick={() => setFilter("web")}
-              />
-              <div className="w-px h-5 bg-slate-700 mx-1" />
-              <button
-                onClick={onVerifyAll}
-                disabled={verifyAllProgress !== null || gaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length === 0}
-                className={
-                  "rounded-full border px-3 py-1 text-xs font-medium transition " +
-                  (verifyAllProgress !== null
-                    ? "border-indigo-500/50 bg-indigo-500/10 text-indigo-300 cursor-wait"
-                    : gaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length === 0
-                      ? "border-slate-800 text-slate-600 cursor-not-allowed"
-                      : "border-emerald-700 text-emerald-300 hover:border-emerald-500 hover:bg-emerald-500/10")
-                }
-              >
-                {verifyAllProgress
-                  ? "Verifying…"
-                  : `Verify All (${gaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length})`}
-              </button>
-            </div>
-            <FilterPill
-              label={
-                showPaymentMethods
-                  ? `Hide payment methods (${counts.hiddenPaymentMethods})`
-                  : `Show payment methods (${counts.hiddenPaymentMethods})`
-              }
-              active={showPaymentMethods}
-              onClick={() => setShowPaymentMethods((v) => !v)}
-            />
-          </div>
-          {!showPaymentMethods && counts.hiddenPaymentMethods > 0 && (
-            <div className="mb-3 rounded-lg border border-slate-800 bg-slate-900/30 px-4 py-2 text-xs text-slate-500">
-              {counts.hiddenPaymentMethods} payment-method gap
-              {counts.hiddenPaymentMethods === 1 ? "" : "s"} hidden — the mobile
-              SDK loads payment methods dynamically from backend, so static
-              detection is unreliable here.
-            </div>
-          )}
-          <GapTable
-            gaps={visibleGaps}
-            verifying={verifying}
-            patching={patching}
-            patchedGaps={patchedGaps}
-            patchBuildStatus={patchBuildStatus}
-            patchBranches={
-              new Map(
-                Array.from(patchData.entries()).map(([id, p]) => [id, p.branch]),
-              )
-            }
-            gapPrs={gapPrs}
-            onVerify={onVerifyGap}
-            onPatch={onPatchGap}
-            onViewSource={(g) => setActiveSourceGap(g)}
-            onAddPr={onAddPr}
-            onRemovePr={onRemovePr}
-            onOpenPreview={(repoKey, branch, gapId) => {
-              const p = gapId != null ? patchData.get(gapId) : undefined;
-              const gap = gaps.find((g) => g.id === gapId);
-              setActivePreview({
-                repoKey,
-                branch,
-                prUrl: p?.prUrl ?? null,
-                prWarning: p?.prWarning ?? null,
-                patchId: p?.patchId ?? null,
-                gapName: gap?.canonical_name,
-              });
-            }}
-          />
-        </>
-      )}
+          {/* ── Page body ─────────────────────────────────────────────── */}
+          <div className="page-body">
+
+            {/* Skill views */}
+            {SKILLS_REGISTRY.map((skill) => {
+              if (activeTab !== skill.id) return null;
+              const { FormComponent, ResultsComponent } = skill;
+              const skillResult = skillResults.get(skill.id);
+              return (
+                <div key={skill.id} style={{ padding: 24 }}>
+                  <FormComponent
+                    onResult={(r) => setSkillResults((prev) => new Map(prev).set(skill.id, r))}
+                    onError={(msg) => setError(msg)}
+                  />
+                  {skillResult && (
+                    <ResultsComponent
+                      result={skillResult}
+                      onClose={() => setSkillResults((prev) => { const m = new Map(prev); m.delete(skill.id); return m; })}
+                    />
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Review history */}
+            {activeTab === "review-history" && (
+              <div style={{ padding: 24 }}>
+                <ReviewHistory />
+              </div>
+            )}
+
+            {/* Skill history */}
+            {activeTab === "skill-history" && (
+              <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 24 }}>
+                {Object.entries(SKILL_HISTORY_CONFIG).map(([id, cfg]) => (
+                  <SkillHistory
+                    key={id}
+                    skillId={id}
+                    skillName={cfg.name}
+                    formatLabel={cfg.formatLabel}
+                    ResultsComponent={cfg.ResultsComponent}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* ── Gaps view ─────────────────────────────────────────── */}
+            {activeTab === "gaps" && (
+              <>
+                {/* Verify-all progress banner */}
+                {verifyAllProgress && (
+                  <div className="verify-progress-bar" style={{ margin: "12px 24px 0" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, color: "var(--accent)" }}>
+                        Verifying {verifyAllProgress.current}/{verifyAllProgress.total}
+                        <span className="mono" style={{ fontSize: 10, color: "var(--text3)", marginLeft: 8 }}>
+                          {verifyAllProgress.currentName}
+                        </span>
+                      </span>
+                      <button className="btn btn-red btn-sm" onClick={() => { verifyAllAbort.current = true; }}>
+                        Stop
+                      </button>
+                    </div>
+                    <div className="progress-bar-track">
+                      <div
+                        className="progress-bar-fill fill-green"
+                        style={{ width: `${(verifyAllProgress.current / verifyAllProgress.total) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Running */}
+                {status === "running" && (
+                  <div className="empty-state">
+                    <svg className="empty-state-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                      <circle cx="20" cy="20" r="14" strokeDasharray="7 5" opacity="0.35"/>
+                      <path d="M20 9v4M20 27v4M9 20h4M27 20h4" opacity="0.5"/>
+                    </svg>
+                    <div className="empty-state-title">Analysing repos…</div>
+                    <div className="empty-state-sub">
+                      Cloning and extracting features — takes ~1 minute. Cached runs are instant.
+                    </div>
+                  </div>
+                )}
+
+                {/* Failed */}
+                {status === "failed" && report?.error && (
+                  <div style={{ margin: 24, padding: 20, border: "1px solid rgba(248,113,113,.2)", borderRadius: 8, background: "var(--red-dim)", color: "var(--red)" }}>
+                    <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13 }}>Analysis failed</div>
+                    <pre style={{ fontSize: 11, whiteSpace: "pre-wrap", margin: 0, opacity: 0.85 }}>{report.error}</pre>
+                  </div>
+                )}
+
+                {/* Done — gap table */}
+                {report?.status === "done" && (
+                  <>
+                    {!showPaymentMethods && counts.hiddenPaymentMethods > 0 && (
+                      <div style={{ margin: "10px 24px 0", padding: "5px 12px", border: "1px solid var(--border)", borderRadius: 6, fontSize: 11, color: "var(--text3)" }}>
+                        {counts.hiddenPaymentMethods} payment-method gap{counts.hiddenPaymentMethods !== 1 ? "s" : ""} hidden — mobile SDK loads payment methods dynamically.
+                      </div>
+                    )}
+                    <div style={{ padding: "12px 24px 24px" }}>
+                      <GapTable
+                        gaps={visibleGaps}
+                        verifying={verifying}
+                        patching={patching}
+                        patchedGaps={patchedGaps}
+                        patchBuildStatus={patchBuildStatus}
+                        patchBranches={new Map(Array.from(patchData.entries()).map(([id, p]) => [id, p.branch]))}
+                        gapPrs={gapPrs}
+                        onVerify={onVerifyGap}
+                        onPatch={onPatchGap}
+                        onViewSource={(g) => setActiveSourceGap(g)}
+                        onAddPr={onAddPr}
+                        onRemovePr={onRemovePr}
+                        onOpenPreview={(repoKey, branch, gapId) => {
+                          const p = gapId != null ? patchData.get(gapId) : undefined;
+                          const gap = gaps.find((g) => g.id === gapId);
+                          setActivePreview({
+                            repoKey, branch,
+                            prUrl: p?.prUrl ?? null,
+                            prWarning: p?.prWarning ?? null,
+                            patchId: p?.patchId ?? null,
+                            gapName: gap?.canonical_name,
+                          });
+                        }}
+                      />
+                    </div>
+                  </>
+                )}
+
+                {/* Idle */}
+                {status === "idle" && (
+                  <div className="empty-state">
+                    <svg className="empty-state-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                      <rect x="6" y="6" width="28" height="28" rx="5"/>
+                      <line x1="6" y1="15" x2="34" y2="15"/>
+                      <line x1="16" y1="15" x2="16" y2="34"/>
+                    </svg>
+                    <div className="empty-state-title">No analysis yet</div>
+                    <div className="empty-state-sub">
+                      Compare hyperswitch-web and hyperswitch-client-core to find feature gaps.
+                    </div>
+                    <button className="btn btn-accent" onClick={onRun} style={{ marginTop: 8 }}>
+                      Run gap analysis
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+
+          </div>{/* end page-body */}
+        </div>{/* end main */}
+      </div>{/* end workspace */}
+
+      {/* ══════════════════════════ OVERLAYS ════════════════════════════════ */}
 
       {activePatch && (
         <DiffViewer
@@ -649,24 +765,38 @@ export default function App() {
         />
       )}
 
-      {activePatchGen && (
-        <PatchGenerationPanel
-          gapId={activePatchGen.gapId}
-          gapName={activePatchGen.gapName}
+      {activeAgent && (
+        <AgentPanel
+          gapId={activeAgent.gapId}
+          gapName={activeAgent.gapName}
+          mode={activeAgent.mode}
+          existingPatchId={activeAgent.existingPatchId}
           onClose={() => {
-            // Clear the "Generating…" spinner on the button whether success or cancel.
-            setPatching((prev) => { const s = new Set(prev); s.delete(activePatchGen.gapId); return s; });
-            setActivePatchGen(null);
+            if (activeAgent.mode === "patch") {
+              setPatching((prev) => { const s = new Set(prev); s.delete(activeAgent.gapId); return s; });
+            }
+            setActiveAgent(null);
           }}
-          onSuccess={(patch) => {
-            const id = activePatchGen.gapId;
+          onPatchSuccess={(patch: PatchDoneChunk) => {
+            const id = activeAgent.gapId;
+            const patchResp: PatchResponse = {
+              patchId: patch.patchId,
+              branch: patch.branch,
+              repo: patch.repo,
+              filesTouched: patch.filesTouched,
+              summary: patch.summary,
+              diff: patch.diff,
+              buildStatus: "pass",
+              buildLog: patch.buildLog,
+              prUrl: patch.prUrl ?? null,
+              prNumber: patch.prNumber ?? null,
+              prWarning: patch.prWarning ?? null,
+            };
             setPatchedGaps((prev) => { const s = new Set(prev); s.add(id); return s; });
             setPatchBuildStatus((prev) => { const m = new Map(prev); m.set(id, "pass"); return m; });
-            setPatchData((prev) => { const m = new Map(prev); m.set(id, patch); return m; });
-            setActivePatch({ patch, gapName: activePatchGen.gapName });
+            setPatchData((prev) => { const m = new Map(prev); m.set(id, patchResp); return m; });
             setPatching((prev) => { const s = new Set(prev); s.delete(id); return s; });
-            setActivePatchGen(null);
-            // Refresh so the patched badge appears in the table.
+            setActiveAgent((prev) => prev ? { ...prev, mode: "chat", existingPatchId: patch.patchId } : null);
             refresh();
           }}
         />
@@ -692,128 +822,6 @@ export default function App() {
         />
       )}
 
-      {status === "running" && (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/30 p-8 text-center text-slate-500">
-          Cloning repos and extracting features — this takes ~1 minute (cached runs are instant)…
-        </div>
-      )}
-
-      {status === "failed" && report?.error && (
-        <div className="rounded-xl border border-red-900/50 bg-red-950/30 p-6 text-red-300">
-          <div className="font-medium mb-2">Analysis failed</div>
-          <pre className="text-xs whitespace-pre-wrap">{report.error}</pre>
-        </div>
-      )}
-      </>)}
     </div>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="rounded-lg border border-slate-800 bg-slate-950 px-4 py-3">
-      <div className="text-xs uppercase tracking-wider text-slate-500">
-        {label}
-      </div>
-      <div className="text-2xl font-semibold mt-1">{value}</div>
-    </div>
-  );
-}
-
-function StatusPill({ status }: { status: string }) {
-  const tone =
-    status === "done"
-      ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
-      : status === "running"
-        ? "bg-indigo-500/10 text-indigo-300 border-indigo-500/30"
-        : status === "failed"
-          ? "bg-red-500/10 text-red-300 border-red-500/30"
-          : "bg-slate-500/10 text-slate-400 border-slate-500/30";
-  return (
-    <span
-      className={
-        "inline-block rounded border px-2 py-0.5 text-xs font-medium " + tone
-      }
-    >
-      {status}
-    </span>
-  );
-}
-
-function MiniStat({
-  label,
-  value,
-  total,
-  color,
-  active,
-  onClick,
-}: {
-  label: string;
-  value: number;
-  total: number;
-  color: "emerald" | "slate" | "amber" | "indigo";
-  active?: boolean;
-  onClick?: () => void;
-}) {
-  const pct = total > 0 ? Math.round((value / total) * 100) : 0;
-  const tones: Record<string, string> = {
-    emerald: "text-emerald-300 bg-emerald-500",
-    slate: "text-slate-400 bg-slate-500",
-    amber: "text-amber-300 bg-amber-500",
-    indigo: "text-indigo-300 bg-indigo-500",
-  };
-  const [textColor, barColor] = [
-    tones[color].split(" ")[0],
-    tones[color].split(" ")[1],
-  ];
-  const activeBorders: Record<string, string> = {
-    emerald: "border-emerald-500 ring-1 ring-emerald-500/30",
-    slate: "border-slate-500 ring-1 ring-slate-500/30",
-    amber: "border-amber-500 ring-1 ring-amber-500/30",
-    indigo: "border-indigo-500 ring-1 ring-indigo-500/30",
-  };
-  return (
-    <button
-      onClick={onClick}
-      className={
-        "rounded-lg border bg-slate-950 px-3 py-2 text-left transition cursor-pointer hover:bg-slate-900 " +
-        (active ? activeBorders[color] : "border-slate-800")
-      }
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-slate-500">{label}</span>
-        <span className={`text-sm font-semibold ${textColor}`}>{value}</span>
-      </div>
-      <div className="mt-1.5 h-1 rounded-full bg-slate-800 overflow-hidden">
-        <div
-          className={`h-full rounded-full ${barColor} transition-all duration-500`}
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-    </button>
-  );
-}
-
-function FilterPill({
-  label,
-  active,
-  onClick,
-}: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={
-        "rounded-full border px-3 py-1 text-xs font-medium transition " +
-        (active
-          ? "border-indigo-500 bg-indigo-500/20 text-indigo-200"
-          : "border-slate-700 text-slate-400 hover:border-slate-500")
-      }
-    >
-      {label}
-    </button>
   );
 }

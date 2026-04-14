@@ -1,9 +1,12 @@
 import { Router } from "express";
+import fs from "node:fs";
+import path from "node:path";
 import { getValidateCache, putValidateCache } from "../cache.js";
 import { MODEL_REASON, REPOS, type RepoKey } from "../config.js";
-import { db, nowIso, type GapPrRow, type GapRow } from "../db.js";
+import { db, nowIso, type GapPrRow, type GapRow, type PatchRow } from "../db.js";
 import { askJson } from "../llm.js";
 import { syncAllRepos } from "../workspace/repoManager.js";
+import { PROJECT_ROOT } from "../config.js";
 
 export const gapsRouter = Router();
 
@@ -253,4 +256,117 @@ gapsRouter.delete("/gap-prs/:prId", (req, res) => {
   const info = db.prepare(`DELETE FROM gap_prs WHERE id = ?`).run(prId);
   if (info.changes === 0) return res.status(404).json({ error: "not found" });
   res.json({ deleted: true });
+});
+
+/**
+ * POST /analysis/seed-reset
+ *
+ * Clears all analysis data (reports + gaps, cascading to patches) and
+ * re-populates from the seed files (seed/verified-gaps.json).
+ *
+ * Patches are preserved by re-linking them to the new gap IDs via
+ * canonical_name + category + missing_in matching.
+ */
+gapsRouter.post("/analysis/seed-reset", (_req, res) => {
+  const seedDir = path.join(PROJECT_ROOT, "seed");
+  const verifiedPath = path.join(seedDir, "verified-gaps.json");
+
+  if (!fs.existsSync(verifiedPath)) {
+    return res.status(400).json({ error: "seed/verified-gaps.json not found" });
+  }
+
+  let seedGaps: Array<Record<string, unknown>>;
+  try {
+    seedGaps = JSON.parse(fs.readFileSync(verifiedPath, "utf8"));
+  } catch (err) {
+    return res.status(500).json({ error: `Failed to parse seed file: ${(err as Error).message}` });
+  }
+
+  try {
+    let gapsInserted = 0;
+    let patchesRelinked = 0;
+    let patchesOrphaned = 0;
+
+    db.transaction(() => {
+      // 1. Save all existing patches before deletion (cascade will remove them)
+      const existingPatches = db
+        .prepare(
+          `SELECT p.*, g.canonical_name AS gap_canonical_name, g.category AS gap_category, g.missing_in AS gap_missing_in
+           FROM patches p
+           LEFT JOIN gaps g ON g.id = p.gap_id`,
+        )
+        .all() as Array<PatchRow & { gap_canonical_name: string; gap_category: string; gap_missing_in: string }>;
+
+      // 2. Delete all reports → cascades to gaps → cascades to patches
+      db.prepare("DELETE FROM reports").run();
+
+      // 3. Insert a new seed report
+      const reportId = db
+        .prepare(`INSERT INTO reports (created_at, web_sha, mobile_sha, status) VALUES (?, 'seed', 'seed', 'done')`)
+        .run(nowIso()).lastInsertRowid as number;
+
+      // 4. Insert seed gaps and track canonical_name → new gap id
+      const nameToId = new Map<string, number>();
+      const insertGap = db.prepare(
+        `INSERT INTO gaps (report_id, category, canonical_name, missing_in, present_in, evidence, rationale, severity, platform_specific, verified)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const g of seedGaps) {
+        const gapId = insertGap.run(
+          reportId,
+          g.category,
+          g.canonical_name,
+          g.missing_in,
+          g.present_in,
+          g.evidence,
+          g.rationale,
+          g.severity,
+          g.platform_specific ?? 0,
+          g.verified ?? 1,
+        ).lastInsertRowid as number;
+        nameToId.set(`${String(g.canonical_name)}:${String(g.category)}:${String(g.missing_in)}`, gapId);
+        gapsInserted++;
+      }
+
+      // 5. Re-insert patches linked to new gap IDs
+      const insertPatch = db.prepare(
+        `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const p of existingPatches) {
+        const key = `${p.gap_canonical_name}:${p.gap_category}:${p.gap_missing_in}`;
+        const newGapId = nameToId.get(key);
+        if (newGapId !== undefined) {
+          insertPatch.run(
+            newGapId,
+            p.repo,
+            p.branch,
+            p.diff_path,
+            p.summary,
+            p.files_touched,
+            p.status,
+            p.created_at,
+            p.build_status,
+            p.build_log,
+            p.pr_url,
+            p.pr_number,
+            p.pr_warning,
+          );
+          patchesRelinked++;
+        } else {
+          patchesOrphaned++;
+        }
+      }
+    })();
+
+    res.json({
+      message: "Seed reset complete",
+      gapsInserted,
+      patchesRelinked,
+      patchesOrphaned,
+    });
+  } catch (err) {
+    console.error("[seed-reset] error:", err);
+    res.status(500).json({ error: (err as Error).message });
+  }
 });

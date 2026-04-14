@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type PreviewKind, type PreviewState } from "../api";
-import { ChatPanel } from "./ChatPanel";
 
 interface Props {
   repoKey: "web" | "mobile";
@@ -495,16 +494,6 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, patchId, gapN
             )}
           </div>
         </div>
-        {/* Chat panel — only when we have a patch to chat about. */}
-        {patchId != null && (
-          <div className="flex-1 min-h-0 lg:w-[35%] lg:min-w-[320px] lg:max-w-[560px] h-80 lg:h-auto">
-            <ChatPanel
-              patchId={patchId}
-              branch={branch}
-              canonicalName={gapName ?? branch}
-            />
-          </div>
-        )}
         </div>
       </div>
     </div>

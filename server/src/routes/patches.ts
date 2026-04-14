@@ -13,15 +13,8 @@ import { withRepoLock } from "../workspace/mutex.js";
 export const patchesRouter = Router();
 
 /**
- * Generate a patch for a verified gap. Steps:
- *
- *   1. Look up the gap. If not verified, run validation first.
- *   2. Read evidence from the "present" repo to understand the feature.
- *   3. Create a branch in the "missing" repo.
- *   4. Ask Opus to implement the feature (with Edit/Write/Read/Glob/Grep).
- *   5. `git diff` the result into a .patch file.
- *   6. Reset the branch so the working tree is clean.
- *   7. Return patch metadata + diff content.
+ * Generate a patch for a verified gap (blocking, legacy).
+ * Kept for backward compatibility — new callers use /patch/stream.
  */
 patchesRouter.post("/gaps/:id/patch", async (req, res) => {
   const gapId = Number(req.params.id);
@@ -34,8 +27,6 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
     | undefined;
   if (!gap) return res.status(404).json({ error: "gap not found" });
 
-  // Already has a patch? Check both by exact gap_id and by identity
-  // (canonical_name + category + missing_in) to catch cross-report matches.
   const existing = db
     .prepare(
       `SELECT p.* FROM patches p
@@ -57,11 +48,7 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
   const sourceDir = REPOS[sourceRepo].dir;
 
   try {
-    // Serialize workspace access so a chat turn on the same repo can't
-    // race us. Chat runs also take this lock — one holder at a time per
-    // repo. See iteration 8 / server/src/workspace/mutex.ts.
     await withRepoLock(targetRepo, async () => {
-    // ---- Read feature context from source repo ----
     const evidence = safeParseEvidence(gap.evidence);
     const sourceFile = evidence?.[0]?.file;
     let sourceContext = "";
@@ -69,7 +56,6 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
       const fullPath = path.join(sourceDir, sourceFile);
       try {
         sourceContext = fs.readFileSync(fullPath, "utf8");
-        // Truncate large files to avoid bloating the prompt
         if (sourceContext.length > 8000) {
           sourceContext = sourceContext.slice(0, 8000) + "\n... [truncated]";
         }
@@ -78,35 +64,19 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
       }
     }
 
-    // ---- Create branch in target repo ----
     const git = simpleGit(targetDir);
     const slug = gap.canonical_name
       .replace(/[^a-z0-9]+/gi, "-")
       .slice(0, 40)
       .replace(/-$/, "");
     const branchName = `feat/gap-${gapId}-${slug}`;
-
-    // Always start fresh from main, regardless of what branch the workspace
-    // happens to be on. Reading "current branch" was a bug — if a previous
-    // failed run left the workspace stuck on a feature branch, the next
-    // patch would be built on top of stale state and the same cleanup path
-    // would re-strand it. main is the only safe ground truth.
     const defaultBranch = "main";
 
-    // Ensure clean working tree (including submodules) and pin to main.
     await resetSubmodules(targetDir, targetRepo);
     await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
-
-    // Delete old branch if it exists (from a previous failed attempt)
-    try {
-      await git.deleteLocalBranch(branchName, true);
-    } catch {
-      /* didn't exist */
-    }
-
+    try { await git.deleteLocalBranch(branchName, true); } catch { /* didn't exist */ }
     await git.checkoutLocalBranch(branchName);
 
-    // ---- Ask Opus to implement the feature ----
     const repoLabel =
       targetRepo === "web"
         ? "hyperswitch-web (ReScript web SDK)"
@@ -116,125 +86,37 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
         ? "hyperswitch-web (ReScript web SDK)"
         : "hyperswitch-client-core (ReScript mobile SDK)";
 
-    const prompt = `You are implementing a missing feature in the ${repoLabel} repository.
-
-Your current working directory IS the ${targetRepo} repo: ${targetDir}
-You have Edit, Write, Read, Glob, Grep, and Bash tools.
-
-## Feature to implement
-
-Feature name: ${gap.canonical_name}
-Category: ${gap.category}
-Rationale: ${gap.rationale}
-
-This feature exists in ${sourceLabel} but is MISSING here.
-
-## Reference implementation (from ${sourceRepo} repo)
-
-File: ${sourceFile ?? "unknown"}
-
-\`\`\`
-${sourceContext || "(no source context available)"}
-\`\`\`
-
-## Instructions — read every step before starting
-
-1. First use Glob and Grep to understand the existing code structure and conventions in THIS repo.
-2. Find the right location to add the feature — follow the repo's existing patterns.
-3. Implement the feature idiomatically for this repo's architecture.
-4. Only touch files that are necessary. Do NOT refactor unrelated code.
-5. Do NOT add tests unless the repo has an existing test pattern for similar features.
-6. Keep the implementation minimal but functional.
-
-## ⛔ HARD REQUIREMENT — the task is NOT done until the build is green
-
-This is a ReScript codebase. Type errors and missing-binding errors are common — you MUST verify your edits compile. The server runs the same build check on the back end and will REJECT a patch with build errors, wasting the entire run.
-
-After every meaningful edit (or batch of related edits), run:
-
-\`\`\`bash
-npm run --silent re:build 2>&1
-\`\`\`
-
-When you call the Bash tool, **pass \`timeout: 240000\`** (240 seconds) — the default 2-minute Bash timeout is too short for a cold ReScript build in this repo.
-
-Then:
-- **If the build succeeds** (no error lines, exit code 0): you may produce the JSON summary and stop.
-- **If the build fails**: read the compiler output carefully. ReScript errors are precise — they cite the file, line, column, and the exact type mismatch or missing module. **Fix the issue and re-run the build.** Do not guess; the compiler tells you what's wrong.
-
-You have a budget of **up to 5 build attempts** within this single run. Common iteration loop:
-  edit → \`npm run --silent re:build 2>&1\` → read error → edit → build → ... → green → done.
-
-Do not output the JSON summary until \`npm run --silent re:build\` exits 0.
-
-If after 5 attempts you still cannot make it compile, do NOT pretend it works. Output the JSON summary with the field \`build_status: "failed_after_retries"\` and put the last build error tail in \`notes\`. The server will reject it but at least we'll see what went wrong.
-
-## ReScript-specific gotchas
-
-- Adding a field to a record type means **every constructor of that record** must include the new field. Use Grep to find all the places that build the record.
-- Optional fields are \`option<T>\` and constructed with \`Some(x)\` / \`None\`. Don't write \`undefined\` or \`null\`.
-- New modules need an entry in the source tree that ReScript already includes (check \`bsconfig.json\` / \`rescript.json\` includes).
-- Pattern matches must be exhaustive — adding a variant means updating every \`switch\`.
-
-## Naming and integration
-
-- Follow the naming conventions already used in this repo.
-- If the feature requires backend API integration, add the API call structure but use placeholder endpoints matching the repo's existing patterns.
-
-## Output format
-
-After the build is green, output ONLY a JSON summary (no code fences, no extra text) in this exact format:
-
-{"what": "<one-line description of the feature added>", "files": [{"path": "<relative file path>", "change": "<brief description of what changed in this file>"}], "backward_compatible": true, "build_status": "passed", "build_attempts": <number>, "notes": "<optional: any caveats, defaults, or integration notes>"}
-
-Example:
-{"what": "Added hideExpiredPaymentMethods config option", "files": [{"path": "src/types/SdkTypes.res", "change": "Added field to configurationType record, parsed from config dict (default: false)"}], "backward_compatible": true, "build_status": "passed", "build_attempts": 2, "notes": "First attempt missed the parseConfigurationDict update; second attempt fixed it"}`;
+    const prompt = buildSingleAgentPrompt({
+      gap, targetRepo, sourceRepo, repoLabel, sourceLabel,
+      sourceDir, targetDir, sourceFile: sourceFile ?? null,
+      sourceContext,
+    });
 
     const summary = await ask(prompt, {
       model: "opus",
-      // Bumped from 600s → 1500s to give the agent room to iterate on build
-      // failures (up to 5 build attempts × ~120s each + edit time).
       timeoutMs: 1_500_000,
       cwd: targetDir,
-      // Bash added so the agent can run `npm run re:build` itself and iterate
-      // until green. Edit/Write/Read/Glob/Grep unchanged.
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
     });
 
-    // ---- Capture diff (submodule-aware for mobile repo) ----
     const { diff, fileCount } = await getDiffWithSubmodules(targetDir, targetRepo);
 
     if (!diff || fileCount === 0) {
-      // Opus didn't change any files — reset and bail
       await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
-      try {
-        await git.deleteLocalBranch(branchName, true);
-      } catch { /* */ }
-      return res.status(422).json({
-        error: "Opus did not produce any file changes",
-        summary,
-      });
+      try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+      return res.status(422).json({ error: "Opus did not produce any file changes", summary });
     }
 
-    // Save .patch file (always — even on build failure, so the user can inspect)
     const patchFileName = `${gapId}-${slug}.patch`;
     const patchPath = path.join(PATCHES_DIR, patchFileName);
     fs.writeFileSync(patchPath, diff);
 
-    // ---- Mandatory ReScript build check ----
-    // Runs against the agent's edits in the working tree. If it fails the
-    // change is fundamentally broken (missing module, syntax/type error) and
-    // we refuse to commit or persist a patch row — the user can inspect the
-    // diff at `patchPath` and re-run.
     const build = runRescriptBuild(targetDir);
     if (!build.passed) {
-      // Leave the agent's edits on disk so they can be inspected, but reset
-      // back to the default branch so the workspace isn't stuck on a broken
-      // feature branch.
       await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
       try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
       return res.status(422).json({
-        error: "ReScript build failed — patch rejected. The agent's edits introduced a syntax or type error.",
+        error: "ReScript build failed — patch rejected.",
         buildStatus: "fail",
         buildLog: build.log,
         diff,
@@ -243,90 +125,36 @@ Example:
       });
     }
 
-    // Build passed — commit the changes (submodules first, then parent)
     const commitMsg = `feat: add ${gap.canonical_name}\n\nGenerated by feature-gap-dashboard for gap #${gapId}`;
     const commitResult = await commitWithSubmodules(targetDir, targetRepo, commitMsg);
 
-    // Sanity check: after committing, the feature branch MUST have at least
-    // one commit ahead of local main. If not, commitWithSubmodules silently
-    // failed to stage/commit (happens when agent edits end up in paths the
-    // excludePaths pattern doesn't match, or git returns a clean status
-    // mid-stage). Bail loudly instead of pushing an empty branch.
     const aheadCount = await commitsAheadOfForkMain(targetDir, branchName);
     if (aheadCount === 0 && commitResult.submodulesChanged.length === 0) {
       await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
       try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
-      return res.status(500).json({
-        error:
-          "Agent edits were applied and built successfully, but commitWithSubmodules produced zero commits on the feature branch. This usually means the staged files didn't match the expected paths. Patch file saved at " +
-          patchPath +
-          " for manual inspection.",
-        diff,
-        summary: summary.slice(0, 2000),
-        patchPath,
-      });
+      return res.status(500).json({ error: "commitWithSubmodules produced zero commits", diff, summary: summary.slice(0, 2000), patchPath });
     }
 
-    // ---- Push fork + open PR (submodule-aware) ----
-    //
-    // For each submodule the agent committed inside, push that submodule's
-    // commit to its corresponding bot fork. Then rewrite .gitmodules in the
-    // parent so anyone checking out the feature branch from the parent fork
-    // can `git submodule update --init --recursive` and resolve every SHA.
-    //
-    // The PR targets the FORK's own main (pradeep120230-creator/...), not
-    // juspay's. That lets the user merge their own PRs end-to-end without
-    // upstream maintainer approval.
     let prUrl: string | null = null;
     let prNumber: number | null = null;
     let prWarning: string | null = null;
     const submodulePushSummaries: string[] = [];
     try {
-      // 1. Push each dirty submodule to its fork.
       for (const subDir of commitResult.submodulesChanged) {
-        const result = await pushSubmoduleToFork({
-          parentDir: targetDir,
-          subDir,
-          branchName,
-        });
+        const result = await pushSubmoduleToFork({ parentDir: targetDir, subDir, branchName });
         submodulePushSummaries.push(`${subDir} → ${result.forkUrl} @ ${result.sha.slice(0, 8)}`);
       }
-
-      // 2. Rewrite .gitmodules + add it as a follow-up commit on the feature
-      //    branch (only if we actually touched any submodule).
       if (commitResult.submodulesChanged.length > 0) {
         const rewritten = rewriteGitmodulesToForks(targetDir, commitResult.submodulesChanged);
         if (rewritten.length > 0) {
           const parentGit = simpleGit(targetDir);
           await parentGit.add([".gitmodules"]);
-          await parentGit.commit(
-            `chore: point submodules at bot forks for build\n\n` +
-              `Automated by feature-gap-dashboard so the feature branch is checkout-buildable.\n` +
-              `Rewritten: ${rewritten.join(", ")}`,
-          );
+          await parentGit.commit(`chore: point submodules at bot forks for build\n\nRewritten: ${rewritten.join(", ")}`);
         }
       }
-
-      // 3. Push the parent feature branch to the parent fork.
       await pushBranchToFork(targetDir, targetRepo, branchName);
-
-      // 4. Open the PR.
-      const body = formatPrBody({
-        gapId,
-        canonicalName: gap.canonical_name,
-        category: gap.category,
-        rationale: gap.rationale,
-        summaryJson: summary,
-        filesTouched: fileCount,
-        buildLog: build.log,
-        submodulePushes: submodulePushSummaries,
-      });
-      const created = await createPullRequest({
-        repoKey: targetRepo,
-        branch: branchName,
-        title: `feat: add ${gap.canonical_name}`,
-        body,
-      });
+      const body = formatPrBody({ gapId, canonicalName: gap.canonical_name, category: gap.category, rationale: gap.rationale, summaryJson: summary, filesTouched: fileCount, buildLog: build.log, submodulePushes: submodulePushSummaries });
+      const created = await createPullRequest({ repoKey: targetRepo, branch: branchName, title: `feat: add ${gap.canonical_name}`, body });
       prUrl = created.prUrl;
       prNumber = created.prNumber;
     } catch (err) {
@@ -334,75 +162,43 @@ Example:
       console.error(`[patches] PR creation failed for gap ${gapId}:`, err);
     }
 
-    // Switch back to default branch (leave the feature branch intact)
     await forceCheckoutBranch(targetDir, targetRepo, defaultBranch);
 
-    // ---- Save to DB ----
     const patchRow = db
-      .prepare(
-        `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
-         VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        gapId,
-        targetRepo,
-        branchName,
-        patchPath,
-        summary.slice(0, 2000),
-        fileCount,
-        nowIso(),
-        "pass",
-        build.log,
-        prUrl,
-        prNumber,
-        prWarning,
-      );
+      .prepare(`INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning) VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`)
+      .run(gapId, targetRepo, branchName, patchPath, summary.slice(0, 2000), fileCount, nowIso(), "pass", build.log, prUrl, prNumber, prWarning);
 
-    res.json({
-      patchId: patchRow.lastInsertRowid,
-      branch: branchName,
-      repo: targetRepo,
-      filesTouched: fileCount,
-      summary: summary.slice(0, 2000),
-      diff,
-      buildStatus: "pass",
-      buildLog: build.log,
-      prUrl,
-      prNumber,
-      prWarning,
+    res.json({ patchId: patchRow.lastInsertRowid, branch: branchName, repo: targetRepo, filesTouched: fileCount, summary: summary.slice(0, 2000), diff, buildStatus: "pass", buildLog: build.log, prUrl, prNumber, prWarning });
     });
-    });  // close withRepoLock
   } catch (err) {
     console.error(`[patches] failed for gap ${gapId}:`, err);
-
-    // Try to clean up: go back to default branch. Also inside the lock so
-    // we can't race with a chat turn.
-    try {
-      await withRepoLock(targetRepo, () =>
-        forceCheckoutBranch(targetDir, targetRepo, "main"),
-      );
-    } catch { /* best effort */ }
-
+    try { await withRepoLock(targetRepo, () => forceCheckoutBranch(targetDir, targetRepo, "main")); } catch { /* best effort */ }
     res.status(500).json({ error: (err as Error).message });
   }
 });
 
 /**
- * Streaming patch generation.
+ * Multi-Opus streaming patch generation.
  * POST /gaps/:id/patch/stream
  *
- * Same pre-flight as POST /gaps/:id/patch, but uses askStream() so the agent's
- * tool calls and reasoning stream to the browser as NDJSON in real-time.
+ * Three specialized sub-agents run in sequence:
  *
- * Agent flow (new two-phase prompt):
- *   Phase 1 — Analyse the feature fully in the SOURCE repo (Grep/Read with
- *              absolute paths into sourceDir, even though cwd = targetDir).
- *   Phase 2 — Implement the equivalent pattern in the TARGET repo; iterate on
- *              build errors until green (no attempt limit, full 25-min budget).
+ *   Agent 1 — Source Analyst (READ-ONLY, cwd=sourceDir)
+ *     Explores the source repo and produces a structured JSON spec:
+ *     featureName, typeDefinition, configKey, defaultValue, behavior, allRelatedFiles,
+ *     reScriptGotchas, implementationSteps
  *
- * Final NDJSON line is always one of:
- *   {type:"patch_done", patchId, prUrl, diff, buildStatus:"pass", ...}
- *   {type:"error", error:"<message>"}
+ *   Agent 2 — Implementer (cwd=targetDir)
+ *     Receives the spec and implements the feature. Runs re:build after edits,
+ *     iterates until green. No attempt limit.
+ *
+ *   Agent 3 — Verifier (READ-ONLY, cwd=targetDir)
+ *     Checks that the implementation matches the spec — types, config keys,
+ *     default values. Build is already confirmed green by the server; verifier
+ *     checks semantic correctness.
+ *
+ * Phase boundaries are emitted as {type:"phase_marker",phase:"analysing"|"implementing"|"verifying"}.
+ * Final line is always {type:"patch_done",...} or {type:"error",...}.
  */
 patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
   const gapId = Number(req.params.id);
@@ -435,10 +231,9 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
   const targetDir = REPOS[targetRepo].dir;
   const sourceDir = REPOS[sourceRepo].dir;
 
-  // Set streaming headers before any write.
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering if behind a proxy
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
   let clientClosed = false;
@@ -450,9 +245,17 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
     }
   };
 
+  const repoLabel =
+    targetRepo === "web"
+      ? "hyperswitch-web (ReScript web SDK)"
+      : "hyperswitch-client-core (ReScript mobile SDK)";
+  const sourceLabel =
+    sourceRepo === "web"
+      ? "hyperswitch-web (ReScript web SDK)"
+      : "hyperswitch-client-core (ReScript mobile SDK)";
+
   try {
     await withRepoLock(targetRepo, async () => {
-      // ---- Branch setup (identical to blocking endpoint) ----
       const evidence = safeParseEvidence(gap.evidence);
       const sourceFile = evidence?.[0]?.file;
 
@@ -468,101 +271,96 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
       try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
       await git.checkoutLocalBranch(branchName);
 
-      // ---- Two-phase prompt: source analysis + target implementation ----
-      const repoLabel =
-        targetRepo === "web"
-          ? "hyperswitch-web (ReScript web SDK)"
-          : "hyperswitch-client-core (ReScript mobile SDK)";
-      const sourceLabel =
-        sourceRepo === "web"
-          ? "hyperswitch-web (ReScript web SDK)"
-          : "hyperswitch-client-core (ReScript mobile SDK)";
-
       const sourceEntryPath = sourceFile
         ? `${sourceDir}/${sourceFile}`
         : `${sourceDir} (discover the entry point with Grep)`;
 
-      const prompt = `You are implementing a missing feature in the ${repoLabel} repository.
+      // ================================================================
+      // AGENT 1 — SOURCE ANALYST (read-only, cwd=sourceDir)
+      // ================================================================
+      writeLine({ type: "phase_marker", phase: "analysing" });
 
-SOURCE repo (${sourceRepo}): ${sourceDir}
-TARGET repo (${targetRepo}): ${targetDir}   ← your cwd
+      const analystPrompt = `You are a source-code analyst working exclusively in read-only mode.
 
-## Feature to implement
+Your task: fully analyse how the feature "${gap.canonical_name}" works in the ${sourceLabel} repo.
 
-Name: ${gap.canonical_name}
-Category: ${gap.category}
-Rationale: ${gap.rationale}
-Starting point in source: ${sourceEntryPath}
+Source repo: ${sourceDir}
+Entry point: ${sourceEntryPath}
 
-## Phase 1 — Understand how this feature works in the SOURCE repo
+INSTRUCTIONS:
+1. Start from the entry point above. Read it completely.
+2. Follow every import and cross-reference to find ALL files involved in this feature:
+   - Where is the TYPE declared? (Record field, option type, variant)
+   - Where is it PARSED from the JS/JSON config object? (Which function reads it?)
+   - How does the value FLOW through the system? (config → state atom → component prop → render branch)
+   - Which component or function RENDERS or BEHAVES differently based on this feature?
+3. Run Grep across ${sourceDir} for "${gap.canonical_name}" and related camelCase/snake_case variants to find any callsites you missed.
+4. Check for ReScript-specific patterns:
+   - Is the field option<T> or a direct type?
+   - Are there Belt.Option or pattern-match usages?
+   - Are there any switch/match sites that would need a new branch?
 
-Before writing any code in the target, fully analyse the feature in the source repo.
-Use Read, Grep, and Glob with ABSOLUTE PATHS to explore ${sourceDir}.
+OUTPUT: Produce ONLY valid JSON in this exact shape (no fences, no prose):
+{
+  "featureName": "${gap.canonical_name}",
+  "typeDefinition": "<full ReScript type, e.g. option<bool>",
+  "configKey": "<exact JS/JSON key integrators use, e.g. paymentMethodOrder>",
+  "defaultValue": "<default when absent, e.g. None or false>",
+  "behavior": "<what this feature does behaviourally when enabled/set>",
+  "allRelatedFiles": [
+    {"path": "<relative path from repo root>", "role": "<type|parser|state|component|util>"}
+  ],
+  "reScriptGotchas": ["<pitfall 1>", "<pitfall 2>"],
+  "implementationSteps": [
+    "<ordered step 1: e.g. Add field X to record Y in file Z>",
+    "<ordered step 2: ...>"
+  ]
+}
 
-1. Start at ${sourceEntryPath} as your entry point.
-2. Follow imports and references to find EVERY file involved in this feature:
-   - Where is the TYPE declared? (Record field, variant type, type alias)
-   - Where is it PARSED from config? (Which parser reads it from the JS options dict?)
-   - How does the value FLOW? (Config → state → props → component → render branch)
-   - Which COMPONENT renders differently based on this feature?
-3. Grep ${sourceDir} for "${gap.canonical_name}" and related names to find all callsites.
-4. Before moving to Phase 2, state clearly in your response:
-   - The TYPE of the feature (e.g., option<bool> defaulted to None = false)
-   - The config KEY name (how integrators set it in the JS options object)
-   - ALL files in the source that contain code for this feature
-   - What the feature DOES behaviourally or visually
+Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read there.`;
 
-Do NOT edit the target repo until Phase 2.
-
-## Phase 2 — Implement the equivalent pattern in TARGET
-
-Your cwd is ${targetDir}. The target is ${repoLabel}.
-
-Using what you learned in Phase 1:
-1. Find the TARGET equivalent of each source file:
-   - Source type file → target type file (same layer in the architecture)
-   - Source parser → target parser
-   - Source component → target component
-2. Apply the same LOGICAL change in each target file, adapted to the target's idioms and naming conventions.
-3. Do NOT copy source code verbatim — the two repos have different architectures.
-4. Only touch files that need to change. No unrelated refactors.
-
-## ⛔ HARD REQUIREMENT — build must be green before finishing
-
-After every meaningful batch of edits, run:
-  npm run --silent re:build 2>&1
-Pass Bash timeout: 240000 (cold builds take up to 120 seconds in this repo).
-
-Iterate until exit code 0. There is NO attempt limit — use the full time budget.
-
-When a build fails:
-  a. List ALL errors: file path, line number, error message.
-  b. Find the root cause — one missing record-field update often produces 3+ error lines.
-  c. Fix the root cause first, re-run, then handle any remaining secondary errors.
-  d. "The module or file X can't be found": check rescript.json "sources" — new .res files may need to be listed there.
-
-ReScript-specific pitfalls:
-- Adding a field to a record → EVERY constructor of that record must include it.
-  Grep for the record type name BEFORE editing to find all construction sites.
-- Optional fields: option<T> with Some(x) / None. Never undefined or null.
-- New variants → every switch on that type must be exhaustive. Check all switch sites.
-- open ModuleName can shadow built-ins — prefer Belt.* qualified names.
-- Use Belt.Option.getWithDefault, not Option.getOrElse (Belt stdlib, not JS conventions).
-
-## Output (only after build exits 0)
-
-Output ONLY this JSON — no code fences, no extra text:
-{"what":"<one-line description>","files":[{"path":"<path relative to target repo>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<optional caveats>"}`;
-
-      // ---- Stream the agent in real-time ----
-      let agentText = "";
+      let specText = "";
       await askStream(
-        prompt,
+        analystPrompt,
         {
           model: "opus",
-          timeoutMs: 1_500_000,
+          cwd: sourceDir,
+          allowedTools: ["Read", "Glob", "Grep"],
+          timeoutMs: 600_000,
+        },
+        (chunk) => {
+          writeLine(chunk);
+          if (chunk.type === "text" && chunk.text) specText += chunk.text;
+        },
+      );
+
+      // Extract JSON spec from analyst output (may be surrounded by thinking text)
+      let spec: SourceSpec | null = null;
+      try {
+        const m = specText.match(/\{[\s\S]*\}/);
+        if (m) spec = JSON.parse(m[0]) as SourceSpec;
+      } catch {
+        writeLine({ type: "text", text: "\n[Note: analyst output could not be parsed as JSON — using fallback prompt for implementer]\n" });
+      }
+
+      // ================================================================
+      // AGENT 2 — IMPLEMENTER (cwd=targetDir, full tool access)
+      // ================================================================
+      writeLine({ type: "phase_marker", phase: "implementing" });
+
+      let agentText = "";
+
+      const implementerPrompt = spec
+        ? buildSpecBasedImplementerPrompt({ spec, gap, repoLabel, sourceLabel, sourceDir, targetDir, sourceEntryPath })
+        : buildFallbackImplementerPrompt({ gap, repoLabel, sourceLabel, sourceDir, targetDir, sourceEntryPath });
+
+      await askStream(
+        implementerPrompt,
+        {
+          model: "opus",
           cwd: targetDir,
           allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
+          timeoutMs: 1_200_000,
         },
         (chunk) => {
           writeLine(chunk);
@@ -570,7 +368,9 @@ Output ONLY this JSON — no code fences, no extra text:
         },
       );
 
-      // ---- Post-processing (deterministic, same as blocking endpoint) ----
+      // ================================================================
+      // SERVER BUILD CHECK (hard gate — must pass before verifier runs)
+      // ================================================================
       const { diff, fileCount } = await getDiffWithSubmodules(targetDir, targetRepo);
 
       if (!diff || fileCount === 0) {
@@ -585,22 +385,95 @@ Output ONLY this JSON — no code fences, no extra text:
       const patchPath = path.join(PATCHES_DIR, patchFileName);
       fs.writeFileSync(patchPath, diff);
 
-      writeLine({ type: "text", text: "\n---\nRunning post-build verification…" });
-
+      writeLine({ type: "text", text: "\n---\nRunning server-side build verification…" });
       const build = runRescriptBuild(targetDir);
       if (!build.passed) {
+        // Don't delete the branch — save a build_failed patch row so the chat
+        // agent can checkout the branch and fix the errors interactively.
         await forceCheckoutBranch(targetDir, targetRepo, "main");
-        try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+
+        const failedPatchRow = db
+          .prepare(
+            `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
+             VALUES (?, ?, ?, ?, ?, ?, 'build_failed', ?, 'fail', ?, NULL, NULL, NULL)`,
+          )
+          .run(
+            gapId,
+            targetRepo,
+            branchName,
+            patchPath,
+            `Build failed during generation of ${gap.canonical_name}`,
+            fileCount,
+            nowIso(),
+            build.log,
+          );
+
         writeLine({
-          type: "error",
-          error: `Build failed — patch rejected.\n\nBuild log:\n${build.log.slice(-3000)}`,
+          type: "build_failed",
+          patchId: Number(failedPatchRow.lastInsertRowid),
+          branch: branchName,
+          repo: targetRepo,
+          buildLog: build.log.slice(-4000),
+          diff,
+          filesTouched: fileCount,
         });
         res.end();
         return;
       }
 
-      writeLine({ type: "text", text: "Build passed. Committing…" });
+      // ================================================================
+      // AGENT 3 — VERIFIER (read-only, cwd=targetDir)
+      // Build is already green. Verifier checks semantic correctness only.
+      // ================================================================
+      writeLine({ type: "phase_marker", phase: "verifying" });
 
+      const verifierPrompt = buildVerifierPrompt({ spec, gap, targetDir, repoLabel });
+
+      let verifyText = "";
+      await askStream(
+        verifierPrompt,
+        {
+          model: "opus",
+          cwd: targetDir,
+          allowedTools: ["Read", "Grep", "Glob"],
+          timeoutMs: 300_000,
+        },
+        (chunk) => {
+          writeLine(chunk);
+          if (chunk.type === "text" && chunk.text) verifyText += chunk.text;
+        },
+      );
+
+      // Parse verifier result — default to pass if unparseable (build already confirmed)
+      let verifyPassed = true;
+      let verifyIssues: string[] = [];
+      try {
+        const m = verifyText.match(/\{[\s\S]*\}/);
+        if (m) {
+          const parsed = JSON.parse(m[0]) as { pass?: boolean; issues?: string[] };
+          if (parsed.pass === false) {
+            verifyPassed = false;
+            verifyIssues = Array.isArray(parsed.issues) ? parsed.issues : ["unspecified issues"];
+          }
+        }
+      } catch { /* default to pass — build gate is the hard gate */ }
+
+      if (!verifyPassed) {
+        await forceCheckoutBranch(targetDir, targetRepo, "main");
+        try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
+        writeLine({
+          type: "error",
+          error: `Verifier rejected the implementation:\n${verifyIssues.map((i) => `• ${i}`).join("\n")}\n\nThe build was green but the implementation doesn't match the spec. Regenerate with more context.`,
+        });
+        res.end();
+        return;
+      }
+
+      writeLine({ type: "text", text: "\nBuild passed ✓  Verification passed ✓  Committing…" });
+
+      // ================================================================
+      // COMMIT + PUSH + PR
+      // ================================================================
       const commitMsg = `feat: add ${gap.canonical_name}\n\nGenerated by feature-gap-dashboard for gap #${gapId}`;
       const commitResult = await commitWithSubmodules(targetDir, targetRepo, commitMsg);
 
@@ -629,9 +502,7 @@ Output ONLY this JSON — no code fences, no extra text:
           if (rewritten.length > 0) {
             const parentGit = simpleGit(targetDir);
             await parentGit.add([".gitmodules"]);
-            await parentGit.commit(
-              `chore: point submodules at bot forks for build\n\nAutomated by feature-gap-dashboard.\nRewritten: ${rewritten.join(", ")}`,
-            );
+            await parentGit.commit(`chore: point submodules at bot forks for build\n\nAutomated by feature-gap-dashboard.\nRewritten: ${rewritten.join(", ")}`);
           }
         }
         await pushBranchToFork(targetDir, targetRepo, branchName);
@@ -660,7 +531,6 @@ Output ONLY this JSON — no code fences, no extra text:
 
       await forceCheckoutBranch(targetDir, targetRepo, "main");
 
-      // ---- Save to DB ----
       const patchRow = db
         .prepare(
           `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
@@ -681,7 +551,6 @@ Output ONLY this JSON — no code fences, no extra text:
           prWarning,
         );
 
-      // ---- Emit final success chunk ----
       writeLine({
         type: "patch_done",
         patchId: Number(patchRow.lastInsertRowid),
@@ -698,20 +567,16 @@ Output ONLY this JSON — no code fences, no extra text:
       });
 
       res.end();
-    }); // close withRepoLock
+    });
   } catch (err) {
     console.error(`[patches/stream] failed for gap ${gapId}:`, err);
-    try {
-      await withRepoLock(targetRepo, () =>
-        forceCheckoutBranch(targetDir, targetRepo, "main"),
-      );
-    } catch { /* best effort */ }
+    try { await withRepoLock(targetRepo, () => forceCheckoutBranch(targetDir, targetRepo, "main")); } catch { /* best effort */ }
     writeLine({ type: "error", error: (err as Error).message });
     if (!res.writableEnded) res.end();
   }
 });
 
-/** GET /patches/:id — return patch metadata + diff content */
+/** GET /patches/:id */
 patchesRouter.get("/patches/:id", async (req, res) => {
   const patchId = Number(req.params.id);
   const row = db.prepare("SELECT * FROM patches WHERE id = ?").get(patchId) as
@@ -730,7 +595,7 @@ patchesRouter.get("/patches/:id", async (req, res) => {
   res.json({ ...row, diff });
 });
 
-/** GET /patches — list all patches, enriched with gap identity for cross-report matching */
+/** GET /patches */
 patchesRouter.get("/patches", (_req, res) => {
   const rows = db
     .prepare(
@@ -742,6 +607,220 @@ patchesRouter.get("/patches", (_req, res) => {
     .all();
   res.json(rows);
 });
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+interface SourceSpec {
+  featureName?: string;
+  typeDefinition?: string;
+  configKey?: string;
+  defaultValue?: string;
+  behavior?: string;
+  allRelatedFiles?: Array<{ path: string; role: string }>;
+  reScriptGotchas?: string[];
+  implementationSteps?: string[];
+}
+
+function buildSpecBasedImplementerPrompt(opts: {
+  spec: SourceSpec;
+  gap: GapRow;
+  repoLabel: string;
+  sourceLabel: string;
+  sourceDir: string;
+  targetDir: string;
+  sourceEntryPath: string;
+}): string {
+  const { spec, gap, repoLabel, targetDir } = opts;
+  return `You are implementing a feature in the ${repoLabel} repository.
+
+Your cwd is the TARGET repo: ${targetDir}
+You have Edit, Write, Read, Glob, Grep, and Bash tools.
+
+## Feature to implement: ${gap.canonical_name}
+
+A source-code analyst has already fully studied how this feature works in the reference implementation.
+Here is their structured spec — follow it exactly:
+
+<spec>
+${JSON.stringify(spec, null, 2)}
+</spec>
+
+## What to do
+
+1. Use Glob and Grep to understand the TARGET repo's structure. Find the equivalent of each source file listed in spec.allRelatedFiles.
+2. Apply spec.implementationSteps in order, adapted to the target repo's idioms and naming conventions.
+3. Do NOT copy source code verbatim — the two repos have different architectures.
+4. Only touch files that need to change. No unrelated refactors.
+
+## ⛔ HARD REQUIREMENT — build must be green before you finish
+
+After every meaningful batch of edits, run:
+  npm run --silent re:build 2>&1
+Pass Bash timeout: 240000 (cold builds take up to 120 seconds).
+
+Iterate until exit code 0. There is NO attempt limit — use the full time budget.
+
+When a build fails:
+  a. List ALL errors: file path, line number, error message.
+  b. Find the root cause — one missing record-field update often produces 3+ error lines.
+  c. Fix the root cause first, re-run, then handle remaining secondary errors.
+
+ReScript-specific pitfalls (also see spec.reScriptGotchas):
+- Adding a field to a record → EVERY constructor of that record must include it.
+  Grep for the record type name BEFORE editing to find all construction sites.
+- Optional fields: option<T> with Some(x) / None. Never undefined or null.
+- New variants → every switch on that type must be exhaustive.
+- Use Belt.Option.getWithDefault, not Option.getOrElse.
+- open ModuleName can shadow built-ins — prefer Belt.* qualified names.
+
+## Output (only after build exits 0)
+
+Output ONLY this JSON — no code fences, no extra text:
+{"what":"<one-line description>","files":[{"path":"<path relative to target repo>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<optional caveats>"}`;
+}
+
+function buildFallbackImplementerPrompt(opts: {
+  gap: GapRow;
+  repoLabel: string;
+  sourceLabel: string;
+  sourceDir: string;
+  targetDir: string;
+  sourceEntryPath: string;
+}): string {
+  const { gap, repoLabel, sourceLabel, sourceDir, targetDir, sourceEntryPath } = opts;
+  return `You are implementing a missing feature in the ${repoLabel} repository.
+
+SOURCE repo (${sourceLabel}): ${sourceDir}
+TARGET repo: ${targetDir}   ← your cwd
+
+## Feature to implement
+
+Name: ${gap.canonical_name}
+Category: ${gap.category}
+Rationale: ${gap.rationale}
+Starting point in source: ${sourceEntryPath}
+
+## Phase 1 — Understand the feature in the SOURCE repo
+
+Use Read, Grep, and Glob with ABSOLUTE PATHS to explore ${sourceDir}.
+
+1. Start at ${sourceEntryPath}.
+2. Follow imports to find EVERY file involved:
+   - Type declaration, config parser, state flow, component render
+3. Grep ${sourceDir} for "${gap.canonical_name}" variants.
+4. State clearly: the TYPE, the config KEY, ALL involved files, BEHAVIOUR.
+
+Do NOT edit the target until Phase 2.
+
+## Phase 2 — Implement in TARGET
+
+Find the target equivalent of each source file and apply the same logical change.
+Adapt to target idioms — do NOT copy source code verbatim.
+
+## ⛔ Build must be green — no attempt limit
+
+npm run --silent re:build 2>&1  (Bash timeout: 240000)
+Iterate until exit 0.
+
+ReScript: record constructors, option<T>/Some/None, exhaustive switches, Belt.* stdlib.
+
+## Output (after green build)
+
+{"what":"<one-line>","files":[{"path":"<relative>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<caveats>"}`;
+}
+
+function buildVerifierPrompt(opts: {
+  spec: SourceSpec | null;
+  gap: GapRow;
+  targetDir: string;
+  repoLabel: string;
+}): string {
+  const { spec, gap, targetDir, repoLabel } = opts;
+  const specSection = spec
+    ? `The source analyst produced this spec:\n\n<spec>\n${JSON.stringify(spec, null, 2)}\n</spec>`
+    : `No structured spec is available. Verify by searching for "${gap.canonical_name}" and checking it was added correctly.`;
+
+  return `You are a code reviewer verifying that a feature was implemented correctly.
+
+The server has already confirmed the ReScript build is GREEN — do NOT re-run the build.
+Your job is to verify SEMANTIC CORRECTNESS only using Read and Grep.
+
+Feature: ${gap.canonical_name}
+Target repo: ${targetDir} (${repoLabel})
+
+${specSection}
+
+## What to verify
+
+${spec ? `
+1. TYPE: Find the field in the target repo. Confirm its type matches spec.typeDefinition ("${spec.typeDefinition ?? "?"}").
+2. CONFIG KEY: Search for the config key "${spec.configKey ?? gap.canonical_name}" in the parser code. Confirm it's read from the correct config object.
+3. DEFAULT: Confirm the default value matches spec.defaultValue ("${spec.defaultValue ?? "?"}").
+4. COVERAGE: Check that spec.allRelatedFiles layers are covered — type, parser, at minimum.
+` : `
+1. Search for "${gap.canonical_name}" in the target repo and confirm it appears in at least 2-3 files (not just one).
+2. Confirm there is a config parser that reads the feature from the integrator options.
+3. Confirm there is a type declaration for the feature.
+`}
+
+## Output
+
+Output ONLY this JSON:
+{"pass": true, "issues": []}
+— or —
+{"pass": false, "issues": ["<specific issue 1>", "<specific issue 2>"]}
+
+Do not output anything else. No prose, no fences.`;
+}
+
+function buildSingleAgentPrompt(opts: {
+  gap: GapRow;
+  targetRepo: RepoKey;
+  sourceRepo: RepoKey;
+  repoLabel: string;
+  sourceLabel: string;
+  sourceDir: string;
+  targetDir: string;
+  sourceFile: string | null;
+  sourceContext: string;
+}): string {
+  const { gap, repoLabel, sourceLabel, sourceDir, targetDir, sourceFile, sourceContext } = opts;
+  return `You are implementing a missing feature in the ${repoLabel} repository.
+
+SOURCE repo (${sourceLabel}): ${sourceDir}
+TARGET repo: ${targetDir}   ← your cwd
+
+## Feature to implement
+
+Feature name: ${gap.canonical_name}
+Category: ${gap.category}
+Rationale: ${gap.rationale}
+
+## Reference implementation (from source repo)
+
+File: ${sourceFile ?? "unknown"}
+
+\`\`\`
+${sourceContext || "(no source context available)"}
+\`\`\`
+
+## Instructions
+
+1. Use Glob and Grep to understand the existing code structure and conventions.
+2. Find the right location to add the feature — follow the repo's existing patterns.
+3. Implement the feature idiomatically for this repo's architecture.
+4. Only touch files that are necessary.
+
+## ⛔ Build must be green
+
+npm run --silent re:build 2>&1  (Bash timeout: 240000)
+No attempt limit. Iterate until exit 0.
+ReScript: record constructors, option<T>/Some/None, exhaustive switches, Belt.* stdlib.
+
+## Output (after green build)
+
+{"what":"<one-line>","files":[{"path":"<relative>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<caveats>"}`;
+}
 
 function safeParseEvidence(s: string): Array<{ name?: string; file?: string; snippet?: string }> | null {
   try {

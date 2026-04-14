@@ -8,9 +8,7 @@ interface Props {
   patching: Set<number>;
   patchedGaps: Set<number>;
   patchBuildStatus: Map<number, "pass" | "fail" | "skipped">;
-  /** Map from gap.id → branch name of the generated patch (if any) */
   patchBranches: Map<number, string>;
-  /** Map from "canonical_name:category:missing_in" → linked PR rows */
   gapPrs: Map<string, GapPrRow[]>;
   onVerify: (id: number) => void;
   onPatch: (id: number) => void;
@@ -20,15 +18,47 @@ interface Props {
   onOpenPreview: (repoKey: "web" | "mobile", branch: string, gapId: number) => void;
 }
 
-const CATEGORY_LABEL: Record<Gap["category"], string> = {
-  payment_method: "Payment method",
-  config: "Config",
-  component: "Component",
-  backend_api: "Backend API",
-};
-
 function gapPrKey(g: Gap): string {
   return `${g.canonical_name}:${g.category}:${g.missing_in}`;
+}
+
+function categoryBadgeClass(cat: Gap["category"]): string {
+  switch (cat) {
+    case "payment_method": return "badge badge-payment";
+    case "config": return "badge badge-config";
+    case "component": return "badge badge-component";
+    case "backend_api": return "badge badge-backend";
+  }
+}
+
+function categoryLabel(cat: Gap["category"]): string {
+  switch (cat) {
+    case "payment_method": return "payment";
+    case "config": return "config";
+    case "component": return "component";
+    case "backend_api": return "backend api";
+  }
+}
+
+function evidenceFile(g: Gap): string {
+  const f = g.evidence[0]?.file;
+  if (!f) return "—";
+  return f.split("/").pop() ?? f;
+}
+
+function prShortLabel(url: string): string {
+  try {
+    const u = new URL(url);
+    const prMatch = u.pathname.match(/\/pull\/(\d+)/);
+    if (prMatch) {
+      const parts = u.pathname.split("/").filter(Boolean);
+      const repo = parts[1] ?? parts[0] ?? "";
+      return `${repo} #${prMatch[1]}`;
+    }
+    return u.pathname.split("/").slice(-2).join("/");
+  } catch {
+    return url.slice(0, 30);
+  }
 }
 
 export function GapTable({
@@ -48,58 +78,50 @@ export function GapTable({
 }: Props) {
   if (gaps.length === 0) {
     return (
-      <div className="rounded-xl border border-slate-800 bg-slate-900/30 p-8 text-center text-slate-500">
-        No gaps to show.
+      <div className="gap-table-wrap">
+        <div className="gap-table-empty">No gaps to show.</div>
       </div>
     );
   }
 
   return (
-    <div className="rounded-xl border border-slate-800 bg-slate-900/30 overflow-x-auto">
-      <table className="w-full text-sm min-w-[960px]">
-        <thead className="bg-slate-900/80 text-slate-400 uppercase text-xs tracking-wider">
+    <div className="gap-table-wrap">
+      <table className="gap-table">
+        <thead>
           <tr>
-            <th className="text-left px-4 py-3">Category</th>
-            <th className="text-left px-4 py-3">Feature</th>
-            <th className="text-left px-4 py-3">Missing in</th>
-            <th className="text-left px-4 py-3">Evidence</th>
-            <th className="text-left px-4 py-3">Status</th>
-            <th className="text-left px-4 py-3">Linked PRs</th>
-            <th className="text-right px-4 py-3 min-w-[280px]">Actions</th>
+            <th>Category</th>
+            <th>Feature</th>
+            <th>Missing in</th>
+            <th>Evidence</th>
+            <th>Status</th>
+            <th>Linked PRs</th>
+            <th style={{ textAlign: "right", minWidth: 280 }}>Actions</th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-slate-800">
-          {gaps.map((g) => {
-            const isVerifying = verifying.has(g.id);
-            const isPatching = patching.has(g.id);
-            const hasPatched = patchedGaps.has(g.id);
-            const prs = gapPrs.get(gapPrKey(g)) ?? [];
-            return (
-              <GapRow
-                key={g.id}
-                gap={g}
-                isVerifying={isVerifying}
-                isPatching={isPatching}
-                hasPatched={hasPatched}
-                buildStatus={patchBuildStatus.get(g.id)}
-                patchBranch={patchBranches.get(g.id)}
-                prs={prs}
-                onVerify={onVerify}
-                onPatch={onPatch}
-                onViewSource={onViewSource}
-                onAddPr={onAddPr}
-                onRemovePr={onRemovePr}
-                onOpenPreview={onOpenPreview}
-              />
-            );
-          })}
+        <tbody>
+          {gaps.map((g) => (
+            <GapRow
+              key={g.id}
+              gap={g}
+              isVerifying={verifying.has(g.id)}
+              isPatching={patching.has(g.id)}
+              hasPatched={patchedGaps.has(g.id)}
+              buildStatus={patchBuildStatus.get(g.id)}
+              patchBranch={patchBranches.get(g.id)}
+              prs={gapPrs.get(gapPrKey(g)) ?? []}
+              onVerify={onVerify}
+              onPatch={onPatch}
+              onViewSource={onViewSource}
+              onAddPr={onAddPr}
+              onRemovePr={onRemovePr}
+              onOpenPreview={onOpenPreview}
+            />
+          ))}
         </tbody>
       </table>
     </div>
   );
 }
-
-// ─── Individual row ───────────────────────────────────────────────────────────
 
 function GapRow({
   gap: g,
@@ -138,11 +160,7 @@ function GapRow({
 
   const submitPr = async () => {
     const url = prInput.trim();
-    if (!url) return;
-    if (!url.startsWith("http")) {
-      setPrError("Must be a valid URL");
-      return;
-    }
+    if (!url || !url.startsWith("http")) { setPrError("Must be a valid URL"); return; }
     setAddingPr(true);
     setPrError(null);
     try {
@@ -158,72 +176,90 @@ function GapRow({
 
   const removePr = async (prId: number) => {
     setRemovingPrId(prId);
-    try {
-      await onRemovePr(prId, g.id);
-    } finally {
-      setRemovingPrId(null);
-    }
+    try { await onRemovePr(prId, g.id); }
+    finally { setRemovingPrId(null); }
   };
 
+  // Status badge
+  let statusBadge: React.ReactNode;
+  if (g.platform_specific === 1) {
+    statusBadge = <span className="badge badge-platform">platform</span>;
+  } else if (hasPatched) {
+    statusBadge = (
+      <span className="badge badge-patched">
+        patched
+        {buildStatus === "pass" && <span style={{ marginLeft: 4, color: "var(--green)" }}>✓</span>}
+        {buildStatus === "fail" && <span style={{ marginLeft: 4, color: "var(--red)" }}>✗</span>}
+      </span>
+    );
+  } else if (g.verified === 1) {
+    statusBadge = <span className="badge badge-verified">verified</span>;
+  } else {
+    statusBadge = <span className="badge badge-unverified">unverified</span>;
+  }
+
   return (
-    <tr
-      className={
-        "hover:bg-slate-900/60 align-top " +
-        (g.platform_specific ? "opacity-50" : "")
-      }
-    >
-      <td className="px-4 py-3 text-slate-400">
-        {CATEGORY_LABEL[g.category]}
-      </td>
-      <td className="px-4 py-3 font-mono text-slate-100">
-        {g.canonical_name}
-      </td>
-      <td className="px-4 py-3">
-        <MissingBadge side={g.missing_in} />
-      </td>
-      <td className="px-4 py-3 text-slate-400 font-mono text-xs">
-        {g.evidence[0]?.file ?? "\u2014"}
-      </td>
-      <td className="px-4 py-3">
-        <VerifiedBadge
-          verified={g.verified === 1}
-          platformSpecific={g.platform_specific === 1}
-        />
+    <tr className={g.platform_specific === 1 ? "dimmed" : ""}>
+      {/* Category */}
+      <td>
+        <span className={categoryBadgeClass(g.category)}>{categoryLabel(g.category)}</span>
       </td>
 
-      {/* ── Linked PRs cell ── */}
-      <td className="px-4 py-3">
-        <div className="space-y-1">
-          {prs.length > 0 && (
-            <div className="space-y-1">
-              {prs.map((pr) => (
-                <div key={pr.id} className="flex items-center gap-1.5 group">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-violet-400 shrink-0" />
-                  <a
-                    href={pr.pr_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-violet-300 hover:text-violet-100 hover:underline font-mono truncate max-w-[180px]"
-                    title={pr.pr_url}
-                  >
-                    {prShortLabel(pr.pr_url)}
-                  </a>
-                  <button
-                    onClick={() => removePr(pr.id)}
-                    disabled={removingPrId === pr.id}
-                    className="opacity-0 group-hover:opacity-100 text-slate-600 hover:text-red-400 text-xs transition"
-                    title="Remove link"
-                  >
-                    {removingPrId === pr.id ? "…" : "×"}
-                  </button>
-                </div>
-              ))}
+      {/* Feature name */}
+      <td>
+        <span className="mono" style={{ fontSize: 12, color: "var(--text)" }}>{g.canonical_name}</span>
+      </td>
+
+      {/* Missing in */}
+      <td>
+        <span className={`badge ${g.missing_in === "mobile" ? "badge-mobile" : "badge-web"}`}>
+          {g.missing_in}
+        </span>
+      </td>
+
+      {/* Evidence */}
+      <td>
+        <span className="mono" style={{ fontSize: 10, color: "var(--text3)" }} title={g.evidence[0]?.file}>
+          {evidenceFile(g)}
+        </span>
+      </td>
+
+      {/* Status */}
+      <td>{statusBadge}</td>
+
+      {/* Linked PRs */}
+      <td>
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          {prs.map((pr) => (
+            <div key={pr.id} style={{ display: "flex", alignItems: "center", gap: 5 }} className="group">
+              <span style={{ width: 5, height: 5, borderRadius: "50%", background: "var(--accent)", flexShrink: 0, display: "inline-block" }} />
+              <a
+                href={pr.pr_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mono"
+                style={{ fontSize: 10, color: "var(--accent)", textDecoration: "none", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                title={pr.pr_url}
+                onMouseOver={(e) => (e.currentTarget.style.textDecoration = "underline")}
+                onMouseOut={(e) => (e.currentTarget.style.textDecoration = "none")}
+              >
+                {prShortLabel(pr.pr_url)}
+              </a>
+              <button
+                onClick={() => removePr(pr.id)}
+                disabled={removingPrId === pr.id}
+                style={{ marginLeft: 2, fontSize: 11, color: "var(--text3)", cursor: "pointer", background: "none", border: "none", padding: 0, opacity: 0.5, transition: "opacity .15s" }}
+                title="Remove link"
+                onMouseOver={(e) => (e.currentTarget.style.opacity = "1")}
+                onMouseOut={(e) => (e.currentTarget.style.opacity = "0.5")}
+              >
+                {removingPrId === pr.id ? "…" : "×"}
+              </button>
             </div>
-          )}
+          ))}
 
-          {/* Link PR inline form */}
           {linkingPr ? (
-            <div className="flex items-center gap-1 mt-1">
+            <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
               <input
                 autoFocus
                 value={prInput}
@@ -233,18 +269,25 @@ function GapRow({
                   if (e.key === "Escape") { setLinkingPr(false); setPrInput(""); setPrError(null); }
                 }}
                 placeholder="https://github.com/…/pull/…"
-                className="rounded border border-slate-600 bg-slate-900 px-2 py-0.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-violet-500 w-44"
+                style={{
+                  borderRadius: 4, border: "1px solid var(--border2)", background: "var(--bg3)",
+                  padding: "2px 6px", fontSize: 10, color: "var(--text)", width: 140,
+                  outline: "none", fontFamily: "var(--mono)",
+                }}
+                onFocus={(e) => (e.target.style.borderColor = "var(--accent)")}
+                onBlur={(e) => (e.target.style.borderColor = "var(--border2)")}
               />
               <button
+                className="btn btn-sm"
+                style={{ borderColor: "var(--accent)", color: "var(--accent)", fontSize: 10 }}
                 onClick={submitPr}
                 disabled={addingPr || !prInput.trim()}
-                className="rounded border border-violet-600 bg-violet-600/20 px-2 py-0.5 text-xs text-violet-300 hover:bg-violet-600/30 disabled:opacity-40 transition"
               >
                 {addingPr ? "…" : "Add"}
               </button>
               <button
                 onClick={() => { setLinkingPr(false); setPrInput(""); setPrError(null); }}
-                className="text-xs text-slate-500 hover:text-slate-300 px-1"
+                style={{ fontSize: 11, color: "var(--text3)", cursor: "pointer", background: "none", border: "none" }}
               >
                 ✕
               </button>
@@ -252,55 +295,51 @@ function GapRow({
           ) : (
             <button
               onClick={() => setLinkingPr(true)}
-              className="text-xs text-slate-500 hover:text-violet-400 transition mt-0.5"
-              title="Link an open PR to this gap"
+              style={{ fontSize: 10, color: "var(--text3)", cursor: "pointer", background: "none", border: "none", textAlign: "left", padding: 0, marginTop: prs.length > 0 ? 2 : 0 }}
+              onMouseOver={(e) => (e.currentTarget.style.color = "var(--accent)")}
+              onMouseOut={(e) => (e.currentTarget.style.color = "var(--text3)")}
             >
               + Link PR
             </button>
           )}
-          {prError && (
-            <p className="text-xs text-red-400 mt-0.5">{prError}</p>
-          )}
+          {prError && <p style={{ fontSize: 10, color: "var(--red)", margin: "2px 0 0" }}>{prError}</p>}
         </div>
       </td>
 
-      {/* ── Actions cell ── */}
-      <td className="px-4 py-3 text-right whitespace-nowrap">
-        <div className="flex items-center justify-end gap-2">
+      {/* Actions */}
+      <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
           <button
+            className="btn btn-sm"
             onClick={() => onViewSource(g)}
-            className="rounded border border-slate-700 px-3 py-1 text-xs font-medium text-slate-300 hover:border-sky-500 hover:text-sky-300 transition"
           >
             View
           </button>
 
           <button
+            className="btn btn-sm"
             disabled={isVerifying || g.verified === 1}
             onClick={() => onVerify(g.id)}
-            className={
-              "rounded border px-3 py-1 text-xs font-medium transition " +
-              (g.verified === 1
-                ? "border-slate-800 text-slate-600 cursor-not-allowed"
+            style={
+              g.verified === 1
+                ? { borderColor: "var(--border)", color: "var(--text3)", cursor: "default" }
                 : isVerifying
-                  ? "border-indigo-500/50 bg-indigo-500/10 text-indigo-300 cursor-wait"
-                  : "border-slate-700 text-slate-300 hover:border-indigo-500 hover:text-indigo-300")
+                  ? { borderColor: "rgba(124,106,247,.4)", color: "var(--accent)", cursor: "wait" }
+                  : {}
             }
           >
-            {isVerifying ? "Checking\u2026" : g.verified === 1 ? "Verified" : "Verify"}
+            {isVerifying ? "Checking…" : g.verified === 1 ? "Verified" : "Verify"}
           </button>
 
           {hasPatched ? (
             <>
               <button
+                className="btn btn-sm btn-green"
                 onClick={() => onPatch(g.id)}
-                className="rounded border border-emerald-700 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition"
               >
-                Review{" "}
-                {buildStatus === "pass" ? (
-                  <span className="text-emerald-400 ml-1" title="Build passed">&#10003;</span>
-                ) : buildStatus === "fail" ? (
-                  <span className="text-red-400 ml-1" title="Build failed">&#10007;</span>
-                ) : null}
+                Chat
+                {buildStatus === "pass" && <span style={{ color: "var(--green)" }}>✓</span>}
+                {buildStatus === "fail" && <span style={{ color: "var(--red)" }}>✗</span>}
               </button>
               {patchBranch && (
                 <PreviewButton
@@ -312,86 +351,22 @@ function GapRow({
             </>
           ) : (
             <button
+              className={`btn btn-sm ${!g.platform_specific && !isPatching ? "btn-amber" : ""}`}
               disabled={isPatching || g.platform_specific === 1}
               onClick={() => onPatch(g.id)}
-              className={
-                "rounded border px-3 py-1 text-xs font-medium transition " +
-                (g.platform_specific === 1
-                  ? "border-slate-800 text-slate-600 cursor-not-allowed"
+              style={
+                g.platform_specific === 1
+                  ? { borderColor: "var(--border)", color: "var(--text3)", cursor: "default" }
                   : isPatching
-                    ? "border-amber-500/50 bg-amber-500/10 text-amber-300 cursor-wait"
-                    : "border-slate-700 text-slate-300 hover:border-amber-500 hover:text-amber-300")
+                    ? { borderColor: "rgba(245,158,11,.3)", color: "var(--amber)", cursor: "wait" }
+                    : {}
               }
             >
-              {isPatching ? "Generating\u2026" : "Generate Patch"}
+              {isPatching ? "Generating…" : "Generate Patch"}
             </button>
           )}
         </div>
       </td>
     </tr>
-  );
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Convert a full GitHub PR URL into a compact label:
- *   https://github.com/juspay/hyperswitch-web/pull/423 → #423
- *   https://github.com/org/repo/pull/12                → #12
- *   anything else                                       → hostname/path tail
- */
-function prShortLabel(url: string): string {
-  try {
-    const u = new URL(url);
-    const prMatch = u.pathname.match(/\/pull\/(\d+)/);
-    if (prMatch) {
-      // "org/repo #123"
-      const parts = u.pathname.split("/").filter(Boolean);
-      const repo = parts[1] ?? parts[0] ?? "";
-      return `${repo} #${prMatch[1]}`;
-    }
-    return u.pathname.split("/").slice(-2).join("/");
-  } catch {
-    return url.slice(0, 30);
-  }
-}
-
-function MissingBadge({ side }: { side: "web" | "mobile" }) {
-  const tone =
-    side === "mobile"
-      ? "bg-amber-500/10 text-amber-300 border-amber-500/30"
-      : "bg-sky-500/10 text-sky-300 border-sky-500/30";
-  return (
-    <span className={"inline-block rounded border px-2 py-0.5 text-xs font-medium " + tone}>
-      {side}
-    </span>
-  );
-}
-
-function VerifiedBadge({
-  verified,
-  platformSpecific,
-}: {
-  verified: boolean;
-  platformSpecific: boolean;
-}) {
-  if (platformSpecific) {
-    return (
-      <span className="inline-block rounded border px-2 py-0.5 text-xs font-medium bg-slate-500/10 text-slate-400 border-slate-500/30">
-        platform-specific
-      </span>
-    );
-  }
-  if (verified) {
-    return (
-      <span className="inline-block rounded border px-2 py-0.5 text-xs font-medium bg-emerald-500/10 text-emerald-300 border-emerald-500/30">
-        verified
-      </span>
-    );
-  }
-  return (
-    <span className="inline-block rounded border px-2 py-0.5 text-xs font-medium bg-slate-700/20 text-slate-500 border-slate-700">
-      unverified
-    </span>
   );
 }

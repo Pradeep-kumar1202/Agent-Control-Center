@@ -85,7 +85,27 @@ export interface PatchDoneChunk {
   prWarning: string | null;
 }
 
-export type PatchStreamChunk = ChatStreamChunk | PatchDoneChunk;
+/** Emitted at the start of each agent phase in the multi-Opus pipeline. */
+export interface PhaseMarkerChunk {
+  type: "phase_marker";
+  phase: "analysing" | "implementing" | "verifying";
+}
+
+/**
+ * Emitted when the server-side build check fails after the implementer.
+ * The branch is kept alive — the chat agent can checkout and fix it.
+ */
+export interface PatchBuildFailedChunk {
+  type: "build_failed";
+  patchId: number;
+  branch: string;
+  repo: string;
+  buildLog: string;
+  diff: string;
+  filesTouched: number;
+}
+
+export type PatchStreamChunk = ChatStreamChunk | PatchDoneChunk | PatchBuildFailedChunk | PhaseMarkerChunk;
 
 export interface SkillRunSummary {
   id: number;
@@ -245,6 +265,11 @@ export const api = {
     jsonFetch<{ deleted: boolean }>(`${BASE}/gap-prs/${prId}`, {
       method: "DELETE",
     }),
+  seedReset: () =>
+    jsonFetch<{ message: string; gapsInserted: number; patchesRelinked: number; patchesOrphaned: number }>(
+      `${BASE}/analysis/seed-reset`,
+      { method: "POST" },
+    ),
   listReviews: () => jsonFetch<ReviewHistoryRow[]>(`${BASE}/reviews`),
   getReview: (id: number) => jsonFetch<ReviewHistoryRow>(`${BASE}/reviews/${id}`),
   deleteReview: (id: number) =>
