@@ -13,6 +13,8 @@ import { TranslationsForm } from "./translations/Form";
 import { TranslationsResults } from "./translations/Results";
 import { ReviewForm } from "./review/Form";
 import { ReviewResults } from "./review/Results";
+import { IntegrationForm } from "./integration/Form";
+import { IntegrationResults } from "./integration/Results";
 
 // ─── Shared types ────────────────────────────────────────────────────────────
 
@@ -89,5 +91,13 @@ export const SKILLS_REGISTRY: SkillConfig[] = [
     activeTabClass: "border-violet-500 text-violet-300",
     FormComponent: ReviewForm,
     ResultsComponent: ReviewResults,
+  },
+  {
+    id: "integration",
+    name: "Integration Agent",
+    description: "Implement a payment method from external docs",
+    activeTabClass: "border-rose-500 text-rose-300",
+    FormComponent: IntegrationForm,
+    ResultsComponent: IntegrationResults,
   },
 ];

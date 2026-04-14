@@ -4,6 +4,7 @@ import path from "node:path";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../config.js";
 import { db, nowIso, type GapRow } from "../db.js";
 import { ask, askStream } from "../llm.js";
+import { generateDoc } from "../skills/docs/generator.js";
 import simpleGit from "simple-git";
 import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../skills/submoduleGit.js";
 import { runRescriptBuild } from "../skills/buildCheck.js";
@@ -551,9 +552,11 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
           prWarning,
         );
 
+      const patchId = Number(patchRow.lastInsertRowid);
+
       writeLine({
         type: "patch_done",
-        patchId: Number(patchRow.lastInsertRowid),
+        patchId,
         branch: branchName,
         repo: targetRepo,
         filesTouched: fileCount,
@@ -565,6 +568,17 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
         prNumber,
         prWarning,
       });
+
+      // Fire-and-forget documentation generation
+      generateDoc({
+        sourceType: "patch",
+        sourceId: patchId,
+        diff,
+        summary: agentText.slice(0, 2000),
+        featureName: gap.canonical_name,
+        filesChanged: diff.split("\n").filter((l: string) => l.startsWith("diff --git")).map((l: string) => l.replace(/^diff --git a\//, "").replace(/ b\/.*/, "")),
+        repoKey: targetRepo,
+      }).catch(() => { /* fire-and-forget */ });
 
       res.end();
     });

@@ -8,6 +8,9 @@ import { SourceViewer } from "./components/SourceViewer";
 import { SKILLS_REGISTRY, type SkillEnvelopeClient } from "./skills/registry";
 import { ReviewHistory } from "./skills/review/History";
 import { SkillHistory } from "./skills/shared/SkillHistory";
+import { AchievementsPage } from "./skills/achievements/AchievementsPage";
+import { DocsPage } from "./skills/docs/DocsPage";
+import { FeatureAgent } from "./skills/feature/FeatureAgent";
 import { PropsResults } from "./skills/props/Results";
 import { TestsResults } from "./skills/tests/Results";
 
@@ -145,11 +148,33 @@ function IconGrid4() {
   );
 }
 
+function IconDoc() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 1.5h6l3 3v8a1 1 0 01-1 1H3a1 1 0 01-1-1v-10a1 1 0 011-1z"/>
+      <path d="M9 1.5v3h3"/>
+      <line x1="4.5" y1="7.5" x2="9.5" y2="7.5"/>
+      <line x1="4.5" y1="10" x2="8" y2="10"/>
+    </svg>
+  );
+}
+
+function IconPlug() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 1v3M9 1v3"/>
+      <path d="M3 4h8v3a4 4 0 01-8 0V4z"/>
+      <line x1="7" y1="10" x2="7" y2="13"/>
+    </svg>
+  );
+}
+
 function skillIcon(id: string) {
   if (id === "props")        return <IconPlus />;
   if (id === "tests")        return <IconCheck />;
   if (id === "translations") return <IconGlobe />;
   if (id === "review")       return <IconPR />;
+  if (id === "integration")  return <IconPlug />;
   return <IconGrid />;
 }
 
@@ -445,6 +470,13 @@ export default function App() {
               <span className="sidebar-item-label">{skill.name}</span>
             </div>
           ))}
+          <div
+            className={`sidebar-item ${activeTab === "feature-agent" ? "active" : ""}`}
+            onClick={() => setActiveTab("feature-agent")}
+          >
+            <IconBolt />
+            <span className="sidebar-item-label">Feature Agent</span>
+          </div>
 
           <div className="sidebar-section-label">History</div>
           <div className={`sidebar-item ${activeTab === "review-history" ? "active" : ""}`} onClick={() => setActiveTab("review-history")}>
@@ -456,6 +488,24 @@ export default function App() {
             <span className="sidebar-item-label">Skill History</span>
           </div>
 
+          <div className="sidebar-section-label">Knowledge</div>
+          <div
+            className={`sidebar-item ${activeTab === "docs" ? "active" : ""}`}
+            onClick={() => setActiveTab("docs")}
+          >
+            <IconDoc />
+            <span className="sidebar-item-label">Documentation</span>
+          </div>
+
+          <div className="sidebar-section-label">Insights</div>
+          <div
+            className={`sidebar-item ${activeTab === "achievements" ? "active" : ""}`}
+            onClick={() => setActiveTab("achievements")}
+          >
+            <IconGrid4 />
+            <span className="sidebar-item-label">Achievements</span>
+          </div>
+
           <div className="sidebar-section-label">Coming soon</div>
           <div className="sidebar-item soon">
             <IconFlow />
@@ -465,11 +515,6 @@ export default function App() {
           <div className="sidebar-item soon">
             <IconBolt />
             <span className="sidebar-item-label">Triggers</span>
-            <span className="sidebar-badge">soon</span>
-          </div>
-          <div className="sidebar-item soon">
-            <IconGrid4 />
-            <span className="sidebar-item-label">Integrations</span>
             <span className="sidebar-badge">soon</span>
           </div>
 
@@ -599,6 +644,42 @@ export default function App() {
             </div>
           )}
 
+          {/* Page header — Feature Agent */}
+          {activeTab === "feature-agent" && (
+            <div className="page-header">
+              <div className="page-header-row" style={{ marginBottom: 16 }}>
+                <div>
+                  <div className="page-title">Feature Agent</div>
+                  <div className="page-subtitle">Build new features interactively across both SDKs.</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Page header — Documentation */}
+          {activeTab === "docs" && (
+            <div className="page-header">
+              <div className="page-header-row" style={{ marginBottom: 16 }}>
+                <div>
+                  <div className="page-title">Documentation</div>
+                  <div className="page-subtitle">Auto-generated docs for all agent actions.</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Page header — Achievements */}
+          {activeTab === "achievements" && (
+            <div className="page-header">
+              <div className="page-header-row" style={{ marginBottom: 16 }}>
+                <div>
+                  <div className="page-title">Achievements</div>
+                  <div className="page-subtitle">Everything accomplished via the dashboard.</div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* ── Page body ─────────────────────────────────────────────── */}
           <div className="page-body">
 
@@ -644,6 +725,15 @@ export default function App() {
                 ))}
               </div>
             )}
+
+            {/* Feature Agent */}
+            {activeTab === "feature-agent" && <FeatureAgent />}
+
+            {/* Documentation */}
+            {activeTab === "docs" && <DocsPage />}
+
+            {/* Achievements */}
+            {activeTab === "achievements" && <AchievementsPage />}
 
             {/* ── Gaps view ─────────────────────────────────────────── */}
             {activeTab === "gaps" && (

@@ -19,6 +19,7 @@ import path from "node:path";
 import simpleGit from "simple-git";
 import { REPOS } from "../../config.js";
 import { saveSkillRun } from "../../db.js";
+import { generateDoc } from "../docs/generator.js";
 import { askJson } from "../../llm.js";
 import { validateTranslations, type TranslationQualityIssue } from "../../agents/validators.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
@@ -357,6 +358,23 @@ export async function handleTranslationsSkill(req: Request, res: Response): Prom
     };
     const runId = saveSkillRun("translations", envelope.status, JSON.stringify(spec), JSON.stringify(envelope));
     envelope.meta = { ...envelope.meta, runId };
+
+    // Fire-and-forget documentation
+    for (const [repoKey, result] of Object.entries(results)) {
+      if (!result.error && result.diff) {
+        generateDoc({
+          sourceType: "skill",
+          sourceId: runId,
+          skillId: "translations",
+          diff: result.diff,
+          summary: result.summary,
+          featureName: `Translation: ${spec.keyName}`,
+          filesChanged: result.diff.split("\n").filter((l: string) => l.startsWith("diff --git")).map((l: string) => l.replace(/^diff --git a\//, "").replace(/ b\/.*/, "")),
+          repoKey: repoKey as "web" | "mobile",
+        }).catch(() => { /* fire-and-forget */ });
+      }
+    }
+
     res.json(envelope);
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });

@@ -2,8 +2,11 @@ import cors from "cors";
 import express from "express";
 import { PORT } from "./config.js";
 import { db } from "./db.js";
+import { achievementsRouter } from "./routes/achievements.js";
 import { analyzeRouter } from "./routes/analyze.js";
 import { chatRouter } from "./routes/chat.js";
+import { docsRouter } from "./routes/docs.js";
+import { featureRouter } from "./routes/feature.js";
 import { gapsRouter } from "./routes/gaps.js";
 import { patchesRouter } from "./routes/patches.js";
 import { previewRouter } from "./routes/preview.js";
@@ -25,8 +28,11 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, counts });
 });
 
+app.use(achievementsRouter);
 app.use(analyzeRouter);
 app.use(chatRouter);     // /patches/:id/chat (iteration 8 — in-drawer chat)
+app.use(docsRouter);     // /docs/* (auto-generated documentation)
+app.use(featureRouter);  // /feature/* (interactive feature agent)
 app.use(gapsRouter);
 app.use(patchesRouter);
 app.use(previewRouter);  // /preview/* (dev-server lifecycle for demo videos)

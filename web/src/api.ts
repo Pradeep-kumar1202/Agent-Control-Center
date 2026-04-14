@@ -296,6 +296,46 @@ export const api = {
     jsonFetch<{ lines: string[]; total: number }>(
       `${BASE}/preview/${repoKey}/logs?since=${since}`,
     ),
+  // ─── Feature Agent ─────────────────────────────────────────────────────────
+  createFeatureSession: (description: string) =>
+    jsonFetch<FeatureSession>(`${BASE}/feature/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ description }),
+    }),
+  listFeatureSessions: () =>
+    jsonFetch<FeatureSession[]>(`${BASE}/feature/sessions`),
+  getFeatureSession: (id: number) =>
+    jsonFetch<FeatureSessionDetail>(`${BASE}/feature/sessions/${id}`),
+  streamFeatureChat: (sessionId: number, message: string, signal?: AbortSignal): Promise<Response> =>
+    fetch(`${BASE}/feature/sessions/${sessionId}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+      signal,
+    }),
+  triggerImplementation: (sessionId: number): Promise<Response> =>
+    fetch(`${BASE}/feature/sessions/${sessionId}/implement`, { method: "POST" }),
+  deleteFeatureSession: (id: number) =>
+    jsonFetch<{ deleted: boolean }>(`${BASE}/feature/sessions/${id}`, { method: "DELETE" }),
+  // ─── Documentation ─────────────────────────────────────────────────────────
+  listDocs: () =>
+    jsonFetch<DocSummary[]>(`${BASE}/docs`),
+  getDoc: (id: number) =>
+    jsonFetch<DocSummary>(`${BASE}/docs/${id}`),
+  searchDocs: (q: string) =>
+    jsonFetch<DocSummary[]>(`${BASE}/docs/search?q=${encodeURIComponent(q)}`),
+  deleteDoc: (id: number) =>
+    jsonFetch<{ deleted: boolean }>(`${BASE}/docs/${id}`, { method: "DELETE" }),
+  regenerateDoc: (id: number) =>
+    jsonFetch<DocSummary>(`${BASE}/docs/${id}/regenerate`, { method: "POST" }),
+  // ─── Achievements ──────────────────────────────────────────────────────────
+  getAchievementsSummary: () =>
+    jsonFetch<AchievementsSummary>(`${BASE}/achievements/summary`),
+  getAchievementsTimeline: () =>
+    jsonFetch<TimelineEntry[]>(`${BASE}/achievements/timeline`),
+  getRecentActivity: () =>
+    jsonFetch<ActivityItem[]>(`${BASE}/achievements/recent`),
 };
 
 // ─── Preview manager types ───────────────────────────────────────────────────
@@ -393,4 +433,79 @@ export interface ReviewHistoryRow {
   reviewed_at: string;
   /** Only present on GET /reviews/:id */
   result_json?: string;
+}
+
+// ─── Feature Agent types ─────────────────────────────────────────────────────
+
+export interface FeatureSession {
+  id: number;
+  title: string;
+  status: "discovery" | "implementing" | "done" | "failed";
+  repos: string;
+  branch: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FeatureMessage {
+  id: number;
+  session_id: number;
+  turn: number;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  tool_name: string | null;
+  created_at: string;
+}
+
+export interface FeatureSessionDetail extends FeatureSession {
+  messages: FeatureMessage[];
+}
+
+// ─── Documentation types ─────────────────────────────────────────────────────
+
+export interface DocSummary {
+  id: number;
+  source_type: string;
+  source_id: number;
+  skill_id: string | null;
+  title: string;
+  files_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// ─── Achievements types ──────────────────────────────────────────────────────
+
+export interface AchievementsSummary {
+  totalPatches: number;
+  patchesPassed: number;
+  patchesFailed: number;
+  buildSuccessRate: number;
+  totalPRs: number;
+  totalSkillRuns: number;
+  skillBreakdown: Record<string, { total: number; ok: number; partial: number; error: number }>;
+  totalReviews: number;
+  reviewBreakdown: Record<string, number>;
+  totalGapsFound: number;
+  gapsVerified: number;
+  gapsDismissed: number;
+  gapsPatched: number;
+  firstActivityDate: string | null;
+  lastActivityDate: string | null;
+}
+
+export interface TimelineEntry {
+  date: string;
+  patches: number;
+  skills: number;
+  reviews: number;
+}
+
+export interface ActivityItem {
+  type: "patch" | "skill" | "review";
+  title: string;
+  description: string;
+  status: string;
+  timestamp: string;
+  meta: { prUrl?: string | null; branch?: string; repo?: string; skillId?: string };
 }

@@ -130,6 +130,50 @@ db.exec(`
     ON skill_runs(skill_id, created_at DESC);
 `);
 
+// Auto-generated documentation for agent actions (patches, skills, etc.)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS docs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL CHECK (source_type IN ('patch','skill','integration','feature')),
+    source_id   INTEGER NOT NULL,
+    skill_id    TEXT,
+    title       TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    files_json  TEXT NOT NULL DEFAULT '[]',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source_type, source_id);
+`);
+
+// Feature agent sessions — interactive multi-turn feature building
+db.exec(`
+  CREATE TABLE IF NOT EXISTS feature_sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'discovery'
+                CHECK (status IN ('discovery','implementing','done','failed')),
+    repos       TEXT NOT NULL DEFAULT '["web","mobile"]',
+    branch      TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS feature_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES feature_sessions(id) ON DELETE CASCADE,
+    turn        INTEGER NOT NULL,
+    role        TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
+    content     TEXT NOT NULL,
+    tool_name   TEXT,
+    created_at  TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_feature_messages_session
+    ON feature_messages(session_id, turn, id);
+`);
+
 // Migrate existing DBs that predate the verified column.
 try {
   db.exec(`ALTER TABLE gaps ADD COLUMN verified INTEGER NOT NULL DEFAULT 0`);
@@ -322,6 +366,38 @@ export type SkillRunRow = {
   input_json: string;
   result_json: string;
   created_at: string;
+};
+
+export type FeatureSessionRow = {
+  id: number;
+  title: string;
+  status: "discovery" | "implementing" | "done" | "failed";
+  repos: string;
+  branch: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type FeatureMessageRow = {
+  id: number;
+  session_id: number;
+  turn: number;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  tool_name: string | null;
+  created_at: string;
+};
+
+export type DocRow = {
+  id: number;
+  source_type: "patch" | "skill" | "integration" | "feature";
+  source_id: number;
+  skill_id: string | null;
+  title: string;
+  content: string;
+  files_json: string;
+  created_at: string;
+  updated_at: string;
 };
 
 /** Persist any skill's result envelope so it survives modal close + page refresh. */

@@ -67,4 +67,12 @@ export const SKILLS: SkillManifest[] = [
     endpoint: "/skills/review/generate",
     repos: ["web", "mobile"],
   },
+  {
+    id: "integration",
+    name: "Integration Agent",
+    description:
+      "Implement a payment method or flow from external documentation",
+    endpoint: "/skills/integration/generate",
+    repos: ["web", "mobile"],
+  },
 ];
