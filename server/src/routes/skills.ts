@@ -16,6 +16,8 @@ import { handleTestsSkill } from "../skills/tests/index.js";
 import { handleTranslationsSkill } from "../skills/translations/index.js";
 import { handleReviewSkill } from "../skills/review/index.js";
 import { handleIntegrationSkill } from "../skills/integration/index.js";
+import { handleSdkIntegratorSkill, handleClassifySkill } from "../skills/sdk-integrator/index.js";
+import { handleCoderSkill } from "../skills/coder/index.js";
 import { runTestSuite, type TestRunSpec, type TestRunChunk } from "../skills/tests/runner.js";
 import { withRepoLock } from "../workspace/mutex.js";
 import type { RepoKey } from "../config.js";
@@ -32,6 +34,9 @@ skillsRouter.post("/skills/tests/generate", handleTestsSkill);
 skillsRouter.post("/skills/translations/generate", handleTranslationsSkill);
 skillsRouter.post("/skills/review/generate", handleReviewSkill);
 skillsRouter.post("/skills/integration/generate", handleIntegrationSkill);
+skillsRouter.post("/skills/sdk-integrator/classify", handleClassifySkill);
+skillsRouter.post("/skills/sdk-integrator/generate", handleSdkIntegratorSkill);
+skillsRouter.post("/skills/coder/generate", handleCoderSkill);
 
 // ─── Skill run history ────────────────────────────────────────────────────
 

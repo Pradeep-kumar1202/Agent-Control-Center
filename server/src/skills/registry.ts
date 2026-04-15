@@ -75,4 +75,20 @@ export const SKILLS: SkillManifest[] = [
     endpoint: "/skills/integration/generate",
     repos: ["web", "mobile"],
   },
+  {
+    id: "sdk-integrator",
+    name: "SDK Integrator",
+    description:
+      "Implement a native SDK integration from vendor documentation",
+    endpoint: "/skills/sdk-integrator/generate",
+    repos: ["web", "mobile"],
+  },
+  {
+    id: "coder",
+    name: "Coder",
+    description:
+      "General-purpose coding: bug fixes, refactors, feature changes",
+    endpoint: "/skills/coder/generate",
+    repos: ["web", "mobile"],
+  },
 ];
