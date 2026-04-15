@@ -15,6 +15,10 @@ import { ReviewForm } from "./review/Form";
 import { ReviewResults } from "./review/Results";
 import { IntegrationForm } from "./integration/Form";
 import { IntegrationResults } from "./integration/Results";
+import { SdkIntegratorForm } from "./sdk-integrator/Form";
+import { SdkIntegratorResults } from "./sdk-integrator/Results";
+import { CoderForm } from "./coder/Form";
+import { CoderResults } from "./coder/Results";
 
 // ─── Shared types ────────────────────────────────────────────────────────────
 
@@ -99,5 +103,21 @@ export const SKILLS_REGISTRY: SkillConfig[] = [
     activeTabClass: "border-rose-500 text-rose-300",
     FormComponent: IntegrationForm,
     ResultsComponent: IntegrationResults,
+  },
+  {
+    id: "sdk-integrator",
+    name: "SDK Integrator",
+    description: "Implement a native SDK integration from vendor docs",
+    activeTabClass: "border-orange-500 text-orange-300",
+    FormComponent: SdkIntegratorForm,
+    ResultsComponent: SdkIntegratorResults,
+  },
+  {
+    id: "coder",
+    name: "Coder",
+    description: "General-purpose coding: bug fixes, refactors, features",
+    activeTabClass: "border-indigo-500 text-indigo-300",
+    FormComponent: CoderForm,
+    ResultsComponent: CoderResults,
   },
 ];

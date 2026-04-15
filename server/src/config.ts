@@ -56,20 +56,44 @@ export const PORT = Number(process.env.PORT ?? 5174);
 
 export type RepoKey = "web" | "mobile";
 
+/** Extended repo key including the rn_packages sub-repo (used by sdk-integrator & coder skills). */
+export type ExtendedRepoKey = "web" | "mobile" | "rn_packages";
+
+/** Subset of RepoKey used by the gap-analysis pipeline (same as RepoKey). */
+export type AnalysisRepoKey = "web" | "mobile";
+
+/** User-facing targets for the sdk-integrator skill. */
+export type IntegrationTarget = "web" | "mobile";
+
 export const REPOS: Record<
-  RepoKey,
+  ExtendedRepoKey,
   { name: string; url: string; dir: string }
 > = {
   web: {
     name: "hyperswitch-web",
     url: "https://github.com/juspay/hyperswitch-web.git",
-    dir: path.join(WORKSPACE_DIR, "hyperswitch-web"),
+    dir: path.join(WORKSPACE_DIR, "web", "hyperswitch-web"),
   },
   mobile: {
     name: "hyperswitch-client-core",
     url: "https://github.com/juspay/hyperswitch-client-core.git",
-    dir: path.join(WORKSPACE_DIR, "hyperswitch-client-core"),
+    dir: path.join(WORKSPACE_DIR, "mobile", "hyperswitch-client-core"),
   },
+  rn_packages: {
+    name: "react-native-hyperswitch",
+    url: "https://github.com/juspay/hyperswitch-client-core.git",
+    dir: path.join(WORKSPACE_DIR, "mobile", "react-native-hyperswitch"),
+  },
+};
+
+/**
+ * Namespace directories used as cwd for coder subprocesses.
+ * "mobile" → workspace/mobile/ (contains both client-core + rn-packages)
+ * "web"    → workspace/web/    (contains hyperswitch-web)
+ */
+export const INTEGRATION_TARGET_CWD: Record<IntegrationTarget, string> = {
+  mobile: path.join(WORKSPACE_DIR, "mobile"),
+  web: path.join(WORKSPACE_DIR, "web"),
 };
 
 // LLM model selection — extraction is cheap, validation/patching is expensive.
