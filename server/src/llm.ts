@@ -97,13 +97,16 @@ export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
 
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new LLMError(`claude CLI timed out after ${timeoutMs}ms`, stderr));
-    }, timeoutMs);
+    // timeoutMs <= 0 disables the hard timeout — used by long-running coder paths.
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new LLMError(`claude CLI timed out after ${timeoutMs}ms`, stderr));
+        }, timeoutMs)
+      : null;
 
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       activeChildren.delete(child);
     };
 
@@ -200,14 +203,17 @@ export function askStream(
 
     let buf = "";
     let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      onChunk({ type: "error", error: `claude CLI timed out after ${timeoutMs}ms` });
-      reject(new LLMError(`claude CLI timed out after ${timeoutMs}ms`, stderr));
-    }, timeoutMs);
+    // timeoutMs <= 0 disables the hard timeout — used by long-running coder paths.
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+          child.kill("SIGKILL");
+          onChunk({ type: "error", error: `claude CLI timed out after ${timeoutMs}ms` });
+          reject(new LLMError(`claude CLI timed out after ${timeoutMs}ms`, stderr));
+        }, timeoutMs)
+      : null;
 
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       activeChildren.delete(child);
     };
 

@@ -29,7 +29,8 @@ export interface RepoReviewLog {
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 export const REVIEWER_MODEL: Model = "opus";
-export const REVIEWER_TIMEOUT_MS = 600_000; // 10 min (needs time to explore codebase)
+// 0 = no hard timeout; reviewer runs until natural completion or user cancel.
+export const REVIEWER_TIMEOUT_MS = 0;
 export const REVIEWER_TOOLS = ["Read", "Grep", "Glob"];
 
 // ─── JSON extraction ─────────────────────────────────────────────────────────

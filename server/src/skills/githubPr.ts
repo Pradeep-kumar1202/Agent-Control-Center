@@ -19,7 +19,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import simpleGit from "simple-git";
-import type { RepoKey } from "../config.js";
+import type { RepoKey, ExtendedRepoKey } from "../config.js";
 
 export interface ForkConfig {
   /** GitHub username that owns the forks. */
@@ -28,12 +28,15 @@ export interface ForkConfig {
   webRepo: string;
   /** Fork repo name for hyperswitch-client-core. */
   mobileRepo: string;
+  /** Fork repo name for react-native-hyperswitch (rn_packages). */
+  rnPackagesRepo: string;
 }
 
 export const FORK_CONFIG: ForkConfig = {
   owner: process.env.BOT_FORK_OWNER ?? "pradeep120230-creator",
   webRepo: process.env.WEB_FORK_REPO ?? "sdk-agent-hyperswitch-web",
   mobileRepo: process.env.MOBILE_FORK_REPO ?? "sdk-agent-hyperswitch-client-core",
+  rnPackagesRepo: process.env.RN_PACKAGES_FORK_REPO ?? "sdk-agent-react-native-hyperswitch",
 };
 
 /**
@@ -47,22 +50,28 @@ export const SUBMODULE_FORKS: Record<string, string> = {
   "ios": process.env.IOS_FORK ?? "sdk-agent-hyperswitch-sdk-ios",
 };
 
-const UPSTREAM: Record<RepoKey, { owner: string; repo: string }> = {
+const UPSTREAM: Record<ExtendedRepoKey, { owner: string; repo: string }> = {
   web: { owner: "juspay", repo: "hyperswitch-web" },
   mobile: { owner: "juspay", repo: "hyperswitch-client-core" },
+  rn_packages: { owner: "juspay", repo: "react-native-hyperswitch" },
 };
 
-export function forkSlug(repoKey: RepoKey): string {
-  const repo = repoKey === "web" ? FORK_CONFIG.webRepo : FORK_CONFIG.mobileRepo;
+export function forkSlug(repoKey: ExtendedRepoKey): string {
+  const repo =
+    repoKey === "web"
+      ? FORK_CONFIG.webRepo
+      : repoKey === "rn_packages"
+        ? FORK_CONFIG.rnPackagesRepo
+        : FORK_CONFIG.mobileRepo;
   return `${FORK_CONFIG.owner}/${repo}`;
 }
 
-export function upstreamSlug(repoKey: RepoKey): string {
+export function upstreamSlug(repoKey: ExtendedRepoKey): string {
   const u = UPSTREAM[repoKey];
   return `${u.owner}/${u.repo}`;
 }
 
-function forkRemoteUrl(repoKey: RepoKey): string {
+function forkRemoteUrl(repoKey: ExtendedRepoKey): string {
   return `https://github.com/${forkSlug(repoKey)}.git`;
 }
 
@@ -106,7 +115,7 @@ function run(
  */
 export async function pushBranchToFork(
   repoDir: string,
-  repoKey: RepoKey,
+  repoKey: ExtendedRepoKey,
   branch: string,
 ): Promise<{ remoteUrl: string }> {
   const git = simpleGit(repoDir);
@@ -233,7 +242,7 @@ function escapeRegex(s: string): string {
  * of the same fork.
  */
 export async function createPullRequest(args: {
-  repoKey: RepoKey;
+  repoKey: ExtendedRepoKey;
   branch: string;
   title: string;
   body: string;

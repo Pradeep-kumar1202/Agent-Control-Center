@@ -14,13 +14,16 @@
  */
 
 import type { Request, Response } from "express";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import {
   INTEGRATION_TARGET_CWD,
   REPOS,
   type IntegrationTarget,
   type ExtendedRepoKey,
 } from "../../config.js";
-import { ask, askJson } from "../../llm.js";
+import { askStream, askJson } from "../../llm.js";
 import type { SkillRepoResult } from "../registry.js";
 
 // ── Shared helpers ──
@@ -28,6 +31,7 @@ import { sendSSE, initSSE } from "../shared/sse.js";
 import { setupBranch, collectDiff, commitAndSave } from "../shared/git.js";
 import {
   runReviewLoop,
+  forwardCoderChunk,
   CODER_MODEL,
   CODER_TOOLS,
   CODER_TIMEOUT_MS,
@@ -45,6 +49,12 @@ import {
 
 // ── Knowledge injection ──
 import { loadMobileIntegrationKnowledge } from "../shared/knowledge.js";
+
+// ── Repo sync ──
+import { ensureRepo } from "../../workspace/repoManager.js";
+
+// ── Push + PR ──
+import { pushBranchToFork, createPullRequest, forkSlug } from "../githubPr.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -74,6 +84,158 @@ export interface IntegrationSpec {
 
 interface RepoResult extends SkillRepoResult {
   reviewLog: RepoReviewLog[];
+}
+
+// ─── Package scaffolder (`create-react-native-library`) ─────────────────────
+
+/**
+ * Run `npx create-react-native-library@0.49.8` inside the rn_packages workspace
+ * to bootstrap a new package under `packages/@juspay-tech/{pkgName}`. This is
+ * what WORKFLOW_NATIVE_SDK_INTEGRATION.md Phase 1A.1 requires but the coder
+ * can't do itself (no Bash tool). Running it here gives the coder a valid
+ * builder-bob package skeleton to Edit on top of.
+ *
+ * Non-fatal on failure — if the package dir already exists (re-run) or the
+ * scaffolder errors out, we log a warning and let the coder proceed. The
+ * coder can still hand-author what's missing.
+ */
+async function scaffoldRnPackage(args: {
+  rnPackagesDir: string;
+  pkgName: string;
+  sdkName: string;
+  res: Response;
+}): Promise<{ scaffolded: boolean; warning: string | null }> {
+  const { rnPackagesDir, pkgName, sdkName, res } = args;
+  const packagesDir = path.join(rnPackagesDir, "packages", "@juspay-tech");
+  const pkgDir = path.join(packagesDir, pkgName);
+
+  if (fs.existsSync(pkgDir)) {
+    sendSSE(res, {
+      type: "progress",
+      repo: "mobile",
+      message: `Package ${pkgName} already exists — skipping scaffold`,
+    });
+    return { scaffolded: false, warning: null };
+  }
+
+  sendSSE(res, {
+    type: "phase",
+    repo: "mobile",
+    message: `Scaffolding ${pkgName} with create-react-native-library`,
+  });
+
+  fs.mkdirSync(packagesDir, { recursive: true });
+
+  const cliArgs = [
+    "create-react-native-library@0.49.8",
+    pkgName,
+    "--slug", `@juspay-tech/${pkgName}`,
+    "--description", `React Native wrapper for ${sdkName} SDK`,
+    "--type", "module",
+    "--languages", "kotlin-swift",
+    "--example", "vanilla",
+    "--no-interactive",
+  ];
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("npx", cliArgs, {
+        cwd: packagesDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, CI: "1" },
+      });
+      let stderr = "";
+      child.stdout?.on("data", (b) => {
+        const s = b.toString().trim();
+        if (s) {
+          sendSSE(res, { type: "text", repo: "mobile", message: s.slice(0, 200) });
+        }
+      });
+      child.stderr?.on("data", (b) => (stderr += b.toString()));
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`create-react-native-library exited ${code}: ${stderr.slice(0, 500)}`));
+      });
+    });
+    sendSSE(res, {
+      type: "progress",
+      repo: "mobile",
+      message: `Scaffold complete: packages/@juspay-tech/${pkgName}`,
+    });
+    return { scaffolded: true, warning: null };
+  } catch (err) {
+    const warning = `Scaffold failed: ${(err as Error).message}`;
+    sendSSE(res, { type: "error", repo: "mobile", message: warning });
+    return { scaffolded: false, warning };
+  }
+}
+
+// ─── Push + PR helper ───────────────────────────────────────────────────────
+
+interface PrOutcome {
+  prUrl: string | null;
+  prNumber: number | null;
+  prWarning: string | null;
+}
+
+/**
+ * Force-push a feature branch to the bot fork and open a PR against that
+ * fork's own main. Emits SSE events so the UI shows live progress. Non-fatal
+ * on failure — returns a warning instead of throwing.
+ */
+async function pushAndOpenPr(args: {
+  repoKey: ExtendedRepoKey;
+  repoDir: string;
+  branch: string;
+  sdkName: string;
+  res: Response;
+}): Promise<PrOutcome> {
+  const { repoKey, repoDir, branch, sdkName, res } = args;
+  const label = String(repoKey);
+
+  sendSSE(res, {
+    type: "phase",
+    repo: label,
+    message: `Pushing to ${forkSlug(repoKey)}`,
+  });
+
+  try {
+    await pushBranchToFork(repoDir, repoKey, branch);
+  } catch (err) {
+    const warning = `Push failed: ${(err as Error).message}`;
+    sendSSE(res, { type: "error", repo: label, message: warning });
+    return { prUrl: null, prNumber: null, prWarning: warning };
+  }
+
+  sendSSE(res, {
+    type: "phase",
+    repo: label,
+    message: `Opening PR on ${forkSlug(repoKey)}`,
+  });
+
+  try {
+    const { prUrl, prNumber } = await createPullRequest({
+      repoKey,
+      branch,
+      title: `integrate ${sdkName} SDK`,
+      body:
+        `## Summary\n\nIntegrate the **${sdkName}** SDK into this repo.\n\n` +
+        `## Generated by\n\nAgent-Control-Center sdk-integrator skill.\n\n` +
+        `---\n*Automated PR. Reviewer: please verify the implementation matches existing patterns in this repo.*\n`,
+    });
+    sendSSE(res, {
+      type: "progress",
+      repo: label,
+      message: `PR opened: ${prUrl}`,
+      data: { prUrl, prNumber },
+    });
+    return { prUrl, prNumber, prWarning: null };
+  } catch (err) {
+    const warning = `PR creation failed: ${(err as Error).message}`;
+    sendSSE(res, { type: "error", repo: label, message: warning });
+    return { prUrl: null, prNumber: null, prWarning: warning };
+  }
 }
 
 // ─── SDK classification (Sonnet — fast, cheap) ──────────────────────────────
@@ -156,7 +318,7 @@ async function classifySdkFromDoc(
 ): Promise<SdkClassification> {
   const base = await askJson<Partial<SdkClassification>>(
     buildClassifyPrompt(sdkDoc, sdkTypeHint),
-    { model: "sonnet", timeoutMs: 60_000 },
+    { model: "sonnet", timeoutMs: 0 },
   );
 
   // Fill in defaults for any missing fields
@@ -431,6 +593,10 @@ async function runMobileIntegration(
     throw new Error("At least one mobile sub-repo must be selected");
   }
 
+  // Ensure repos are cloned before touching them
+  if (includeClientCore) await ensureRepo("mobile");
+  if (includeRnPackages) await ensureRepo("rn_packages");
+
   // Setup branches in selected repos
   const mobileSetup = includeClientCore ? await setupBranch("mobile", branchName) : null;
   const rnSetup = includeRnPackages ? await setupBranch("rn_packages", branchName) : null;
@@ -447,11 +613,33 @@ async function runMobileIntegration(
     message: `Implementing ${spec.sdkName} across ${repoLabel}...`,
   });
 
+  // Pre-scaffold a new rn_packages package if requested. The coder has no Bash
+  // tool, so it can't run `create-react-native-library` itself — we do it here
+  // and let the coder Edit on top of the generated skeleton.
+  if (includeRnPackages && spec.newPackage && rnSetup) {
+    const pkgName =
+      spec.newPackageName ||
+      `react-native-hyperswitch-${spec.sdkName.toLowerCase()}`;
+    await scaffoldRnPackage({
+      rnPackagesDir: REPOS.rn_packages.dir,
+      pkgName,
+      sdkName: spec.sdkName,
+      res,
+    });
+  }
+
+  sendSSE(res, {
+    type: "phase",
+    repo: "mobile",
+    message: `Coding ${repoLabel}`,
+  });
+
   // Load codebase knowledge for system prompt injection
   const knowledge = await loadMobileIntegrationKnowledge();
 
-  // Single coder call
-  const coderSummary = await ask(
+  // Single coder call (streamed so UI sees tool-level activity)
+  let coderSummary = "";
+  await askStream(
     buildCombinedMobilePrompt(spec, includeClientCore, includeRnPackages),
     {
       model: CODER_MODEL,
@@ -459,6 +647,10 @@ async function runMobileIntegration(
       cwd,
       allowedTools: CODER_TOOLS,
       system: knowledge || undefined,
+    },
+    (chunk) => {
+      forwardCoderChunk(res, "mobile", chunk);
+      if (chunk.type === "text" && chunk.text) coderSummary += chunk.text;
     },
   );
 
@@ -521,19 +713,35 @@ async function runMobileIntegration(
   const finalMobile = mobileSetup ? await collectDiff(mobileSetup.git) : { diff: "", fileCount: 0 };
   const finalRn = rnSetup ? await collectDiff(rnSetup.git) : { diff: "", fileCount: 0 };
 
-  // Commit and save patches per-repo
+  // Commit and save patches per-repo, then push + open PR for each
+  let mobilePr: PrOutcome = { prUrl: null, prNumber: null, prWarning: null };
   if (mobileSetup) {
     if (finalMobile.diff) {
       await commitAndSave(mobileSetup.git, mobileSetup.defaultBranch, `integrate ${spec.sdkName} SDK`, "mobile", slug, finalMobile.diff, "integration");
+      mobilePr = await pushAndOpenPr({
+        repoKey: "mobile",
+        repoDir: REPOS.mobile.dir,
+        branch: branchName,
+        sdkName: spec.sdkName,
+        res,
+      });
     } else {
       await mobileSetup.git.checkout(mobileSetup.defaultBranch);
       try { await mobileSetup.git.deleteLocalBranch(branchName, true); } catch { /* */ }
     }
   }
 
+  let rnPr: PrOutcome = { prUrl: null, prNumber: null, prWarning: null };
   if (rnSetup) {
     if (finalRn.diff) {
       await commitAndSave(rnSetup.git, rnSetup.defaultBranch, `integrate ${spec.sdkName} SDK`, "rn_packages", slug, finalRn.diff, "integration");
+      rnPr = await pushAndOpenPr({
+        repoKey: "rn_packages",
+        repoDir: REPOS.rn_packages.dir,
+        branch: branchName,
+        sdkName: spec.sdkName,
+        res,
+      });
     } else {
       await rnSetup.git.checkout(rnSetup.defaultBranch);
       try { await rnSetup.git.deleteLocalBranch(branchName, true); } catch { /* */ }
@@ -556,6 +764,9 @@ async function runMobileIntegration(
       diff: finalMobile.diff,
       filesTouched: finalMobile.fileCount,
       reviewLog,
+      prUrl: mobilePr.prUrl,
+      prNumber: mobilePr.prNumber,
+      prWarning: mobilePr.prWarning,
     };
   }
 
@@ -567,6 +778,9 @@ async function runMobileIntegration(
       diff: finalRn.diff,
       filesTouched: finalRn.fileCount,
       reviewLog,
+      prUrl: rnPr.prUrl,
+      prNumber: rnPr.prNumber,
+      prWarning: rnPr.prWarning,
     };
   }
 
@@ -588,6 +802,7 @@ async function runWebIntegration(
   const repoKey: ExtendedRepoKey = "web";
   const cwd = INTEGRATION_TARGET_CWD.web;
 
+  await ensureRepo("web");
   const { git, defaultBranch } = await setupBranch(repoKey, branchName);
 
   sendSSE(res, {
@@ -595,13 +810,26 @@ async function runWebIntegration(
     repo: "web",
     message: `Implementing ${spec.sdkName} in Web SDK...`,
   });
-
-  const coderSummary = await ask(buildWebPrompt(spec), {
-    model: CODER_MODEL,
-    timeoutMs: CODER_TIMEOUT_MS,
-    cwd,
-    allowedTools: CODER_TOOLS,
+  sendSSE(res, {
+    type: "phase",
+    repo: "web",
+    message: "Coding hyperswitch-web",
   });
+
+  let coderSummary = "";
+  await askStream(
+    buildWebPrompt(spec),
+    {
+      model: CODER_MODEL,
+      timeoutMs: CODER_TIMEOUT_MS,
+      cwd,
+      allowedTools: CODER_TOOLS,
+    },
+    (chunk) => {
+      forwardCoderChunk(res, "web", chunk);
+      if (chunk.type === "text" && chunk.text) coderSummary += chunk.text;
+    },
+  );
 
   const initial = await collectDiff(git);
   if (!initial.diff || initial.fileCount === 0) {
@@ -639,8 +867,16 @@ async function runWebIntegration(
 
   // Collect final diff and commit
   const final = await collectDiff(git);
+  let webPr: PrOutcome = { prUrl: null, prNumber: null, prWarning: null };
   if (final.diff) {
     await commitAndSave(git, defaultBranch, `integrate ${spec.sdkName} SDK`, repoKey, slug, final.diff, "integration");
+    webPr = await pushAndOpenPr({
+      repoKey: "web",
+      repoDir: REPOS.web.dir,
+      branch: branchName,
+      sdkName: spec.sdkName,
+      res,
+    });
   } else {
     await git.checkout(defaultBranch);
     try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
@@ -659,6 +895,9 @@ async function runWebIntegration(
     diff: final.diff,
     filesTouched: final.fileCount,
     reviewLog,
+    prUrl: webPr.prUrl,
+    prNumber: webPr.prNumber,
+    prWarning: webPr.prWarning,
   };
 }
 

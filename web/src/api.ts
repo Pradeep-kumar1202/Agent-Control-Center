@@ -591,6 +591,10 @@ export interface IntegrationSpec {
 export interface IntegrationSSEEvent {
   type:
     | "progress"
+    | "phase"
+    | "tool_use"
+    | "tool_result"
+    | "text"
     | "review_start"
     | "review_result"
     | "fix_start"

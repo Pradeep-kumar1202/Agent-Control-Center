@@ -61,6 +61,7 @@ interface ProgressEntry {
   repo?: string;
   message: string;
   type: IntegrationSSEEvent["type"];
+  data?: unknown;
   timestamp: number;
 }
 
@@ -174,6 +175,7 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
           repo: event.repo,
           message: event.message,
           type: event.type,
+          data: event.data,
           timestamp: Date.now(),
         };
         setProgress((prev) => [...prev, entry]);
@@ -439,26 +441,45 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
       {step === "generate" && (
         <>
           {progress.length > 0 && (
-            <div className="mb-4 rounded-lg border border-slate-800 bg-slate-950 p-3 max-h-64 overflow-y-auto">
-              {progress.map((p, i) => (
-                <div key={i} className="flex items-start gap-2 text-xs py-0.5">
-                  <span className={
-                    p.type === "error" ? "text-red-400" :
-                    p.type === "review_result" ? "text-violet-400" :
-                    p.type === "repo_done" ? "text-emerald-400" :
-                    p.type === "done" ? "text-emerald-300 font-medium" :
-                    "text-slate-500"
-                  }>
-                    {p.type === "error" ? "x" :
-                     p.type === "review_result" ? "R" :
-                     p.type === "repo_done" ? "+" :
-                     p.type === "done" ? "+" :
-                     ">"}
-                  </span>
-                  {p.repo && <span className="text-orange-400 font-mono">[{p.repo}]</span>}
-                  <span className="text-slate-300">{p.message}</span>
-                </div>
-              ))}
+            <div className="mb-4 rounded-lg border border-slate-800 bg-slate-950 p-3 max-h-96 overflow-y-auto font-mono">
+              {progress.map((p, i) => {
+                // tool_result is noisy — only render if it signals an error
+                if (p.type === "tool_result") {
+                  const errored = (p.data as { isError?: boolean } | undefined)?.isError === true;
+                  if (!errored) return null;
+                }
+
+                const isPhase = p.type === "phase";
+                const rowClass = isPhase
+                  ? "flex items-start gap-2 text-xs py-1 mt-1 border-t border-slate-800 pt-1.5"
+                  : "flex items-start gap-2 text-xs py-0.5";
+
+                const iconAndColor = (() => {
+                  switch (p.type) {
+                    case "error": return { icon: "x", color: "text-red-400" };
+                    case "phase": return { icon: "▸", color: "text-orange-400 font-semibold" };
+                    case "tool_use": return { icon: "⚙", color: "text-cyan-400" };
+                    case "tool_result": return { icon: "!", color: "text-red-300" };
+                    case "text": return { icon: " ", color: "text-slate-400" };
+                    case "review_start": return { icon: "R", color: "text-violet-300" };
+                    case "review_result": return { icon: "R", color: "text-violet-400" };
+                    case "fix_start": return { icon: "F", color: "text-amber-400" };
+                    case "repo_done": return { icon: "+", color: "text-emerald-400" };
+                    case "done": return { icon: "+", color: "text-emerald-300 font-medium" };
+                    default: return { icon: ">", color: "text-slate-500" };
+                  }
+                })();
+
+                return (
+                  <div key={i} className={rowClass}>
+                    <span className={iconAndColor.color}>{iconAndColor.icon}</span>
+                    {p.repo && !isPhase && <span className="text-orange-400/70">[{p.repo}]</span>}
+                    <span className={isPhase ? "text-orange-200" : "text-slate-300"}>
+                      {p.message}
+                    </span>
+                  </div>
+                );
+              })}
               <div ref={progressEndRef} />
             </div>
           )}

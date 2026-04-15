@@ -7,6 +7,10 @@ import type { Response } from "express";
 export interface SSEEvent {
   type:
     | "progress"
+    | "phase"
+    | "tool_use"
+    | "tool_result"
+    | "text"
     | "review_start"
     | "review_result"
     | "fix_start"

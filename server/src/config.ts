@@ -81,7 +81,7 @@ export const REPOS: Record<
   },
   rn_packages: {
     name: "react-native-hyperswitch",
-    url: "https://github.com/juspay/hyperswitch-client-core.git",
+    url: "https://github.com/juspay/react-native-hyperswitch.git",
     dir: path.join(WORKSPACE_DIR, "mobile", "react-native-hyperswitch"),
   },
 };
