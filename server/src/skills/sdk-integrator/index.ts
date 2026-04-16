@@ -75,8 +75,11 @@ export interface IntegrationSpec {
   /** User-facing targets: "web" | "mobile". "mobile" = both client-core + rn-packages. */
   targets: IntegrationTarget[];
   platforms: string[];
-  newPackage?: boolean;
-  newPackageName?: string;
+  /** Optional custom NPM package name. Defaults to `react-native-hyperswitch-${sdkName.toLowerCase()}`. */
+  packageNameOverride?: string;
+  /** Optional existing branch to extend (e.g. another integration still in progress).
+   *  When set, the feature branch is created off this instead of main. */
+  baseBranch?: string;
   additionalContext?: string;
   /** Which sub-repos to include for mobile. Defaults to both. */
   mobileSubRepos?: MobileSubRepo[];
@@ -126,15 +129,20 @@ async function scaffoldRnPackage(args: {
 
   fs.mkdirSync(packagesDir, { recursive: true });
 
+  // Non-interactive mode is driven by CI=1 in env (set on spawn below) — the
+  // 0.49.x CLI rejects a `--no-interactive` flag explicitly, so don't pass it.
   const cliArgs = [
     "create-react-native-library@0.49.8",
     pkgName,
     "--slug", `@juspay-tech/${pkgName}`,
     "--description", `React Native wrapper for ${sdkName} SDK`,
-    "--type", "module",
+    // 0.49.x type options: turbo-module | fabric-view | nitro-module
+    //                    | legacy-module | legacy-view | library
+    // `legacy-module` matches the existing @juspay-tech packages (old-style
+    // ViewManager + NativeModule), so the coder's Edit patterns apply cleanly.
+    "--type", "legacy-module",
     "--languages", "kotlin-swift",
     "--example", "vanilla",
-    "--no-interactive",
   ];
 
   try {
@@ -428,7 +436,7 @@ The user described this flow as: ${c.apiChain.description || "see API chain step
 function buildCombinedMobilePrompt(spec: IntegrationSpec, includeClientCore: boolean, includeRnPackages: boolean): string {
   const c = spec.classification;
   const flowInstructions = getFlowInstructions(c, spec.sdkName);
-  const pkgName = spec.newPackageName || `react-native-hyperswitch-${spec.sdkName.toLowerCase()}`;
+  const pkgName = spec.packageNameOverride || `react-native-hyperswitch-${spec.sdkName.toLowerCase()}`;
 
   const repoList: string[] = [];
   if (includeClientCore) repoList.push("- `hyperswitch-client-core/` — ReScript consumer SDK (hooks, modules, types, native view bindings)");
@@ -458,7 +466,7 @@ ${spec.additionalContext ? `## Additional Context\n\n${spec.additionalContext}\n
     parts.push(`
 ### ${includeClientCore ? "Part 1: " : ""}Native Module (react-native-hyperswitch)
 
-${spec.newPackage ? `1. Create or find the NPM package \`${pkgName}\` under \`react-native-hyperswitch/packages/@juspay-tech/\`. Use react-native-hyperswitch-paypal as reference.` : "1. Find the existing NPM package for this SDK under `react-native-hyperswitch/packages/@juspay-tech/`."}
+1. Find or create the NPM package \`${pkgName}\` under \`react-native-hyperswitch/packages/@juspay-tech/\`. A builder-bob skeleton may already be scaffolded — if so, Edit on top of it. Otherwise use react-native-hyperswitch-paypal as reference.
 
 2. Implement the native module following these critical rules:
 
@@ -486,14 +494,28 @@ ${c.requiresActivity ? "- Implement Activity-Host pattern (see PayPalRedirectAct
     parts.push(`
 ### ${includeRnPackages ? "Part 2: " : ""}ReScript Consumer Bindings (hyperswitch-client-core)
 
-1. First, READ the reference pattern file: **${c.referencePattern || "hyperswitch-client-core/src/components/modules/ScanCardModule.res"}**
+${includeRnPackages ? `0. **READ \`react-native-hyperswitch/packages/@juspay-tech/${pkgName}/src/index.tsx\`** — this is the TypeScript bridge you wrote (or updated) in Part 1. Before writing any ReScript, enumerate EVERY item from it:
+   - exported event names (e.g. \`onInitialized\`, \`onLoaded\`, \`onAuthorized\`, \`onResize\`, \`onError\`, …)
+   - exported native-view prop names (e.g. \`category\`, \`returnURL\`, …)
+   - exported imperative method names + argument lists (e.g. \`initialize(clientToken, returnURL)\`, \`load()\`, \`authorize()\`)
+   - every field on every callback-payload type (e.g. \`approved\`, \`authToken\`, \`finalizeRequired\`, \`errorMessage\`)
+
+   The ReScript type definitions you write below MUST be a 1:1 mirror of this list. Missing any event, prop, method, or payload field is a review failure.
+
+` : ""}1. READ the reference pattern file: **${c.referencePattern || "hyperswitch-client-core/src/components/modules/ScanCardModule.res"}**
 
 ${flowInstructions}
 
-2. Create the ReScript module wrapper using \`require\` + \`try/catch\` pattern:
+2. Create the ReScript module wrapper. It must expose the **complete** TS surface enumerated in step 0:
+   - Every event → field on the module's \`event\` record type AND a prop on the \`@react.component\` that wraps it
+   - Every callback-payload field → field on the event record with the correct option wrapping
+   - Every native-view prop → prop on the ReScript component
+   - Every imperative method → method on the \`element\` ref type with matching argument order and types
+
+   Use the \`require\` + \`try/catch\` pattern (see ScanCardModule.res as shape reference — yours will be larger):
 
 \`\`\`rescript
-type module_ = {{methodName}: (string, Dict.t<JSON.t> => unit) => unit}
+type module_ = { /* complete type signature covering all of step 0 */ }
 @val external require: string => module_ = "require"
 let mod = try { require("@juspay-tech/${pkgName}")->Some } catch { | _ => None }
 \`\`\`
@@ -506,7 +528,9 @@ ${c.hasNativeUI ? `4. Create native view bindings (.ios.res, .android.res with r
     parts.push(`
 ### Critical: Interface Consistency
 
-The native module methods you create in Part 1 MUST exactly match what the ReScript bindings call in Part 2. If your Swift method is \`startPayment(clientId:orderId:callback:)\`, the TypeScript bridge must expose the same signature, and the ReScript binding must call it with the same parameter names/types.`);
+The native module methods you create in Part 1 MUST exactly match what the ReScript bindings call in Part 2. If your Swift method is \`startPayment(clientId:orderId:callback:)\`, the TypeScript bridge must expose the same signature, and the ReScript binding must call it with the same parameter names/types.
+
+**Interface consistency is bidirectional.** The ReScript module type is not a subset of the TS bridge — it is a full mirror. If the TS bridge exports an event, prop, callback-payload field, or imperative method that ReScript does not expose, that's a completeness bug. Do NOT silently drop events, props, or payload fields to minimize the diff. If Part 1 added \`onResize\` / \`finalizeRequired\` / a \`category\` prop, Part 2's ReScript types must surface all of them.`);
   }
 
   parts.push(`
@@ -598,8 +622,8 @@ async function runMobileIntegration(
   if (includeRnPackages) await ensureRepo("rn_packages");
 
   // Setup branches in selected repos
-  const mobileSetup = includeClientCore ? await setupBranch("mobile", branchName) : null;
-  const rnSetup = includeRnPackages ? await setupBranch("rn_packages", branchName) : null;
+  const mobileSetup = includeClientCore ? await setupBranch("mobile", branchName, spec.baseBranch) : null;
+  const rnSetup = includeRnPackages ? await setupBranch("rn_packages", branchName, spec.baseBranch) : null;
 
   const repoLabel = includeClientCore && includeRnPackages
     ? "client-core + rn-packages"
@@ -613,12 +637,13 @@ async function runMobileIntegration(
     message: `Implementing ${spec.sdkName} across ${repoLabel}...`,
   });
 
-  // Pre-scaffold a new rn_packages package if requested. The coder has no Bash
-  // tool, so it can't run `create-react-native-library` itself — we do it here
-  // and let the coder Edit on top of the generated skeleton.
-  if (includeRnPackages && spec.newPackage && rnSetup) {
+  // Pre-scaffold the rn_packages package. The coder has no Bash tool, so it
+  // can't run `create-react-native-library` itself — we do it here and let the
+  // coder Edit on top of the generated skeleton. `scaffoldRnPackage` is
+  // idempotent: it no-ops when the package directory already exists.
+  if (includeRnPackages && rnSetup) {
     const pkgName =
-      spec.newPackageName ||
+      spec.packageNameOverride ||
       `react-native-hyperswitch-${spec.sdkName.toLowerCase()}`;
     await scaffoldRnPackage({
       rnPackagesDir: REPOS.rn_packages.dir,
@@ -637,10 +662,20 @@ async function runMobileIntegration(
   // Load codebase knowledge for system prompt injection
   const knowledge = await loadMobileIntegrationKnowledge();
 
+  // Build the coder prompt once and emit it so the UI can surface what the
+  // agent was actually asked to do.
+  const mobilePrompt = buildCombinedMobilePrompt(spec, includeClientCore, includeRnPackages);
+  sendSSE(res, {
+    type: "coder_prompt",
+    repo: "mobile",
+    message: "Mobile coder prompt",
+    data: { prompt: mobilePrompt },
+  });
+
   // Single coder call (streamed so UI sees tool-level activity)
   let coderSummary = "";
   await askStream(
-    buildCombinedMobilePrompt(spec, includeClientCore, includeRnPackages),
+    mobilePrompt,
     {
       model: CODER_MODEL,
       timeoutMs: includeClientCore && includeRnPackages ? MOBILE_CODER_TIMEOUT_MS : CODER_TIMEOUT_MS,
@@ -803,7 +838,7 @@ async function runWebIntegration(
   const cwd = INTEGRATION_TARGET_CWD.web;
 
   await ensureRepo("web");
-  const { git, defaultBranch } = await setupBranch(repoKey, branchName);
+  const { git, defaultBranch } = await setupBranch(repoKey, branchName, spec.baseBranch);
 
   sendSSE(res, {
     type: "progress",
@@ -816,9 +851,17 @@ async function runWebIntegration(
     message: "Coding hyperswitch-web",
   });
 
+  const webPrompt = buildWebPrompt(spec);
+  sendSSE(res, {
+    type: "coder_prompt",
+    repo: "web",
+    message: "Web coder prompt",
+    data: { prompt: webPrompt },
+  });
+
   let coderSummary = "";
   await askStream(
-    buildWebPrompt(spec),
+    webPrompt,
     {
       model: CODER_MODEL,
       timeoutMs: CODER_TIMEOUT_MS,

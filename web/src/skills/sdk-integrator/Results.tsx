@@ -47,11 +47,17 @@ export function SdkIntegratorResults({ result, onClose }: SkillResultsProps) {
   const sdkName = (result.meta?.sdkName as string) ?? "";
   const classification = result.meta?.classification as SdkClassification | undefined;
   const reviewLogs = (result.meta?.reviewLogs as Record<string, ReviewLogEntry[]>) ?? {};
+  const prompts = (result.meta?.prompts as Record<string, string>) ?? {};
+  const [promptExpanded, setPromptExpanded] = useState(false);
 
   // Resolve which repo key to actually display
   const activeRepoKey = activeTab === "mobile_group" ? mobileSubTab : activeTab;
   const active = result.results[activeRepoKey];
   const activeReviewLog = reviewLogs[activeRepoKey] ?? [];
+  // Mobile prompt is shared across client-core and rn_packages (one combined prompt).
+  const activePrompt =
+    prompts[activeRepoKey] ||
+    (activeTab === "mobile_group" ? prompts.mobile : undefined);
 
   // Count total repos for subtitle
   const repoCount = allRepoKeys.length;
@@ -217,6 +223,29 @@ export function SdkIntegratorResults({ result, onClose }: SkillResultsProps) {
                       )}
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* Coder prompt */}
+              {activePrompt && (
+                <div className="border-b border-slate-800 px-6 py-3">
+                  <button
+                    onClick={() => setPromptExpanded((v) => !v)}
+                    className="flex items-center gap-2 text-xs w-full text-left hover:text-slate-200"
+                  >
+                    <span className="text-slate-500">{promptExpanded ? "v" : ">"}</span>
+                    <span className="text-slate-500 font-medium uppercase tracking-wider">
+                      Coder Prompt
+                    </span>
+                    <span className="text-slate-600">
+                      ({activePrompt.length.toLocaleString()} chars)
+                    </span>
+                  </button>
+                  {promptExpanded && (
+                    <pre className="mt-2 rounded border border-slate-800 bg-slate-950 p-3 text-xs text-slate-300 font-mono whitespace-pre-wrap max-h-[32rem] overflow-y-auto">
+                      {activePrompt}
+                    </pre>
+                  )}
                 </div>
               )}
 

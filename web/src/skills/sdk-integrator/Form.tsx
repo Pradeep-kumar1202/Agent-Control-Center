@@ -74,10 +74,11 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
   const [targets, setTargets] = useState<Set<string>>(new Set(["mobile"]));
   const [mobileSubRepos, setMobileSubRepos] = useState<Set<string>>(new Set(["client_core", "rn_packages"]));
   const [platforms, setPlatforms] = useState<Set<string>>(new Set(["ios", "android", "rescript_mobile"]));
-  const [newPackage, setNewPackage] = useState(false);
-  const [newPackageName, setNewPackageName] = useState("");
+  const [packageNameOverride, setPackageNameOverride] = useState("");
+  const [baseBranch, setBaseBranch] = useState("");
   const [additionalContext, setAdditionalContext] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [expandedPrompts, setExpandedPrompts] = useState<Set<number>>(new Set());
 
   // Step 2 state
   const [classification, setClassification] = useState<SdkClassification | null>(null);
@@ -88,6 +89,8 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
   const [progress, setProgress] = useState<ProgressEntry[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const progressEndRef = useRef<HTMLDivElement>(null);
+  // Accumulate coder_prompt SSE payloads (keyed by repo) so onResult can pass them through.
+  const promptsRef = useRef<Record<string, string>>({});
 
   // Current step
   const step: Step = generating || progress.length > 0
@@ -157,8 +160,8 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
       classification,
       targets: Array.from(targets) as IntegrationSpec["targets"],
       platforms: Array.from(platforms),
-      newPackage,
-      newPackageName: newPackage ? newPackageName.trim() || undefined : undefined,
+      packageNameOverride: packageNameOverride.trim() || undefined,
+      baseBranch: baseBranch.trim() || undefined,
       additionalContext: additionalContext.trim() || undefined,
       mobileSubRepos: targets.has("mobile")
         ? Array.from(mobileSubRepos) as IntegrationSpec["mobileSubRepos"]
@@ -167,10 +170,15 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
 
     setGenerating(true);
     setProgress([]);
+    promptsRef.current = {};
 
     abortRef.current = generateIntegration(
       spec,
       (event: IntegrationSSEEvent) => {
+        if (event.type === "coder_prompt" && event.repo) {
+          const text = (event.data as { prompt?: string } | undefined)?.prompt;
+          if (text) promptsRef.current[event.repo] = text;
+        }
         const entry: ProgressEntry = {
           repo: event.repo,
           message: event.message,
@@ -193,6 +201,7 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
             reviewLogs: Object.fromEntries(
               Object.entries(envelope.results).map(([k, v]) => [k, v.reviewLog]),
             ),
+            prompts: { ...promptsRef.current },
           },
         });
       },
@@ -221,8 +230,10 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
       {/* ── Step 1: Input ────────────────────────────────────────── */}
       {step === "input" && (
         <>
-          {/* SDK Name */}
-          <div className="mb-4">
+          {/* Section: SDK Info */}
+          <SectionHeader title="SDK Info" subtitle="Name and vendor documentation." />
+
+          <div className="mb-5">
             <label className="block text-xs text-slate-400 mb-1">SDK Name</label>
             <input
               type="text"
@@ -233,8 +244,7 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
             />
           </div>
 
-          {/* SDK Documentation */}
-          <div className="mb-4">
+          <div className="mb-6">
             <div className="flex items-center justify-between mb-1">
               <label className="block text-xs text-slate-400">SDK Documentation</label>
               <label className="text-xs text-orange-400 hover:text-orange-300 cursor-pointer">
@@ -251,8 +261,13 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
             />
           </div>
 
-          {/* Target SDKs */}
-          <div className="mb-4">
+          {/* Section: Integration Targets */}
+          <SectionHeader
+            title="Integration Targets"
+            subtitle="Which SDKs, sub-repos, and native platforms to generate for."
+          />
+
+          <div className="mb-5">
             <label className="block text-xs text-slate-400 mb-2">Target SDKs</label>
             <div className="flex flex-wrap gap-2">
               {TARGETS.map((r) => (
@@ -298,8 +313,7 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
             )}
           </div>
 
-          {/* Target Platforms */}
-          <div className="mb-4">
+          <div className="mb-6">
             <label className="block text-xs text-slate-400 mb-2">Target Platforms</label>
             <div className="flex flex-wrap gap-2">
               {PLATFORMS.map((p) => (
@@ -322,31 +336,48 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
             </div>
           </div>
 
-          {/* New Package toggle */}
-          <div className="mb-4 flex items-center gap-3">
-            <button
-              onClick={() => setNewPackage(!newPackage)}
-              className={
-                "rounded border px-3 py-1.5 text-xs transition " +
-                (newPackage
-                  ? "border-orange-500 bg-orange-500/10 text-orange-200"
-                  : "border-slate-700 text-slate-400 hover:border-slate-500")
-              }
-            >
-              {newPackage ? "New Package" : "Existing Package"}
-            </button>
-            {newPackage && (
+          {/* Section: Options */}
+          <SectionHeader
+            title="Options"
+            subtitle="Customise the package name or add context. Safe to leave everything blank."
+          />
+
+          {/* Package name override — only when rn_packages is selected */}
+          {targets.has("mobile") && mobileSubRepos.has("rn_packages") && (
+            <div className="mb-5">
+              <label className="block text-xs text-slate-400 mb-1">
+                NPM Package Name <span className="text-slate-600">(optional — auto-derived from SDK name)</span>
+              </label>
               <input
                 type="text"
-                value={newPackageName}
-                onChange={(e) => setNewPackageName(e.target.value)}
-                placeholder="react-native-hyperswitch-{name}"
-                className="flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:border-orange-500 focus:outline-none"
+                value={packageNameOverride}
+                onChange={(e) => setPackageNameOverride(e.target.value)}
+                placeholder={`react-native-hyperswitch-${sdkName.trim().toLowerCase() || "{sdk-name}"}`}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-600 focus:border-orange-500 focus:outline-none font-mono"
               />
-            )}
+              <p className="mt-1 text-xs text-slate-600">
+                Leave blank unless the package already exists under a non-standard name. The scaffolder runs automatically if the package doesn't exist yet.
+              </p>
+            </div>
+          )}
+
+          {/* Base branch — extend an existing feature branch instead of main */}
+          <div className="mb-5">
+            <label className="block text-xs text-slate-400 mb-1">
+              Base Branch <span className="text-slate-600">(optional — defaults to main)</span>
+            </label>
+            <input
+              type="text"
+              value={baseBranch}
+              onChange={(e) => setBaseBranch(e.target.value)}
+              placeholder="main"
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 placeholder:text-slate-600 focus:border-orange-500 focus:outline-none font-mono"
+            />
+            <p className="mt-1 text-xs text-slate-600">
+              Fill in when extending work that already exists on another feature branch (e.g. adding a new payment method to a package being built in another PR). The feature branch is created off this branch instead of main, and the scaffolder skips if the package already exists.
+            </p>
           </div>
 
-          {/* Advanced */}
           <div className="mb-6">
             <button
               onClick={() => setShowAdvanced(!showAdvanced)}
@@ -449,6 +480,38 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
                   if (!errored) return null;
                 }
 
+                // coder_prompt: render as a collapsible row that expands to show the full prompt text.
+                if (p.type === "coder_prompt") {
+                  const promptText = (p.data as { prompt?: string } | undefined)?.prompt ?? "";
+                  const expanded = expandedPrompts.has(i);
+                  return (
+                    <div key={i} className="py-1">
+                      <button
+                        onClick={() =>
+                          setExpandedPrompts((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(i)) next.delete(i);
+                            else next.add(i);
+                            return next;
+                          })
+                        }
+                        className="flex items-start gap-2 text-xs w-full text-left hover:text-slate-200"
+                      >
+                        <span className="text-slate-500">{expanded ? "v" : ">"}</span>
+                        {p.repo && <span className="text-orange-400/70">[{p.repo}]</span>}
+                        <span className="text-slate-400">
+                          {p.message} <span className="text-slate-600">({promptText.length.toLocaleString()} chars)</span>
+                        </span>
+                      </button>
+                      {expanded && (
+                        <pre className="mt-1 rounded border border-slate-800 bg-slate-950 p-3 text-xs text-slate-300 font-mono whitespace-pre-wrap max-h-96 overflow-y-auto">
+                          {promptText}
+                        </pre>
+                      )}
+                    </div>
+                  );
+                }
+
                 const isPhase = p.type === "phase";
                 const rowClass = isPhase
                   ? "flex items-start gap-2 text-xs py-1 mt-1 border-t border-slate-800 pt-1.5"
@@ -497,6 +560,18 @@ export function SdkIntegratorForm({ onResult, onError }: SkillFormProps) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ─── Section Header ──────────────────────────────────────────────────────────
+
+function SectionHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+  return (
+    <div className="mb-3 mt-5 first:mt-0">
+      <div className="text-xs font-semibold text-slate-300 uppercase tracking-wider">{title}</div>
+      {subtitle && <div className="mt-0.5 text-xs text-slate-500">{subtitle}</div>}
+      <div className="mt-2 h-px bg-slate-800" />
     </div>
   );
 }

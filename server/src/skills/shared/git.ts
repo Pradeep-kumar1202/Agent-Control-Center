@@ -29,25 +29,46 @@ async function discardIgnoredPaths(
 export async function setupBranch(
   repoKey: ExtendedRepoKey,
   branchName: string,
+  /** Optional explicit base branch to branch off (e.g. another feature branch
+   *  that already has partial work). If omitted, branches off main/master/develop. */
+  baseBranch?: string,
 ): Promise<{ git: ReturnType<typeof simpleGit>; defaultBranch: string }> {
   const repoDir = REPOS[repoKey].dir;
   const git = simpleGit(repoDir);
 
+  // Reset tracked files, then wipe untracked files/dirs. Without `clean -fd`,
+  // half-written scaffolds or coder Writes from a crashed prior run persist as
+  // untracked, and `scaffoldRnPackage` silently skips ("already exists").
   await git.raw(["checkout", "--force", "HEAD"]);
-  let currentBranch = (await git.branch()).current || "main";
+  await git.raw(["clean", "-fd"]);
 
-  // If we're sitting on the feature branch from a prior run, hop off so we can
-  // recreate it cleanly. Resolve a sane default to land on.
-  if (currentBranch === branchName) {
-    const branches = await git.branch();
-    const fallback =
-      ["main", "master", "develop"].find((b) => branches.all.includes(b)) ||
-      branches.all.find((b) => b !== branchName) ||
-      "main";
-    await git.checkout(fallback);
-    currentBranch = fallback;
+  let defaultBranch: string;
+  if (baseBranch) {
+    // Caller asked to branch off a specific base. Fetch it (it may not be local
+    // yet) and check it out. This lets runs extend work from an existing feature
+    // branch instead of starting fresh from main.
+    try {
+      await git.fetch("origin", baseBranch);
+    } catch {
+      /* base may already be local, or origin may not have it — fall through */
+    }
+    await git.checkout(baseBranch);
+    defaultBranch = baseBranch;
+  } else {
+    let currentBranch = (await git.branch()).current || "main";
+    // If we're sitting on the feature branch from a prior run, hop off so we
+    // can recreate it cleanly. Resolve a sane default to land on.
+    if (currentBranch === branchName) {
+      const branches = await git.branch();
+      const fallback =
+        ["main", "master", "develop"].find((b) => branches.all.includes(b)) ||
+        branches.all.find((b) => b !== branchName) ||
+        "main";
+      await git.checkout(fallback);
+      currentBranch = fallback;
+    }
+    defaultBranch = currentBranch;
   }
-  const defaultBranch = currentBranch;
 
   // -B creates the branch or resets it if it already exists.
   await git.checkout(["-B", branchName]);

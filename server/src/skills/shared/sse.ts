@@ -8,6 +8,7 @@ export interface SSEEvent {
   type:
     | "progress"
     | "phase"
+    | "coder_prompt"
     | "tool_use"
     | "tool_result"
     | "text"

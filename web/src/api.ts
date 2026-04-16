@@ -581,8 +581,10 @@ export interface IntegrationSpec {
   classification: SdkClassification;
   targets: Array<"web" | "mobile">;
   platforms: string[];
-  newPackage?: boolean;
-  newPackageName?: string;
+  packageNameOverride?: string;
+  /** Optional existing branch to extend (e.g. another integration still in progress).
+   *  When set, the feature branch is created off this instead of main. */
+  baseBranch?: string;
   additionalContext?: string;
   /** Which sub-repos to include when target is "mobile". Defaults to both. */
   mobileSubRepos?: Array<"client_core" | "rn_packages">;
@@ -592,6 +594,7 @@ export interface IntegrationSSEEvent {
   type:
     | "progress"
     | "phase"
+    | "coder_prompt"
     | "tool_use"
     | "tool_result"
     | "text"
