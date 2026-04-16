@@ -352,3 +352,35 @@ The blocking endpoint read `evidence[0].file` server-side (≤8000 chars), injec
 - Test Writer and Props Agent now have Bash access. Watch for any unintended side effects (e.g., agent running git commands). The workspace is disposable, but worth monitoring on first run.
 
 <!-- Append new iterations below this line. Never edit history. -->
+
+---
+
+## Iteration — Official GitBook-style doc generation on every skill run
+
+**Context:** Internal dev-notes (`docs.content`) were already auto-generated after every skill run, but had a docs-team tone (`### What it does / How it was implemented`). The user wanted a second, publish-ready markdown body on each doc that matches the voice and structure of `docs.hyperswitch.io/integration-guide/payment-experience/sdk-reference/react` so a reviewer can copy the block straight into GitBook.
+
+**Decisions:**
+- **One row, two bodies.** Added nullable column `official_content TEXT` to the `docs` table rather than a separate table or a parallel row. Regeneration keeps the row id stable, so links elsewhere don't break.
+- **Auto-generate alongside internal.** `generateDoc()` still INSERTs the internal body first, then fires a second Sonnet call with an official-style prompt and UPDATEs the row. The official call is fire-and-forget — if it fails, the internal content is preserved and the UI offers a "Generate official doc" button as a fallback.
+- **Skip list for scaffolding skills.** `tests` and `review` runs do not produce public API, so the official body is gated: `NO_OFFICIAL_DOC_SKILLS = new Set(["tests", "review"])` in both the server generator and the web `OfficialBlock`. The UI shows a "scaffolding, not public API" placeholder instead of a blank block.
+- **Prompt anchoring.** `officialPrompt.ts` carries three anchors in order: (1) do/don't style rules derived from the live docs, (2) a markdown skeleton, (3) one concrete before/after few-shot modelled on the `showCardBrand` property. The few-shot is what actually pulls the model into the right register — style rules alone aren't enough.
+- **UI: two stacked cards.** The expanded doc row renders internal (top) + official (bottom). The official card has `Copy MD` (writes raw markdown to clipboard, flashes "Copied ✓" for 1.5 s) and `Regen Official` (partial regen via `POST /docs/:id/regenerate-official`, which preserves the internal body).
+- **react-markdown + remark-gfm** added to the web bundle. The old inline `renderMarkdown()` helper couldn't handle tables or fenced code blocks — both are load-bearing for the official style (options tables, `tsx` code blocks with imports). Bundle went from ~380 KB gzip → ~130 KB gzip post-build (route-specific splitting didn't regress).
+- **`regenerateDoc()` refactored to UPDATE-in-place.** Previously it did DELETE + INSERT, which reassigned the row id and silently broke any external references. New implementation preserves `id` and now also refreshes both bodies in one click.
+
+**Files changed:**
+- `server/src/db.ts` — new migration `ALTER TABLE docs ADD COLUMN official_content TEXT`, extended `DocRow` type.
+- `server/src/skills/docs/officialPrompt.ts` *(new)* — exports `buildOfficialPrompt()` with style rules, skeleton, and few-shot.
+- `server/src/skills/docs/generator.ts` — `generateDoc()` now runs a second Sonnet call, new `generateOfficialOnly()` helper, `regenerateDoc()` rewritten to UPDATE-in-place. Shared `loadSourceForDoc()` factored out of the old regen path.
+- `server/src/routes/docs.ts` — new `POST /docs/:id/regenerate-official` endpoint.
+- `web/package.json` — added `react-markdown@^10.1.0`, `remark-gfm@^4.0.1`.
+- `web/src/api.ts` — new `DocFull` type with `content` + `official_content`, `regenerateOfficialDoc()` client method, `getDoc()`/`regenerateDoc()` now return `DocFull`.
+- `web/src/skills/docs/DocsPage.tsx` — replaced custom `renderMarkdown()` with a themed `DocMarkdown` component using `react-markdown` + `remark-gfm`. Expanded row now renders two stacked cards; new `OfficialBlock` handles copy, regen, and both empty/skipped states.
+
+**Verification:** `tsc --noEmit` clean on both web and server for all touched files. `vite build` succeeds (454 KB raw, 130 KB gzip). End-to-end manual verification deferred until the dashboard is booted — the user will run the `props` skill on a trivial feature to confirm the official block renders with table + tsx code block + `**Info:**` callouts.
+
+**What the next session needs to know:**
+- Each successful skill run now burns **two** Sonnet calls instead of one (internal + official). If token spend becomes a concern, the cheapest lever is to switch the official call to `haiku` in `tryWriteOfficialContent` — the prompt is heavily anchored, so a smaller model should still produce usable copy.
+- The `NO_OFFICIAL_DOC_SKILLS` set lives in two files (`server/src/skills/docs/generator.ts` and `web/src/skills/docs/DocsPage.tsx`) and must stay in sync. Adding a new skill that shouldn't get public docs means editing both.
+- Old doc rows created before this iteration have `official_content = NULL` and render with a "Generate official doc" button instead of the block — no bulk migration was run. A user can backfill any row by clicking the button.
+- The `regenerateDoc()` row-id preservation is a behaviour change: any caller that assumed a new id after regen will now get the same id. Grep showed no such callers at the time of writing.

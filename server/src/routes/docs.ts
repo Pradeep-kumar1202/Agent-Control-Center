@@ -1,16 +1,17 @@
 /**
  * Documentation routes — CRUD for auto-generated documentation.
  *
- * GET    /docs              — list all docs (summary view)
- * GET    /docs/search?q=... — search docs by title/content
- * GET    /docs/:id          — full doc with content
- * DELETE /docs/:id          — delete a doc
- * POST   /docs/:id/regenerate — re-generate from source data
+ * GET    /docs                         — list all docs (summary view)
+ * GET    /docs/search?q=...            — search docs by title/content
+ * GET    /docs/:id                     — full doc with content
+ * DELETE /docs/:id                     — delete a doc
+ * POST   /docs/:id/regenerate          — regenerate BOTH internal + official bodies
+ * POST   /docs/:id/regenerate-official — regenerate ONLY the official body
  */
 
 import { Router } from "express";
 import { db, type DocRow } from "../db.js";
-import { regenerateDoc } from "../skills/docs/generator.js";
+import { generateOfficialOnly, regenerateDoc } from "../skills/docs/generator.js";
 
 export const docsRouter = Router();
 
@@ -75,6 +76,22 @@ docsRouter.post("/docs/:id/regenerate", async (req, res) => {
     const doc = await regenerateDoc(id);
     if (!doc) {
       res.status(404).json({ error: "Doc not found or regeneration failed" });
+      return;
+    }
+    res.json(doc);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ─── Regenerate ONLY the official block (cheaper; leaves internal intact) ──
+
+docsRouter.post("/docs/:id/regenerate-official", async (req, res) => {
+  const id = Number(req.params.id);
+  try {
+    const doc = await generateOfficialOnly(id);
+    if (!doc) {
+      res.status(404).json({ error: "Doc not found" });
       return;
     }
     res.json(doc);

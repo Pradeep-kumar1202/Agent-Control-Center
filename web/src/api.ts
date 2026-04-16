@@ -322,13 +322,15 @@ export const api = {
   listDocs: () =>
     jsonFetch<DocSummary[]>(`${BASE}/docs`),
   getDoc: (id: number) =>
-    jsonFetch<DocSummary>(`${BASE}/docs/${id}`),
+    jsonFetch<DocFull>(`${BASE}/docs/${id}`),
   searchDocs: (q: string) =>
     jsonFetch<DocSummary[]>(`${BASE}/docs/search?q=${encodeURIComponent(q)}`),
   deleteDoc: (id: number) =>
     jsonFetch<{ deleted: boolean }>(`${BASE}/docs/${id}`, { method: "DELETE" }),
   regenerateDoc: (id: number) =>
-    jsonFetch<DocSummary>(`${BASE}/docs/${id}/regenerate`, { method: "POST" }),
+    jsonFetch<DocFull>(`${BASE}/docs/${id}/regenerate`, { method: "POST" }),
+  regenerateOfficialDoc: (id: number) =>
+    jsonFetch<DocFull>(`${BASE}/docs/${id}/regenerate-official`, { method: "POST" }),
   // ─── Achievements ──────────────────────────────────────────────────────────
   getAchievementsSummary: () =>
     jsonFetch<AchievementsSummary>(`${BASE}/achievements/summary`),
@@ -472,6 +474,12 @@ export interface DocSummary {
   files_json: string;
   created_at: string;
   updated_at: string;
+}
+
+/** Full doc row returned by GET /docs/:id. Carries both markdown bodies. */
+export interface DocFull extends DocSummary {
+  content: string;
+  official_content: string | null;
 }
 
 // ─── Achievements types ──────────────────────────────────────────────────────

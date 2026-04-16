@@ -201,6 +201,14 @@ try {
   db.exec(`ALTER TABLE patches ADD COLUMN pr_warning TEXT`);
 } catch { /* already exists */ }
 
+// Migrate: add official_content to docs. Populated by a second Sonnet call in
+// generateDoc() to produce GitBook-style copy matching docs.hyperswitch.io.
+// Nullable so old rows keep working and the UI can offer a "Generate official"
+// backfill button.
+try {
+  db.exec(`ALTER TABLE docs ADD COLUMN official_content TEXT`);
+} catch { /* already exists */ }
+
 // ── Seed import ─────────────────────────────────────────────────────────────
 // On a fresh clone the DB is empty. If seed/verified-gaps.json and
 // seed/dismissed-gaps.json exist (checked into git), auto-import them so
@@ -395,6 +403,7 @@ export type DocRow = {
   skill_id: string | null;
   title: string;
   content: string;
+  official_content: string | null;
   files_json: string;
   created_at: string;
   updated_at: string;
