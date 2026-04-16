@@ -16,6 +16,8 @@ import {
   REVIEWER_MODEL,
   REVIEWER_TIMEOUT_MS,
   REVIEWER_TOOLS,
+  type FixResult,
+  type Rebuttal,
   type RepoReviewLog,
   type ReviewIssue,
   type ReviewResult,
@@ -108,14 +110,42 @@ export interface ReviewLoopOpts {
   cwd: string;
   /** Collect the current diff from git. */
   getDiff: () => Promise<string>;
-  /** Build the review prompt from the current diff. */
-  buildReviewPrompt: (diff: string, previousIssues?: ReviewIssue[]) => string;
+  /**
+   * Build the review prompt from the current diff.
+   * `previousIssues` are issues the fix-coder tried to fix last round.
+   * `rebuttals` are issues the fix-coder explicitly rejected last round —
+   * the reviewer should re-evaluate those with the coder's stated reason
+   * instead of silently re-raising them.
+   */
+  buildReviewPrompt: (
+    diff: string,
+    previousIssues?: ReviewIssue[],
+    rebuttals?: Rebuttal[],
+  ) => string;
   /** Build the fix prompt from issues + diff. */
   buildFixPrompt: (issues: ReviewIssue[], diff: string) => string;
   /** Express response for SSE. */
   res: Response;
   /** Optional system prompt (e.g. codebase knowledge) passed to reviewer + fix-coder. */
   system?: string;
+}
+
+/**
+ * Best-effort parse of the fix-coder's JSON output. Returns empty rebuttals
+ * if the coder didn't emit JSON or the JSON isn't shaped right — in that
+ * case we assume every issue was accepted and silently attempted, which
+ * matches the pre-rebuttal behavior.
+ */
+function parseFixResult(text: string): FixResult {
+  try {
+    return extractJsonFromText<FixResult>(text);
+  } catch {
+    return {};
+  }
+}
+
+function keyOf(i: { file: string; check: string }): string {
+  return `${i.file}|${i.check}`;
 }
 
 /**
@@ -128,6 +158,7 @@ export async function runReviewLoop(
   const { targetLabel, cwd, getDiff, buildReviewPrompt, buildFixPrompt, res, system } = opts;
   const reviewLog: RepoReviewLog[] = [];
   let previousIssues: ReviewIssue[] | undefined;
+  let pendingRebuttals: Rebuttal[] | undefined;
   let diff = await getDiff();
 
   for (let iteration = 1; iteration <= MAX_REVIEW_ITERATIONS; iteration++) {
@@ -146,7 +177,7 @@ export async function runReviewLoop(
     try {
       let reviewText = "";
       await askStream(
-        buildReviewPrompt(diff, previousIssues),
+        buildReviewPrompt(diff, previousIssues, pendingRebuttals),
         {
           model: REVIEWER_MODEL,
           timeoutMs: REVIEWER_TIMEOUT_MS,
@@ -168,7 +199,7 @@ export async function runReviewLoop(
       };
     }
 
-    reviewLog.push({ iteration, review });
+    reviewLog.push({ iteration, review, rebuttals: pendingRebuttals });
 
     sendSSE(res, {
       type: "review_result",
@@ -204,6 +235,7 @@ export async function runReviewLoop(
       message: `Fixing ${blockersAndWarnings.length} issues`,
     });
 
+    let fixText = "";
     await askStream(
       buildFixPrompt(blockersAndWarnings, diff),
       {
@@ -213,11 +245,30 @@ export async function runReviewLoop(
         allowedTools: CODER_TOOLS,
         system,
       },
-      (chunk) => forwardCoderChunk(res, targetLabel, chunk),
+      (chunk) => {
+        forwardCoderChunk(res, targetLabel, chunk);
+        if (chunk.type === "text" && chunk.text) fixText += chunk.text;
+      },
     );
 
+    const fixResult = parseFixResult(fixText);
+    const rebuttedKeys = new Set((fixResult.rebuttals ?? []).map(keyOf));
+    const attemptedFixes = blockersAndWarnings.filter((i) => !rebuttedKeys.has(keyOf(i)));
+    pendingRebuttals = fixResult.rebuttals && fixResult.rebuttals.length > 0
+      ? fixResult.rebuttals
+      : undefined;
+
+    if (pendingRebuttals) {
+      sendSSE(res, {
+        type: "fix_result",
+        repo: targetLabel,
+        message: `Coder disputed ${pendingRebuttals.length} of ${blockersAndWarnings.length} issues`,
+        data: { rebuttals: pendingRebuttals, attempted: attemptedFixes.length },
+      });
+    }
+
     diff = await getDiff();
-    previousIssues = blockersAndWarnings;
+    previousIssues = attemptedFixes;
   }
 
   return { reviewLog, finalDiff: diff };

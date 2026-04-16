@@ -574,14 +574,30 @@ function buildIntegrationFixPrompt(
   diff: string,
 ): string {
   const blockersAndWarnings = issues.filter((i) => i.severity !== "nit");
-  return `You previously implemented the ${spec.sdkName} SDK integration. A reviewer found the following issues that MUST be fixed:
+  return `You previously implemented the **${spec.sdkName}** SDK integration. A reviewer has raised the issues below.
+
+You have the full original spec (classification + SDK doc) and tool access (Read/Grep/Glob) to verify the reviewer's claims against the actual code and requirements.
+
+${classificationBlock(spec.classification)}
+
+## Target Platforms: ${spec.platforms.join(", ")}
+
+## SDK Documentation (original requirements)
+
+<sdk-doc>
+${spec.sdkDoc.slice(0, 10000)}
+</sdk-doc>
+
+${spec.additionalContext ? `## Additional Context\n\n${spec.additionalContext}\n` : ""}
+
+## Reviewer Issues
 
 ${blockersAndWarnings
   .map(
     (i, idx) =>
-      `${idx + 1}. **[${i.severity}] ${i.check}** in \`${i.file}\`:
+      `${idx + 1}. **[${i.severity}] ${i.check}** in \`${i.file}\`
    Problem: ${i.description}
-   Fix: ${i.suggestedFix}`,
+   Reviewer's suggested fix: ${i.suggestedFix}`,
   )
   .join("\n\n")}
 
@@ -591,7 +607,30 @@ ${blockersAndWarnings
 ${diff.slice(0, 20000)}
 \`\`\`
 
-Fix ALL the issues above. Use Edit/Write/Read/Glob/Grep tools. After fixing, output a brief summary of what you changed.`;
+## What you must do
+
+For each issue above, independently judge whether the reviewer is correct given the spec and the current code:
+
+- **If the issue is valid** — fix it using Edit/Write/Read/Glob/Grep.
+- **If the issue is invalid** (reviewer misread the code, the spec explicitly requires the current behavior, the "fix" would break another part of the integration) — do NOT change the code. Instead record a rebuttal.
+
+Rebut sparingly — fixing is the default. Only reject when you can point to a concrete reason grounded in the spec or the code. A generic "this looks fine" is not a rebuttal.
+
+## Output Format
+
+After you finish, return ONLY valid JSON (no fences, no explanation around it):
+
+{
+  "fixed": [
+    { "file": "<file from issue>", "check": "<check name from issue>" }
+  ],
+  "rebuttals": [
+    { "file": "<file from issue>", "check": "<check name from issue>", "reason": "<why this issue is invalid — cite spec or code>" }
+  ],
+  "summary": "<one-line description of what you changed>"
+}
+
+Every issue above must appear in either \`fixed\` or \`rebuttals\` — use the exact \`file\` and \`check\` strings from the issue list.`;
 }
 
 // ─── Run mobile integration (single coder, two repos) ───────────────────────

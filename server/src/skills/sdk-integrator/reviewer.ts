@@ -10,9 +10,11 @@
 
 // Re-export shared types so sdk-integrator/index.ts can import everything from here
 export {
+  type FixResult,
+  type Rebuttal,
+  type RepoReviewLog,
   type ReviewIssue,
   type ReviewResult,
-  type RepoReviewLog,
   extractJsonFromText,
   REVIEWER_MODEL,
   REVIEWER_TIMEOUT_MS,
@@ -242,12 +244,18 @@ ${c.paymentExperience ? `- **Payment experience:** ${c.paymentExperience}` : ""}
 
 /**
  * Build the integration-specific review prompt. Returns a function that
- * takes (diff, previousIssues) — matching the RunReviewLoop interface.
+ * takes (diff, previousIssues, rebuttals) — matching the RunReviewLoop
+ * interface. `rebuttals` are issues the fix-coder explicitly rejected last
+ * round with a stated reason; evaluate them fresh instead of re-raising.
  */
 export function makeIntegrationReviewPrompt(
   ctx: IntegrationReviewContext,
-): (diff: string, previousIssues?: import("../shared/reviewer.js").ReviewIssue[]) => string {
-  return (diff, previousIssues) => {
+): (
+  diff: string,
+  previousIssues?: import("../shared/reviewer.js").ReviewIssue[],
+  rebuttals?: import("../shared/reviewer.js").Rebuttal[],
+) => string {
+  return (diff, previousIssues, rebuttals) => {
     const previousSection = previousIssues?.length
       ? `
 ## Previous Issues (supposedly fixed — verify they are actually resolved)
@@ -259,6 +267,26 @@ ${previousIssues
    Suggested fix: ${i.suggestedFix}`,
   )
   .join("\n")}
+`
+      : "";
+
+    const rebuttalSection = rebuttals?.length
+      ? `
+## Coder Rebuttals (issues the coder disputed — re-evaluate with their reasoning)
+
+The coder had access to the original SDK documentation and classification and explicitly rejected these issues from the previous pass. For each one, judge whether the coder's reasoning holds against the spec and the current code:
+
+- If the coder is right, DO NOT re-raise the issue this pass.
+- If the coder is wrong, raise it again as a **blocker** and sharpen the \`description\` + \`suggestedFix\` so it's unambiguous.
+- Use Read/Grep/Glob to verify the coder's claim against the actual code where needed.
+
+${rebuttals
+  .map(
+    (r, idx) =>
+      `${idx + 1}. **${r.check}** in \`${r.file}\`
+   Coder's reason for rejecting: ${r.reason}`,
+  )
+  .join("\n\n")}
 `
       : "";
 
@@ -288,7 +316,7 @@ Use your tools to:
 
 ${INTEGRATION_REVIEW_CHECKS}
 
-${previousSection}
+${previousSection}${rebuttalSection}
 
 ## SDK Documentation (for reference)
 

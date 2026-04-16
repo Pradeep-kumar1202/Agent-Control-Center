@@ -32,7 +32,7 @@ import {
   CODER_TIMEOUT_MS,
   MOBILE_CODER_TIMEOUT_MS,
 } from "../shared/coderLoop.js";
-import type { RepoReviewLog, ReviewIssue } from "../shared/reviewer.js";
+import type { Rebuttal, RepoReviewLog, ReviewIssue } from "../shared/reviewer.js";
 
 // ── Knowledge injection ──
 import { loadMobileCoderKnowledge } from "../shared/knowledge.js";
@@ -105,8 +105,11 @@ function buildSingleRepoCoderPrompt(task: string, repoKey: ExtendedRepoKey, addi
 
 // ─── Review prompt builders (simpler than integration — no classification) ───
 
-function buildCoderReviewPrompt(task: string, repoDescription: string): (diff: string, previousIssues?: ReviewIssue[]) => string {
-  return (diff, previousIssues) => {
+function buildCoderReviewPrompt(
+  task: string,
+  repoDescription: string,
+): (diff: string, previousIssues?: ReviewIssue[], rebuttals?: Rebuttal[]) => string {
+  return (diff, previousIssues, rebuttals) => {
     const previousSection = previousIssues?.length
       ? `
 ## Previous Issues (supposedly fixed — verify they are actually resolved)
@@ -118,6 +121,22 @@ ${previousIssues
    Suggested fix: ${i.suggestedFix}`,
   )
   .join("\n")}
+`
+      : "";
+
+    const rebuttalSection = rebuttals?.length
+      ? `
+## Coder Rebuttals (issues the coder disputed — re-evaluate with their reasoning)
+
+The coder explicitly rejected these issues from the previous pass. If their reasoning holds against the current code, DO NOT re-raise. If it doesn't, raise again as a **blocker** with a sharper description and suggestedFix.
+
+${rebuttals
+  .map(
+    (r, idx) =>
+      `${idx + 1}. **${r.check}** in \`${r.file}\`
+   Coder's reason for rejecting: ${r.reason}`,
+  )
+  .join("\n\n")}
 `
       : "";
 
@@ -155,7 +174,7 @@ Use your tools to:
 5. **Type safety** — Are types used correctly?
 6. **Clean diff** — No unrelated changes, no leftover boilerplate.
 
-${previousSection}
+${previousSection}${rebuttalSection}
 
 ## Diff to Review
 
@@ -190,14 +209,16 @@ function buildCoderFixPrompt(task: string, issues: ReviewIssue[], diff: string):
   const blockersAndWarnings = issues.filter((i) => i.severity !== "nit");
   return `You were working on this task: ${task}
 
-A reviewer found the following issues that MUST be fixed:
+A reviewer has raised the issues below. You have tool access (Read/Grep/Glob) to verify each claim against the actual code.
+
+## Reviewer Issues
 
 ${blockersAndWarnings
   .map(
     (i, idx) =>
-      `${idx + 1}. **[${i.severity}] ${i.check}** in \`${i.file}\`:
+      `${idx + 1}. **[${i.severity}] ${i.check}** in \`${i.file}\`
    Problem: ${i.description}
-   Fix: ${i.suggestedFix}`,
+   Reviewer's suggested fix: ${i.suggestedFix}`,
   )
   .join("\n\n")}
 
@@ -207,7 +228,30 @@ ${blockersAndWarnings
 ${diff.slice(0, 20000)}
 \`\`\`
 
-Fix ALL the issues above. Use Edit/Write/Read/Glob/Grep tools. After fixing, output a brief summary of what you changed.`;
+## What you must do
+
+For each issue, judge whether the reviewer is correct:
+
+- **Valid** — fix it using Edit/Write/Read/Glob/Grep.
+- **Invalid** (reviewer misread the code, the task explicitly requires the current behavior, the suggested "fix" would break something) — do NOT change the code. Record a rebuttal instead.
+
+Rebut sparingly — fixing is the default. Only reject when you can cite a concrete reason from the task description or the code itself.
+
+## Output Format
+
+After you finish, return ONLY valid JSON (no fences):
+
+{
+  "fixed": [
+    { "file": "<file from issue>", "check": "<check name from issue>" }
+  ],
+  "rebuttals": [
+    { "file": "<file from issue>", "check": "<check name from issue>", "reason": "<why this issue is invalid>" }
+  ],
+  "summary": "<one-line description of what you changed>"
+}
+
+Every issue above must appear in either \`fixed\` or \`rebuttals\` — use the exact \`file\` and \`check\` strings from the issue list.`;
 }
 
 // ─── Execution helpers ───────────────────────────────────────────────────────

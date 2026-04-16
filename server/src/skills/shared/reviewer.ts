@@ -21,9 +21,32 @@ export interface ReviewResult {
   summary: string;
 }
 
+/**
+ * A fix-coder's explicit rejection of a reviewer issue. Keyed by `file|check`
+ * so the next review pass can re-evaluate it with the coder's reasoning
+ * instead of silently re-raising the same issue.
+ */
+export interface Rebuttal {
+  file: string;
+  check: string;
+  reason: string;
+}
+
+/**
+ * JSON shape a fix-coder is asked to emit at the end of its run so the loop
+ * knows which issues it accepted (and fixed) vs. which it disputed.
+ */
+export interface FixResult {
+  fixed?: Array<{ file: string; check: string }>;
+  rebuttals?: Rebuttal[];
+  summary?: string;
+}
+
 export interface RepoReviewLog {
   iteration: number;
   review: ReviewResult;
+  /** Rebuttals the fix-coder raised against this iteration's issues. */
+  rebuttals?: Rebuttal[];
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ export interface SSEEvent {
     | "review_start"
     | "review_result"
     | "fix_start"
+    | "fix_result"
     | "repo_done"
     | "done"
     | "error";
