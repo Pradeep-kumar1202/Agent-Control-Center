@@ -521,8 +521,8 @@ export interface ApiChainStep {
 }
 
 export type UiEntryPoint =
-  | "branded_button"
-  | "inline_widget"
+  | "native_view"
+  | "custom_trigger_button"
   | "invisible"
   | "utility_ui"
   | "other";

@@ -32,8 +32,8 @@ const PLATFORMS = [
 ] as const;
 
 const UI_ENTRY_POINTS: { value: UiEntryPoint; label: string; example: string }[] = [
-  { value: "branded_button", label: "Branded Button", example: "PayPal, Google Pay, Apple Pay" },
-  { value: "inline_widget", label: "Inline Widget", example: "Klarna" },
+  { value: "native_view", label: "Native View", example: "Google Pay, Apple Pay, Klarna" },
+  { value: "custom_trigger_button", label: "Custom Trigger Button", example: "PayPal (RN button → launch)" },
   { value: "invisible", label: "Invisible / Programmatic", example: "Netcetera 3DS, Kount" },
   { value: "utility_ui", label: "Utility UI", example: "ScanCard camera" },
   { value: "other", label: "Other", example: "" },

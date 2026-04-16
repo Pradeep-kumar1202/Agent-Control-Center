@@ -258,10 +258,10 @@ ${sdkDoc.slice(0, 12000)}
 ## Classification Dimensions
 
 ### 1. UI Entry Point — How does the user interact with this SDK?
-- "branded_button": 1-click wallet button (Google Pay, PayPal, Apple Pay)
-- "inline_widget": Renders inside the payment form (Klarna)
-- "invisible": No UI, triggered programmatically (3DS authentication, fraud fingerprinting)
-- "utility_ui": Utility with a UI trigger (card scanner camera)
+- "native_view": Vendor ships a native view (button or inline widget) that you wrap as a React Native ViewManager. The view itself — rendered by the vendor's native code — is what the user sees. Google Pay, Apple Pay (button-shaped native view), Klarna (panel-shaped native view with ref-based authorize).
+- "custom_trigger_button": Vendor gives only a bridge/launch API, no native view. You build your own React Native button; tapping it calls the vendor's launch function. PayPal.
+- "invisible": No UI at all, bridge module called programmatically (3DS authentication, fraud fingerprinting).
+- "utility_ui": ViewManager for a helper surface that is not a payment entry (card scanner camera).
 - "other": Something else
 
 ### 2. API Chain — What sequence of API calls bootstraps this SDK?
@@ -292,7 +292,7 @@ Return ONLY valid JSON (no fences, no explanation):
   "requiresUrlScheme": <boolean>,
   "hasNativeUI": <boolean>,
   "notes": "<observations>",
-  "uiEntryPoint": "<branded_button | inline_widget | invisible | utility_ui | other>",
+  "uiEntryPoint": "<native_view | custom_trigger_button | invisible | utility_ui | other>",
   "sdkProvidesButton": <boolean or null if unknown>,
   "apiChain": {
     "knownPattern": "<session_direct | session_post_session | confirm_next_action | no_api | custom>",

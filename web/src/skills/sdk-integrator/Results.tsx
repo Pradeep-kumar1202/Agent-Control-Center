@@ -324,8 +324,8 @@ function IntegrationFooter({
 // ─── Formatting helpers ──────────────────────────────────────────────────────
 
 const UI_ENTRY_LABELS: Record<UiEntryPoint, string> = {
-  branded_button: "Branded Button",
-  inline_widget: "Inline Widget",
+  native_view: "Native View",
+  custom_trigger_button: "Custom Trigger Button",
   invisible: "Invisible",
   utility_ui: "Utility UI",
   other: "Other",

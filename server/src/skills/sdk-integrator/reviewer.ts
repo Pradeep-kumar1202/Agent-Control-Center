@@ -34,10 +34,10 @@ export interface ApiChainStep {
 }
 
 export type UiEntryPoint =
-  | "branded_button"    // 1-click wallet button (PayPal, GPay, ApplePay)
-  | "inline_widget"     // Renders inside payment sheet (Klarna)
-  | "invisible"         // No UI, triggered programmatically (Netcetera, Kount)
-  | "utility_ui"        // Utility with its own UI trigger (ScanCard camera)
+  | "native_view"           // Vendor-provided native view wrapped as RN ViewManager (GPay, ApplePay, Klarna)
+  | "custom_trigger_button" // Host-built RN button → bridge module launch call (PayPal)
+  | "invisible"             // No UI, bridge module called programmatically (Netcetera, Kount)
+  | "utility_ui"            // ViewManager for a helper surface, not a payment entry (ScanCard camera)
   | "other";
 
 export type ApiChainKnownPattern =
