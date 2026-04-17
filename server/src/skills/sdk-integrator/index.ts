@@ -89,6 +89,19 @@ interface RepoResult extends SkillRepoResult {
   reviewLog: RepoReviewLog[];
 }
 
+/**
+ * Produce a valid npm package slug from an arbitrary SDK name. Lowercases,
+ * collapses any run of non-alphanumerics (spaces, `@`, `/`, `.`, …) into a
+ * single `-`, and trims leading/trailing hyphens. "Klarna ExpressCheckout"
+ * → "klarna-expresscheckout".
+ */
+function slugifyPkgName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 // ─── Package scaffolder (`create-react-native-library`) ─────────────────────
 
 /**
@@ -131,11 +144,20 @@ async function scaffoldRnPackage(args: {
 
   // Non-interactive mode is driven by CI=1 in env (set on spawn below) — the
   // 0.49.x CLI rejects a `--no-interactive` flag explicitly, so don't pass it.
+  //
+  // Every prompt the CLI can ask MUST be covered by a flag. If any prompt is
+  // reached with stdin closed, the CLI exits 0 without scaffolding — silent
+  // success. The full set below is what 0.49.x recognises; leaving any of the
+  // author-* / repo-url fields off reintroduces the silent-success bug.
   const cliArgs = [
     "create-react-native-library@0.49.8",
     pkgName,
     "--slug", `@juspay-tech/${pkgName}`,
     "--description", `React Native wrapper for ${sdkName} SDK`,
+    "--author-name", "Juspay",
+    "--author-email", "hyperswitch@juspay.in",
+    "--author-url", "https://juspay.io",
+    "--repo-url", `https://github.com/juspay/react-native-hyperswitch`,
     // 0.49.x type options: turbo-module | fabric-view | nitro-module
     //                    | legacy-module | legacy-view | library
     // `legacy-module` matches the existing @juspay-tech packages (old-style
@@ -145,6 +167,7 @@ async function scaffoldRnPackage(args: {
     "--example", "vanilla",
   ];
 
+  let stderr = "";
   try {
     await new Promise<void>((resolve, reject) => {
       const child = spawn("npx", cliArgs, {
@@ -152,7 +175,6 @@ async function scaffoldRnPackage(args: {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, CI: "1" },
       });
-      let stderr = "";
       child.stdout?.on("data", (b) => {
         const s = b.toString().trim();
         if (s) {
@@ -166,6 +188,15 @@ async function scaffoldRnPackage(args: {
         else reject(new Error(`create-react-native-library exited ${code}: ${stderr.slice(0, 500)}`));
       });
     });
+    // Exit 0 is not enough — the CLI silently exits 0 if any interactive
+    // prompt was reached with stdin closed (e.g. a missing --author-* flag).
+    // Verify the package directory was actually written.
+    if (!fs.existsSync(pkgDir)) {
+      throw new Error(
+        `create-react-native-library exited 0 but ${pkgDir} does not exist. ` +
+          `Likely an unanswered interactive prompt — check for new flags required by the CLI. stderr: ${stderr.slice(0, 500)}`,
+      );
+    }
     sendSSE(res, {
       type: "progress",
       repo: "mobile",
@@ -436,7 +467,9 @@ The user described this flow as: ${c.apiChain.description || "see API chain step
 function buildCombinedMobilePrompt(spec: IntegrationSpec, includeClientCore: boolean, includeRnPackages: boolean): string {
   const c = spec.classification;
   const flowInstructions = getFlowInstructions(c, spec.sdkName);
-  const pkgName = spec.packageNameOverride || `react-native-hyperswitch-${spec.sdkName.toLowerCase()}`;
+  const pkgName = spec.packageNameOverride
+    ? slugifyPkgName(spec.packageNameOverride)
+    : `react-native-hyperswitch-${slugifyPkgName(spec.sdkName)}`;
 
   const repoList: string[] = [];
   if (includeClientCore) repoList.push("- `hyperswitch-client-core/` — ReScript consumer SDK (hooks, modules, types, native view bindings)");
@@ -466,7 +499,7 @@ ${spec.additionalContext ? `## Additional Context\n\n${spec.additionalContext}\n
     parts.push(`
 ### ${includeClientCore ? "Part 1: " : ""}Native Module (react-native-hyperswitch)
 
-1. Find or create the NPM package \`${pkgName}\` under \`react-native-hyperswitch/packages/@juspay-tech/\`. A builder-bob skeleton may already be scaffolded — if so, Edit on top of it. Otherwise use react-native-hyperswitch-paypal as reference.
+1. Find or create the NPM package \`${pkgName}\` under \`react-native-hyperswitch/packages/@juspay-tech/\`. A builder-bob skeleton may already be scaffolded — if so, Edit on top of it. If the directory is missing, you MAY run (Bash is scoped to this exact CLI): \`cd react-native-hyperswitch/packages/@juspay-tech && CI=1 npx create-react-native-library@0.49.8 ${pkgName} --slug @juspay-tech/${pkgName} --description "React Native wrapper for ${spec.sdkName} SDK" --type legacy-module --languages kotlin-swift --example vanilla\`, then Edit on top. Fall back to react-native-hyperswitch-paypal as a reference only if scaffolding also fails.
 
 2. Implement the native module following these critical rules:
 
@@ -681,9 +714,9 @@ async function runMobileIntegration(
   // coder Edit on top of the generated skeleton. `scaffoldRnPackage` is
   // idempotent: it no-ops when the package directory already exists.
   if (includeRnPackages && rnSetup) {
-    const pkgName =
-      spec.packageNameOverride ||
-      `react-native-hyperswitch-${spec.sdkName.toLowerCase()}`;
+    const pkgName = spec.packageNameOverride
+      ? slugifyPkgName(spec.packageNameOverride)
+      : `react-native-hyperswitch-${slugifyPkgName(spec.sdkName)}`;
     await scaffoldRnPackage({
       rnPackagesDir: REPOS.rn_packages.dir,
       pkgName,

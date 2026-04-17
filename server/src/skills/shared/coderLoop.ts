@@ -30,7 +30,14 @@ export const CODER_MODEL = "opus" as const;
 // 0 = no hard timeout; the coder runs until natural completion or user cancel.
 export const CODER_TIMEOUT_MS = 0;
 export const MOBILE_CODER_TIMEOUT_MS = 0;
-export const CODER_TOOLS = ["Edit", "Write", "Read", "Glob", "Grep"];
+export const CODER_TOOLS = [
+  "Edit",
+  "Write",
+  "Read",
+  "Glob",
+  "Grep",
+  "Bash(npx create-react-native-library:*)",
+];
 
 // ─── Stream chunk → SSE forwarder ────────────────────────────────────────────
 
