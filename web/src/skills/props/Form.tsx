@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, type PropSpec } from "../../api";
+import { usePreviewPanel } from "../../state/previewPanel";
 import type { SkillFormProps } from "../registry";
 
 const PLATFORMS = [
@@ -26,6 +27,7 @@ export function PropsForm({ onResult, onError }: SkillFormProps) {
     new Set(["web", "mobile", "android_native", "ios_native"]),
   );
   const [generating, setGenerating] = useState(false);
+  const previewPanel = usePreviewPanel();
 
   const togglePlatform = (id: string) => {
     setPlatforms((prev) => {
@@ -156,30 +158,46 @@ export function PropsForm({ onResult, onError }: SkillFormProps) {
         </div>
       </div>
 
-      <button
-        onClick={onSubmit}
-        disabled={generating || !propName.trim() || !behavior.trim() || platforms.size === 0}
-        className={
-          "rounded-lg px-5 py-2.5 font-medium text-white transition " +
-          (generating
-            ? "bg-indigo-700 cursor-wait"
-            : !propName.trim() || !behavior.trim() || platforms.size === 0
-              ? "bg-slate-700 cursor-not-allowed text-slate-500"
-              : "bg-indigo-600 hover:bg-indigo-500")
-        }
-      >
-        {generating ? (
-          <span className="inline-flex items-center gap-2">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-            </svg>
-            Generating…
-          </span>
-        ) : (
-          "Generate Prop"
-        )}
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={onSubmit}
+          disabled={generating || !propName.trim() || !behavior.trim() || platforms.size === 0}
+          className={
+            "rounded-lg px-5 py-2.5 font-medium text-white transition " +
+            (generating
+              ? "bg-indigo-700 cursor-wait"
+              : !propName.trim() || !behavior.trim() || platforms.size === 0
+                ? "bg-slate-700 cursor-not-allowed text-slate-500"
+                : "bg-indigo-600 hover:bg-indigo-500")
+          }
+        >
+          {generating ? (
+            <span className="inline-flex items-center gap-2">
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+              Generating…
+            </span>
+          ) : (
+            "Generate Prop"
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            previewPanel.open({ repoKey: "mobile", branch: "main", initialTab: "emulator" })
+          }
+          className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-300 hover:border-indigo-500 hover:text-indigo-300 inline-flex items-center gap-2"
+          title="Open the global Preview Panel — emulator stream + mock server controls"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <rect x="3" y="1" width="8" height="12" rx="1.5"/>
+            <line x1="6" y1="11" x2="8" y2="11"/>
+          </svg>
+          Preview on Emulator
+        </button>
+      </div>
     </div>
   );
 }

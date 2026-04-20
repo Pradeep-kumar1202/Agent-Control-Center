@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api, type TestWriterSpec } from "../../api";
+import { usePreviewPanel } from "../../state/previewPanel";
 import type { SkillFormProps } from "../registry";
 
 const REPO_OPTIONS = [
@@ -14,6 +15,7 @@ export function TestsForm({ onResult, onError }: SkillFormProps) {
   const [featureDescription, setFeatureDescription] = useState("");
   const [baseBranch, setBaseBranch] = useState("main");
   const [generating, setGenerating] = useState(false);
+  const previewPanel = usePreviewPanel();
 
   const onSubmit = async () => {
     if (!branch.trim() || !featureDescription.trim()) return;
@@ -107,30 +109,50 @@ export function TestsForm({ onResult, onError }: SkillFormProps) {
         </div>
       </div>
 
-      <button
-        onClick={onSubmit}
-        disabled={generating || !canSubmit}
-        className={
-          "rounded-lg px-5 py-2.5 font-medium text-white transition " +
-          (generating
-            ? "bg-emerald-700 cursor-wait"
-            : !canSubmit
-              ? "bg-slate-700 cursor-not-allowed text-slate-500"
-              : "bg-emerald-600 hover:bg-emerald-500")
-        }
-      >
-        {generating ? (
-          <span className="inline-flex items-center gap-2">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-            </svg>
-            Writing tests…
-          </span>
-        ) : (
-          "Generate Tests"
-        )}
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={onSubmit}
+          disabled={generating || !canSubmit}
+          className={
+            "rounded-lg px-5 py-2.5 font-medium text-white transition " +
+            (generating
+              ? "bg-emerald-700 cursor-wait"
+              : !canSubmit
+                ? "bg-slate-700 cursor-not-allowed text-slate-500"
+                : "bg-emerald-600 hover:bg-emerald-500")
+          }
+        >
+          {generating ? (
+            <span className="inline-flex items-center gap-2">
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+              Writing tests…
+            </span>
+          ) : (
+            "Generate Tests"
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            previewPanel.open({
+              repoKey: repo === "web" ? "web" : "mobile",
+              branch: branch.trim() || baseBranch.trim() || "main",
+              initialTab: "emulator",
+            })
+          }
+          className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-300 hover:border-emerald-500 hover:text-emerald-300 inline-flex items-center gap-2"
+          title="Open the global Preview Panel — emulator stream + mock server controls"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <rect x="3" y="1" width="8" height="12" rx="1.5"/>
+            <line x1="6" y1="11" x2="8" y2="11"/>
+          </svg>
+          Preview on Emulator
+        </button>
+      </div>
     </div>
   );
 }

@@ -14,6 +14,7 @@ import { propsRouter } from "./routes/props.js";
 import { reviewsRouter } from "./routes/reviews.js";
 import { skillsRouter } from "./routes/skills.js";
 import { stopAllPreviews } from "./skills/previewManager.js";
+import { stopMockServer } from "./skills/embeddedMockServer.js";
 
 const app = express();
 app.use(cors());
@@ -52,6 +53,11 @@ async function shutdown(signal: string): Promise<void> {
     await stopAllPreviews();
   } catch (err) {
     console.error("[server] error stopping previews:", err);
+  }
+  try {
+    await stopMockServer();
+  } catch (err) {
+    console.error("[server] error stopping mock server:", err);
   }
   server.close(() => process.exit(0));
   // Hard exit if close hangs

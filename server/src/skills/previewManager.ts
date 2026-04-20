@@ -603,6 +603,18 @@ export async function startPreview(
           : "";
       slot.error = `process exited (code=${code}, signal=${signal}) before becoming ready${hint}`;
     } else if (slot.status === "ready") {
+      // `npm run android` is a one-shot launcher (build + install + am start);
+      // its exit after BUILD SUCCESSFUL does NOT mean the preview stopped —
+      // the emulator and demo app keep running. We stay "ready" regardless of
+      // the launcher's exit code because hyperswitch-client-core's android
+      // script ends in `&& yarn run adb`, which routinely fails with a benign
+      // node_modules state error *after* the app is already installed and
+      // launched. For web-dev the process IS the live server, so exit-while-
+      // ready is a real stop.
+      if (kind === "android-emulator") {
+        pushLog(slot, `[android] launcher exited (code=${code}); emulator + app remain running`);
+        return;
+      }
       slot.status = "stopped";
     }
   });

@@ -3,7 +3,8 @@ import { api, type Gap, type GapPrRow, type PatchDoneChunk, type PatchResponse, 
 import { AgentPanel } from "./components/AgentPanel";
 import { DiffViewer } from "./components/DiffViewer";
 import { GapTable } from "./components/GapTable";
-import { PreviewDrawer } from "./components/PreviewDrawer";
+import { PreviewPanel } from "./components/PreviewPanel";
+import { usePreviewPanel } from "./state/previewPanel";
 import { SourceViewer } from "./components/SourceViewer";
 import { SKILLS_REGISTRY, type SkillEnvelopeClient } from "./skills/registry";
 import { ReviewHistory } from "./skills/review/History";
@@ -195,14 +196,7 @@ export default function App() {
   const [activePatch, setActivePatch] = useState<{ patch: PatchResponse; gapName: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<ActiveAgent>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
-  const [activePreview, setActivePreview] = useState<{
-    repoKey: "web" | "mobile";
-    branch: string;
-    prUrl?: string | null;
-    prWarning?: string | null;
-    patchId?: number | null;
-    gapName?: string;
-  } | null>(null);
+  const previewPanel = usePreviewPanel();
   const [verifyAllProgress, setVerifyAllProgress] = useState<{
     current: number;
     total: number;
@@ -414,6 +408,18 @@ export default function App() {
           {status === "running" && <span className="topbar-sha">Running…</span>}
         </div>
         <div className="topbar-actions">
+          <button
+            className="btn btn-sm"
+            onClick={() => (previewPanel.state.open ? previewPanel.close() : previewPanel.open())}
+            title="Open the live emulator + mock server panel"
+            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <rect x="3" y="1" width="8" height="12" rx="1.5"/>
+              <line x1="6" y1="11" x2="8" y2="11"/>
+            </svg>
+            {previewPanel.state.open ? "Hide Preview" : "Preview"}
+          </button>
           {status === "running" && (
             <button className="btn btn-red btn-sm" onClick={async () => { await api.cancelAnalysis(); refresh(); }}>
               Cancel
@@ -808,8 +814,10 @@ export default function App() {
                         onOpenPreview={(repoKey, branch, gapId) => {
                           const p = gapId != null ? patchData.get(gapId) : undefined;
                           const gap = gaps.find((g) => g.id === gapId);
-                          setActivePreview({
-                            repoKey, branch,
+                          previewPanel.open({
+                            repoKey,
+                            branch,
+                            initialTab: "emulator",
                             prUrl: p?.prUrl ?? null,
                             prWarning: p?.prWarning ?? null,
                             patchId: p?.patchId ?? null,
@@ -892,17 +900,7 @@ export default function App() {
         />
       )}
 
-      {activePreview && (
-        <PreviewDrawer
-          repoKey={activePreview.repoKey}
-          branch={activePreview.branch}
-          prUrl={activePreview.prUrl}
-          prWarning={activePreview.prWarning}
-          patchId={activePreview.patchId}
-          gapName={activePreview.gapName}
-          onClose={() => setActivePreview(null)}
-        />
-      )}
+      <PreviewPanel />
 
       {activeSourceGap && (
         <SourceViewer

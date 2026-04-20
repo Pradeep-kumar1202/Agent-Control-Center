@@ -296,6 +296,22 @@ export const api = {
     jsonFetch<{ lines: string[]; total: number }>(
       `${BASE}/preview/${repoKey}/logs?since=${since}`,
     ),
+  // Mock merchant server (in-process, port 5252)
+  getMockServer: () => jsonFetch<MockServerState>(`${BASE}/preview/mock-server`),
+  startMockServer: () =>
+    jsonFetch<MockServerState>(`${BASE}/preview/mock-server/start`, { method: "POST" }),
+  stopMockServer: () =>
+    jsonFetch<MockServerState>(`${BASE}/preview/mock-server/stop`, { method: "POST" }),
+  setMockServerConfig: (paymentIntentBody: Record<string, unknown>) =>
+    jsonFetch<MockServerState>(`${BASE}/preview/mock-server/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paymentIntentBody }),
+    }),
+  tailMockServerLogs: (since = 0) =>
+    jsonFetch<{ lines: string[]; total: number }>(
+      `${BASE}/preview/mock-server/logs?since=${since}`,
+    ),
   // ─── Feature Agent ─────────────────────────────────────────────────────────
   createFeatureSession: (description: string) =>
     jsonFetch<FeatureSession>(`${BASE}/feature/sessions`, {
@@ -355,6 +371,13 @@ export interface PreviewState {
   startedAt: number;
   readyAt?: number;
   error?: string;
+}
+
+export interface MockServerState {
+  running: boolean;
+  port: number;
+  startedAt: number | null;
+  paymentIntentBody: Record<string, unknown>;
 }
 
 export interface PropSpec {

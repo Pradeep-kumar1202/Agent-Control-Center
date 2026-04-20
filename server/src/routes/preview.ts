@@ -12,6 +12,13 @@ import {
   type PreviewKind,
 } from "../skills/previewManager.js";
 import { ensureWsScrcpy, wsScrcpyInfo } from "../skills/wsScrcpyManager.js";
+import {
+  getMockServerState,
+  setPaymentIntentBody,
+  startMockServer,
+  stopMockServer,
+  tailMockServerLogs,
+} from "../skills/embeddedMockServer.js";
 
 const ANDROID_HOME = process.env.ANDROID_HOME ?? "/home/sdk/android-sdk";
 
@@ -51,6 +58,47 @@ previewRouter.post("/preview/stop", async (req, res) => {
   if (!repoKey) return res.status(400).json({ error: "invalid repoKey" });
   const state = await stopPreview(repoKey);
   res.json({ stopped: state !== null, state });
+});
+
+// ─── Mock merchant server lifecycle (embedded on port 5252) ───────────────────
+//
+// Registered BEFORE the generic `/preview/:repoKey` route so that
+// `/preview/mock-server` doesn't get parsed as a repoKey param.
+
+previewRouter.get("/preview/mock-server", (_req, res) => {
+  res.json(getMockServerState());
+});
+
+previewRouter.post("/preview/mock-server/start", async (_req, res) => {
+  try {
+    const state = await startMockServer();
+    res.json(state);
+  } catch (err) {
+    res.status(503).json({ error: (err as Error).message });
+  }
+});
+
+previewRouter.post("/preview/mock-server/stop", async (_req, res) => {
+  try {
+    const state = await stopMockServer();
+    res.json(state);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+previewRouter.post("/preview/mock-server/config", (req, res) => {
+  const body = req.body?.paymentIntentBody;
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({ error: "paymentIntentBody must be a JSON object" });
+  }
+  setPaymentIntentBody(body as Record<string, unknown>);
+  res.json(getMockServerState());
+});
+
+previewRouter.get("/preview/mock-server/logs", (req, res) => {
+  const since = Number(req.query.since ?? 0);
+  res.json(tailMockServerLogs(Number.isFinite(since) ? since : 0));
 });
 
 previewRouter.get("/preview/:repoKey", (req, res) => {
