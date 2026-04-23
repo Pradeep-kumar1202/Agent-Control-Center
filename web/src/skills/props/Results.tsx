@@ -3,6 +3,8 @@ import type { SkillResultsProps } from "../registry";
 import type { SkillRepoResultClient } from "../registry";
 import { SkillShell } from "../shared/SkillShell";
 import { DiffSection } from "../shared/DiffSection";
+import { usePreviewPanel } from "../../state/previewPanel";
+import { PrStatusChip } from "../../components/PrStatusChip";
 
 export function PropsResults({ result, onClose }: SkillResultsProps) {
   const repos = Object.entries(result.results);
@@ -102,6 +104,9 @@ function PropFooter({
 }) {
   const [branchCopied, setBranchCopied] = useState(false);
   const repoDir = active.repo === "web" ? "hyperswitch-web" : "hyperswitch-client-core";
+  const previewPanel = usePreviewPanel();
+  const previewableRepo =
+    active.repo === "mobile" || active.repo === "web" ? (active.repo as "mobile" | "web") : null;
   return (
     <div className="border-t border-slate-700 px-6 py-3 space-y-2">
       {/* Branch name — prominent one-click-copy chip for easy paste into Test Generator */}
@@ -130,27 +135,38 @@ function PropFooter({
           Copy checkout cmd
         </button>
       </div>
+      {/* Preview button — only wired for mobile + web; native platforms
+          (android_native, ios_native) don't have a dashboard emulator path. */}
+      {previewableRepo && (
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-slate-500">Preview:</span>
+          <button
+            onClick={() =>
+              previewPanel.open({
+                repoKey: previewableRepo,
+                branch: active.branch,
+                initialTab: "emulator",
+              })
+            }
+            title={`Check out ${active.branch} on the ${previewableRepo} repo and launch the preview`}
+            className="flex-1 rounded border border-indigo-600 bg-indigo-500/10 px-3 py-1.5 text-xs font-medium text-indigo-300 hover:bg-indigo-500/20 inline-flex items-center justify-center gap-2"
+          >
+            <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <rect x="3" y="1" width="8" height="12" rx="1.5"/>
+              <line x1="6" y1="11" x2="8" y2="11"/>
+            </svg>
+            Preview {active.branch} on {previewableRepo === "mobile" ? "Android emulator" : "web dev server"}
+          </button>
+        </div>
+      )}
       {/* PR link or fallback */}
       <div className="flex items-center gap-3">
         {active.prUrl ? (
           <>
             <span className="text-xs text-slate-500">PR:</span>
-            <a
-              href={active.prUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex-1 truncate text-xs text-emerald-300 hover:text-emerald-200 underline underline-offset-2"
-            >
-              {active.prUrl}
-            </a>
-            <a
-              href={active.prUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="rounded border border-emerald-600 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition"
-            >
-              Open PR ↗
-            </a>
+            <div className="flex-1">
+              <PrStatusChip prUrl={active.prUrl} prNumber={active.prNumber ?? null} />
+            </div>
           </>
         ) : (
           <>

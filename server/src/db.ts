@@ -130,6 +130,43 @@ db.exec(`
     ON skill_runs(skill_id, created_at DESC);
 `);
 
+// Test-suite runs (Detox / Cypress) triggered from the Test Writer skill.
+// Persists the full NDJSON stream so a user can reopen a past run long after
+// the browser tab is closed. pass/fail counts are parsed from the runner's
+// stdout at completion time.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS test_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo            TEXT NOT NULL,            -- "web" | "mobile"
+    branch          TEXT NOT NULL,
+    pr_url          TEXT,
+    status          TEXT NOT NULL,            -- "running" | "passed" | "failed" | "error"
+    started_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    exit_code       INTEGER,
+    pass_count      INTEGER,
+    fail_count      INTEGER,
+    logs_ndjson     TEXT,
+    error_message   TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_test_runs_branch ON test_runs(repo, branch, started_at DESC);
+`);
+
+// Any row still marked "running" at boot is a dead run from a previous
+// process that crashed / was killed mid-stream. Flip to "error" so the
+// history list doesn't show a stuck spinner forever.
+try {
+  const info = db
+    .prepare(
+      `UPDATE test_runs SET status='error', ended_at=?, error_message=COALESCE(error_message, 'server restarted mid-run')
+       WHERE status='running'`,
+    )
+    .run(new Date().toISOString());
+  if (info.changes > 0) {
+    console.log(`[db] marked ${info.changes} stale test run(s) as 'error'`);
+  }
+} catch { /* table may not exist on very first boot — next run will have it */ }
+
 // Auto-generated documentation for agent actions (patches, skills, etc.)
 db.exec(`
   CREATE TABLE IF NOT EXISTS docs (
@@ -208,6 +245,20 @@ try {
 try {
   db.exec(`ALTER TABLE docs ADD COLUMN official_content TEXT`);
 } catch { /* already exists */ }
+
+// Manually curated per-PR status (draft / awaiting_review / changes_requested /
+// approved / merged / tested) keyed by pr_url. Single source of truth shared
+// across skill result footers, the patches list, and gap-linked PRs — one PR
+// has one state regardless of which surface rendered the chip. Kept separate
+// from patches.status and patches.build_status, which track the local patch
+// + build lifecycle and must not be disturbed.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pr_states (
+    pr_url     TEXT PRIMARY KEY,
+    state      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`);
 
 // ── Seed import ─────────────────────────────────────────────────────────────
 // On a fresh clone the DB is empty. If seed/verified-gaps.json and
@@ -321,6 +372,51 @@ export type GapRow = {
   verified: 0 | 1;
 };
 
+export type PrState =
+  | "draft"
+  | "awaiting_review"
+  | "changes_requested"
+  | "approved"
+  | "merged"
+  | "tested";
+
+export const PR_STATES: readonly PrState[] = [
+  "draft",
+  "awaiting_review",
+  "changes_requested",
+  "approved",
+  "merged",
+  "tested",
+];
+
+export function isPrState(v: unknown): v is PrState {
+  return typeof v === "string" && (PR_STATES as readonly string[]).includes(v);
+}
+
+export type PrStateRow = { pr_url: string; state: PrState; updated_at: string };
+
+/**
+ * Upsert or clear the manually curated state for a PR URL. Pass `null` to
+ * remove the row. Returns the updated row, or null when the caller cleared it.
+ * Caller must pre-validate `state` against isPrState / null.
+ */
+export function setPrState(prUrl: string, state: PrState | null): PrStateRow | null {
+  if (state === null) {
+    db.prepare(`DELETE FROM pr_states WHERE pr_url = ?`).run(prUrl);
+    return null;
+  }
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO pr_states (pr_url, state, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(pr_url) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
+  ).run(prUrl, state, now);
+  return { pr_url: prUrl, state, updated_at: now };
+}
+
+export function listPrStates(): PrStateRow[] {
+  return db.prepare(`SELECT * FROM pr_states`).all() as PrStateRow[];
+}
+
 export type PatchRow = {
   id: number;
   gap_id: number;
@@ -394,6 +490,21 @@ export type FeatureMessageRow = {
   content: string;
   tool_name: string | null;
   created_at: string;
+};
+
+export type TestRunRow = {
+  id: number;
+  repo: "web" | "mobile";
+  branch: string;
+  pr_url: string | null;
+  status: "running" | "passed" | "failed" | "error";
+  started_at: string;
+  ended_at: string | null;
+  exit_code: number | null;
+  pass_count: number | null;
+  fail_count: number | null;
+  logs_ndjson: string | null;
+  error_message: string | null;
 };
 
 export type DocRow = {

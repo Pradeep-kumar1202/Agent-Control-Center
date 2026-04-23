@@ -11,13 +11,17 @@ import {
   forceRestartMetro,
   type PreviewKind,
 } from "../skills/previewManager.js";
+import { BranchGoneError } from "../skills/submoduleGit.js";
 import { ensureWsScrcpy, wsScrcpyInfo } from "../skills/wsScrcpyManager.js";
 import {
+  getCredentials,
   getMockServerState,
+  setCredentials,
   setPaymentIntentBody,
   startMockServer,
   stopMockServer,
   tailMockServerLogs,
+  type Credentials,
 } from "../skills/embeddedMockServer.js";
 
 const ANDROID_HOME = process.env.ANDROID_HOME ?? "/home/sdk/android-sdk";
@@ -48,6 +52,18 @@ previewRouter.post("/preview/start", async (req, res) => {
     const state = await startPreview(repoKey, branch, kind);
     res.json(state);
   } catch (err) {
+    if (err instanceof BranchGoneError) {
+      // 409 Conflict — the client's understanding of the server state
+      // (patch row says this branch is valid) is stale. Dashboard reacts
+      // by marking the row and prompting regeneration.
+      return res.status(409).json({
+        error: "branch_gone",
+        code: "BRANCH_GONE",
+        branch: err.branch,
+        repo: err.repo,
+        message: err.message,
+      });
+    }
     console.error("[preview] start failed:", err);
     res.status(500).json({ error: (err as Error).message });
   }
@@ -99,6 +115,32 @@ previewRouter.post("/preview/mock-server/config", (req, res) => {
 previewRouter.get("/preview/mock-server/logs", (req, res) => {
   const since = Number(req.query.since ?? 0);
   res.json(tailMockServerLogs(Number.isFinite(since) ? since : 0));
+});
+
+// Hyperswitch credentials (UI-overridable at runtime). Returns the resolved
+// values (UI override OR .env fallback) plus a flag per field so the UI
+// knows whether each came from an override vs. the environment.
+previewRouter.get("/preview/mock-server/credentials", (_req, res) => {
+  res.json(getCredentials());
+});
+
+previewRouter.post("/preview/mock-server/credentials", (req, res) => {
+  const allowed: Array<keyof Credentials> = [
+    "publishableKey",
+    "secretKey",
+    "profileId",
+    "netceteraApiKey",
+    "baseUrl",
+  ];
+  const patch: Partial<Credentials> = {};
+  for (const k of allowed) {
+    const v = req.body?.[k];
+    if (typeof v === "string") patch[k] = v;
+  }
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: "no valid credential fields in body" });
+  }
+  res.json(setCredentials(patch));
 });
 
 previewRouter.get("/preview/:repoKey", (req, res) => {

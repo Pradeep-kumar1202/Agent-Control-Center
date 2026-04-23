@@ -258,3 +258,112 @@ export async function forceCheckoutBranch(
   const git = simpleGit(repoDir);
   await git.raw(["checkout", "--force", branch]);
 }
+
+/**
+ * Thrown when a branch cannot be checked out because it exists neither
+ * locally nor on the configured remote. Routes catch this to respond with
+ * 409 + a typed body, so the UI can self-heal (mark the patch row stale and
+ * prompt the user to regenerate) instead of showing a raw pathspec error.
+ */
+export class BranchGoneError extends Error {
+  readonly code = "BRANCH_GONE" as const;
+  constructor(
+    readonly branch: string,
+    readonly repo: "web" | "mobile",
+  ) {
+    super(`Branch '${branch}' does not exist locally or on remote for repo '${repo}'`);
+    this.name = "BranchGoneError";
+  }
+}
+
+/** All local branch short names in the given repo. */
+export async function listLocalBranches(repoDir: string): Promise<string[]> {
+  try {
+    const git = simpleGit(repoDir);
+    const out = await git.raw(["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+    return out.split("\n").map((l) => l.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * True if `refs/heads/<branch>` exists locally.
+ *
+ * Implemented via listLocalBranches rather than `rev-parse --verify --quiet`
+ * because simple-git's `raw()` does NOT throw when rev-parse exits non-zero
+ * under --quiet (it just resolves with an empty stdout string). Using a
+ * positive-confirmation list avoids that footgun entirely.
+ */
+export async function branchExistsLocal(repoDir: string, branch: string): Promise<boolean> {
+  const all = await listLocalBranches(repoDir);
+  return all.includes(branch);
+}
+
+/**
+ * Check which of `branches` exist on `origin`. One network call per repo.
+ * Returns a Set of remote branch names.
+ *
+ * Hard-capped at 8 s of silent time via simple-git's block timeout so a
+ * slow/unreachable origin can never stall callers (branch-health endpoint,
+ * checkoutOrRecover). On timeout or any other failure, returns an empty set
+ * — treating the branches as not-on-remote, which is the safe default.
+ */
+export async function listRemoteBranches(
+  repoDir: string,
+  branches: string[],
+): Promise<Set<string>> {
+  if (branches.length === 0) return new Set();
+  try {
+    const git = simpleGit(repoDir, { timeout: { block: 8000 } });
+    const out = await git.raw(["ls-remote", "--heads", "origin", ...branches]);
+    const found = new Set<string>();
+    for (const line of out.split("\n")) {
+      const m = line.match(/refs\/heads\/(.+)$/);
+      if (m) found.add(m[1]);
+    }
+    return found;
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Checkout a feature branch with transparent recovery from origin.
+ *
+ * 1. If the branch exists locally, reset submodules and force-checkout (same
+ *    as forceCheckoutBranch — the happy path).
+ * 2. If it's missing locally but present on origin, fetch it into a local
+ *    ref and checkout. User never sees an error.
+ * 3. If it's nowhere, throw BranchGoneError. Callers translate this into a
+ *    409 response (or a typed stream error for NDJSON endpoints).
+ *
+ * Only use for feature branches. For `main` / default-branch checkouts, keep
+ * using forceCheckoutBranch directly — a missing main is a catastrophic repo
+ * state, not a recoverable user-facing condition.
+ */
+export async function checkoutOrRecover(
+  repoDir: string,
+  repoKey: "web" | "mobile",
+  branch: string,
+): Promise<void> {
+  if (await branchExistsLocal(repoDir, branch)) {
+    await forceCheckoutBranch(repoDir, repoKey, branch);
+    return;
+  }
+  const git = simpleGit(repoDir);
+  // Probe the remote for just this one branch (fast — one ls-remote call).
+  const remote = await listRemoteBranches(repoDir, [branch]);
+  if (!remote.has(branch)) {
+    throw new BranchGoneError(branch, repoKey);
+  }
+  // Fetch into a local ref so subsequent checkout works the same as the
+  // local-branch case. The `:<dest>` ref-spec creates refs/heads/<branch>
+  // at the remote's tip.
+  try {
+    await git.raw(["fetch", "origin", `${branch}:refs/heads/${branch}`]);
+  } catch (err) {
+    throw new BranchGoneError(branch, repoKey);
+  }
+  await forceCheckoutBranch(repoDir, repoKey, branch);
+}

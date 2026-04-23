@@ -26,6 +26,13 @@ export interface PreviewPanelContext {
   prUrl?: string | null;
   prWarning?: string | null;
   gapName?: string;
+  /**
+   * Invoked when the EmulatorView (or any child that attempts a checkout)
+   * hits a BranchGoneError. The owner of the gap row (App.tsx) uses this to
+   * flip the row into the "stale — regenerate" state without the user having
+   * to refresh manually.
+   */
+  onBranchGone?: () => void;
 }
 
 export interface PreviewPanelState {

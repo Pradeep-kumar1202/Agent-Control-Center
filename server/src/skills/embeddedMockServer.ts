@@ -30,11 +30,21 @@ const LOG_CAP = 500;
 
 type Json = Record<string, unknown>;
 
+export interface Credentials {
+  publishableKey: string;
+  secretKey: string;
+  profileId: string;
+  netceteraApiKey: string;
+  baseUrl: string;
+}
+
 interface State {
   app: express.Express | null;
   server: http.Server | null;
   starting: Promise<void> | null;
   paymentIntentBody: Json;
+  /** UI-provided overrides. Empty string means "fall back to env". */
+  credentials: Credentials;
   logs: string[];
   startedAt: number | null;
 }
@@ -44,9 +54,62 @@ const state: State = {
   server: null,
   starting: null,
   paymentIntentBody: {},
+  credentials: {
+    publishableKey: "",
+    secretKey: "",
+    profileId: "",
+    netceteraApiKey: "",
+    baseUrl: "",
+  },
   logs: [],
   startedAt: null,
 };
+
+/**
+ * Resolve a credential — UI override wins, then env vars, then empty.
+ * All consumers (routes, Cypress runner) go through this so the UI can
+ * flip keys at runtime without restarting anything.
+ */
+function cred(key: keyof Credentials): string {
+  const ui = state.credentials[key];
+  if (ui) return ui;
+  switch (key) {
+    case "publishableKey": return process.env.HYPERSWITCH_PUBLISHABLE_KEY ?? "";
+    case "secretKey":      return process.env.HYPERSWITCH_SECRET_KEY ?? "";
+    case "profileId":      return process.env.PROFILE_ID ?? "";
+    case "netceteraApiKey":return process.env.NETCETERA_SDK_API_KEY ?? "";
+    case "baseUrl":
+      return (
+        process.env.HYPERSWITCH_SANDBOX_URL ??
+        process.env.HYPERSWITCH_INTEG_URL ??
+        "https://sandbox.hyperswitch.io"
+      );
+  }
+}
+
+export function getCredentials(): Credentials {
+  return {
+    publishableKey: cred("publishableKey"),
+    secretKey: cred("secretKey"),
+    profileId: cred("profileId"),
+    netceteraApiKey: cred("netceteraApiKey"),
+    baseUrl: cred("baseUrl"),
+  };
+}
+
+/** Merge UI overrides into the credentials state. Empty string clears the override. */
+export function setCredentials(patch: Partial<Credentials>): Credentials {
+  const changed: string[] = [];
+  for (const k of Object.keys(patch) as Array<keyof Credentials>) {
+    const v = patch[k];
+    if (typeof v === "string" && state.credentials[k] !== v) {
+      state.credentials[k] = v;
+      changed.push(k);
+    }
+  }
+  pushLog(`credentials updated — ${changed.length ? changed.join(", ") : "no changes"}`);
+  return getCredentials();
+}
 
 export interface MockServerState {
   running: boolean;
@@ -83,20 +146,12 @@ function pushLog(line: string): void {
   }
 }
 
-function hyperswitchBaseUrl(): string {
-  return (
-    process.env.HYPERSWITCH_SANDBOX_URL ??
-    process.env.HYPERSWITCH_INTEG_URL ??
-    "https://sandbox.hyperswitch.io"
-  );
-}
-
 async function makeHyperswitchRequest(
   endpoint: string,
   options: { method?: string; body?: string; headers?: Record<string, string> } = {},
 ): Promise<{ status: number; data: Json }> {
-  const secret = process.env.HYPERSWITCH_SECRET_KEY ?? "";
-  const url = `${hyperswitchBaseUrl()}${endpoint}`;
+  const secret = cred("secretKey");
+  const url = `${cred("baseUrl")}${endpoint}`;
   const res = await fetch(url, {
     method: options.method ?? "GET",
     headers: {
@@ -120,20 +175,20 @@ function buildApp(): express.Express {
       status: "OK",
       timestamp: new Date().toISOString(),
       environment: {
-        baseUrl: hyperswitchBaseUrl(),
-        hasSecretKey: !!process.env.HYPERSWITCH_SECRET_KEY,
-        hasPublishableKey: !!process.env.HYPERSWITCH_PUBLISHABLE_KEY,
+        baseUrl: cred("baseUrl"),
+        hasSecretKey: !!cred("secretKey"),
+        hasPublishableKey: !!cred("publishableKey"),
       },
     });
   });
 
   const handleCreatePayment = async (req: Request, res: Response): Promise<void> => {
-    const publishable = process.env.HYPERSWITCH_PUBLISHABLE_KEY ?? "";
-    const secret = process.env.HYPERSWITCH_SECRET_KEY ?? "";
+    const publishable = cred("publishableKey");
+    const secret = cred("secretKey");
     if (!publishable || !secret) {
-      pushLog(`[create-payment-intent] missing HYPERSWITCH_* env vars`);
+      pushLog(`[create-payment-intent] missing HYPERSWITCH_* credentials`);
       res.status(500).json({
-        error: "Missing HYPERSWITCH_PUBLISHABLE_KEY or HYPERSWITCH_SECRET_KEY in dashboard .env",
+        error: "Missing publishable/secret key — set them in the Preview → Credentials panel",
         timestamp: new Date().toISOString(),
       });
       return;
@@ -148,8 +203,9 @@ function buildApp(): express.Express {
       ...(req.method === "POST" && req.body ? req.body : {}),
     };
 
-    if (process.env.PROFILE_ID) {
-      paymentData.profile_id = process.env.PROFILE_ID;
+    const profileId = cred("profileId");
+    if (profileId) {
+      paymentData.profile_id = profileId;
     }
 
     pushLog(`[create-payment-intent] ${req.method} — forwarding to sandbox`);
@@ -171,7 +227,7 @@ function buildApp(): express.Express {
       res.json({
         publishableKey: publishable,
         clientSecret: data.client_secret,
-        profileId: process.env.PROFILE_ID ?? null,
+        profileId: profileId || null,
       });
     } catch (err) {
       pushLog(`[create-payment-intent] error: ${(err as Error).message}`);
@@ -187,12 +243,13 @@ function buildApp(): express.Express {
   app.post("/create-payment-intent", (req, res) => void handleCreatePayment(req, res));
 
   app.post("/create-authentication", async (req, res) => {
-    const publishable = process.env.HYPERSWITCH_PUBLISHABLE_KEY ?? "";
-    const secret = process.env.HYPERSWITCH_SECRET_KEY ?? "";
+    const publishable = cred("publishableKey");
+    const secret = cred("secretKey");
     if (!publishable || !secret) {
-      res.status(500).json({ error: "Missing HYPERSWITCH_* env vars" });
+      res.status(500).json({ error: "Missing publishable/secret key" });
       return;
     }
+    const profileId = cred("profileId");
     const authData: Json = {
       amount: 1000,
       currency: "USD",
@@ -201,7 +258,7 @@ function buildApp(): express.Express {
         email: process.env.CTP_CUSTOMER_EMAIL,
       },
       authentication_connector: "ctp_visa",
-      profile_id: process.env.PROFILE_ID,
+      profile_id: profileId,
       ...(req.body ?? {}),
     };
     pushLog(`[create-authentication] forwarding to sandbox`);
@@ -211,7 +268,7 @@ function buildApp(): express.Express {
         headers: {
           Accept: "application/json",
           "x-feature": "router-custom-be",
-          "x-profile-id": process.env.PROFILE_ID ?? "",
+          "x-profile-id": profileId,
         },
         body: JSON.stringify(authData),
       });
@@ -236,7 +293,7 @@ function buildApp(): express.Express {
   });
 
   app.get("/netcetera-sdk-api-key", (_req, res) => {
-    const key = process.env.NETCETERA_SDK_API_KEY;
+    const key = cred("netceteraApiKey");
     if (!key) {
       res.status(500).json({ error: "Not Configured", timestamp: new Date().toISOString() });
       return;

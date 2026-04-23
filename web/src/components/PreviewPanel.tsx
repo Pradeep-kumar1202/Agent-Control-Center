@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type MockServerState } from "../api";
+import { api, type HyperswitchCredentials, type MockServerState } from "../api";
 import { usePreviewPanel, type PreviewPanelTab } from "../state/previewPanel";
 import { EmulatorView } from "./EmulatorView";
 
@@ -101,6 +101,7 @@ export function PreviewPanel() {
               repoKey={state.ctx.repoKey}
               branch={state.ctx.branch}
               onSetRepo={onSetRepo}
+              onBranchGone={state.ctx.onBranchGone}
             />
           )}
           {tab === "config" && <JsonConfigTab mockState={mockState} onMockState={setMockState} />}
@@ -117,10 +118,12 @@ function EmulatorTab({
   repoKey,
   branch,
   onSetRepo,
+  onBranchGone,
 }: {
   repoKey: RepoKey;
   branch: string;
   onSetRepo: (r: RepoKey) => void;
+  onBranchGone?: () => void;
 }) {
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -153,11 +156,47 @@ function EmulatorTab({
       </div>
       <div className="flex-1 min-h-0">
         {/* Remount on repoKey/branch change so state resets cleanly. */}
-        <EmulatorView key={`${repoKey}:${branch}`} repoKey={repoKey} branch={branch} />
+        <EmulatorView key={`${repoKey}:${branch}`} repoKey={repoKey} branch={branch} onBranchGone={onBranchGone} />
       </div>
     </div>
   );
 }
+
+const DEFAULT_BILLING_PAYLOAD = {
+  amount: 2999,
+  currency: "USD",
+  authentication_type: "three_ds",
+  customer_id: "hyperswitch_demo_customer_id",
+  capture_method: "automatic",
+  email: "pradeep.kumar@juspay.in",
+  request_external_three_ds_authentication: true,
+  billing: {
+    address: {
+      line1: "1467",
+      line2: "Harrison Street",
+      line3: "Harrison Street",
+      city: "San Fransico",
+      state: "California",
+      zip: "94122",
+      country: "US",
+      first_name: "joseph",
+      last_name: "Doe",
+    },
+  },
+  shipping: {
+    address: {
+      line1: "1467",
+      line2: "Harrison Street",
+      line3: "Harrison Street",
+      city: "San Fransico",
+      state: "California",
+      zip: "94122",
+      country: "US",
+      first_name: "joseph",
+      last_name: "Doe",
+    },
+  },
+};
 
 function JsonConfigTab({
   mockState,
@@ -226,10 +265,22 @@ function JsonConfigTab({
   };
 
   return (
-    <div className="flex flex-col h-full min-h-0 p-4">
-      <div className="mb-3">
-        <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">
-          Payment Intent Body
+    <div className="flex flex-col h-full min-h-0 p-4 overflow-y-auto">
+      <CredentialsSection />
+
+      <div className="mt-5 mb-3">
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500">
+            Payment Intent Body
+          </div>
+          <button
+            type="button"
+            onClick={() => setText(JSON.stringify(DEFAULT_BILLING_PAYLOAD, null, 2))}
+            title="Replace editor contents with the default billing + shipping payload"
+            className="rounded border border-slate-700 px-2 py-1 text-[10px] font-medium text-slate-300 hover:border-indigo-500 hover:text-indigo-200"
+          >
+            Load default billing
+          </button>
         </div>
         <div className="text-[11px] text-slate-500">
           Merged into <code className="text-slate-400">/create-payment-intent</code> responses.
@@ -242,7 +293,7 @@ function JsonConfigTab({
         value={text}
         onChange={(e) => setText(e.target.value)}
         spellCheck={false}
-        className="flex-1 min-h-0 w-full rounded border border-slate-700 bg-slate-950 p-3 text-[12px] font-mono text-slate-200 focus:border-indigo-500 focus:outline-none resize-none"
+        className="min-h-[200px] w-full rounded border border-slate-700 bg-slate-950 p-3 text-[12px] font-mono text-slate-200 focus:border-indigo-500 focus:outline-none resize-y"
       />
 
       <div className="mt-2 flex items-center gap-3">
@@ -276,6 +327,126 @@ function JsonConfigTab({
           }
         >
           {applying ? "Applying…" : mockState?.running ? "Save & Apply" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Hyperswitch credentials editor. Overrides the .env values at runtime —
+ * the mock merchant server on :5252 AND the Cypress runner both read
+ * through a single `getCredentials()` helper on the server, so edits here
+ * propagate without restarting anything.
+ */
+function CredentialsSection() {
+  const [creds, setCreds] = useState<HyperswitchCredentials | null>(null);
+  const [draft, setDraft] = useState<Partial<HyperswitchCredentials>>({});
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [reveal, setReveal] = useState<Partial<Record<keyof HyperswitchCredentials, boolean>>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getMockServerCredentials()
+      .then((c) => { if (!cancelled) setCreds(c); })
+      .catch((e) => { if (!cancelled) setError((e as Error).message); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const field = (key: keyof HyperswitchCredentials, label: string, placeholder: string, masked = true) => {
+    const effective = draft[key] !== undefined ? draft[key]! : creds?.[key] ?? "";
+    const show = !masked || reveal[key];
+    return (
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between">
+          <label className="text-[10px] uppercase tracking-wider text-slate-500">{label}</label>
+          {masked && (
+            <button
+              type="button"
+              onClick={() => setReveal((r) => ({ ...r, [key]: !r[key] }))}
+              className="text-[10px] text-slate-500 hover:text-slate-300"
+            >
+              {show ? "hide" : "show"}
+            </button>
+          )}
+        </div>
+        <input
+          type={show ? "text" : "password"}
+          value={effective}
+          onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))}
+          placeholder={placeholder}
+          spellCheck={false}
+          autoComplete="off"
+          className="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-[12px] font-mono text-slate-200 placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
+        />
+      </div>
+    );
+  };
+
+  const onSave = async () => {
+    if (Object.keys(draft).length === 0) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await api.setMockServerCredentials(draft);
+      setCreds(updated);
+      setDraft({});
+      setSavedAt(Date.now());
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const dirty = Object.keys(draft).length > 0;
+
+  return (
+    <div className="rounded border border-slate-800 bg-slate-950/60 p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[10px] uppercase tracking-wider text-slate-500">Hyperswitch Credentials</div>
+        {savedAt && (
+          <span className="text-[10px] text-emerald-400">
+            saved {new Date(savedAt).toLocaleTimeString()}
+          </span>
+        )}
+      </div>
+      <div className="text-[11px] text-slate-500 mb-3">
+        Overrides apply instantly to the mock merchant server on :5252 and to Cypress env.
+        Leave a field empty to fall back to the dashboard's <code className="text-slate-400">.env</code>.
+      </div>
+      <div className="grid grid-cols-1 gap-2">
+        {field("publishableKey",  "Publishable Key", "pk_snd_…")}
+        {field("secretKey",       "Secret Key",       "snd_…")}
+        {field("profileId",       "Profile ID",       "pro_…", false)}
+        {field("netceteraApiKey", "Netcetera API Key","…")}
+        {field("baseUrl",         "Sandbox URL",      "https://sandbox.hyperswitch.io", false)}
+      </div>
+      {error && <div className="mt-2 text-[11px] text-red-400">{error}</div>}
+      <div className="mt-3 flex items-center justify-end gap-2">
+        {dirty && (
+          <button
+            type="button"
+            onClick={() => setDraft({})}
+            className="rounded border border-slate-700 px-3 py-1.5 text-[11px] text-slate-400 hover:text-slate-200"
+          >
+            Discard
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={!dirty || saving}
+          className={
+            "rounded px-3 py-1.5 text-[11px] font-medium transition " +
+            (!dirty || saving
+              ? "bg-slate-800 text-slate-600 cursor-not-allowed"
+              : "bg-indigo-600 text-white hover:bg-indigo-500")
+          }
+        >
+          {saving ? "Saving…" : "Save Credentials"}
         </button>
       </div>
     </div>

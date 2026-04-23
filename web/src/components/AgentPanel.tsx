@@ -14,6 +14,13 @@ interface Props {
   onClose: () => void;
   /** Called on successful patch generation with the patch metadata */
   onPatchSuccess: (patch: PatchDoneChunk) => void;
+  /**
+   * Called when the chat route reports that the patch's branch was deleted
+   * and can't be recovered — either via a 409 on send or a typed error
+   * chunk mid-stream. Lets App.tsx flip the gap row into the stale state
+   * so the user can regenerate instead of staring at a failing chat.
+   */
+  onBranchGone?: () => void;
 }
 
 // ─── state types ─────────────────────────────────────────────────────────────
@@ -48,6 +55,7 @@ export function AgentPanel({
   existingPatchId,
   onClose,
   onPatchSuccess,
+  onBranchGone,
 }: Props) {
   const [stage, setStage] = useState<PanelStage>(mode === "patch" ? "patching" : "chat-only");
   const [phase, setPhase] = useState<AgentPhase | null>(null);
@@ -196,6 +204,19 @@ export function AgentPanel({
         signal: ctrl.signal,
       });
       if (!r.ok || !r.body) {
+        // Pre-flight branch-gone: the server rejected before flushing any
+        // NDJSON, so there's a parseable JSON body. Translate it into the
+        // same recovery path as the mid-stream BRANCH_GONE chunk below.
+        if (r.status === 409) {
+          try {
+            const body = await r.json();
+            if (body?.code === "BRANCH_GONE") {
+              setLiveTurn((prev) => prev ? { ...prev, error: "Patch branch was deleted — regenerate from the gap row." } : prev);
+              onBranchGone?.();
+              return;
+            }
+          } catch { /* fall through to generic error */ }
+        }
         throw new Error(`chat stream failed: HTTP ${r.status}`);
       }
       for await (const chunk of readNdjson<ChatStreamChunk>(r.body)) {
@@ -204,6 +225,13 @@ export function AgentPanel({
         } else if (chunk.type === "tool_use" && chunk.tool) {
           setLiveTurn((prev) => prev ? { ...prev, toolUses: [...prev.toolUses, chunk.tool!] } : prev);
         } else if (chunk.type === "error" && chunk.error) {
+          if (chunk.code === "BRANCH_GONE") {
+            // Race: pre-flight passed but the branch vanished before the
+            // lock was acquired. Recover the same way as the 409 path.
+            setLiveTurn((prev) => prev ? { ...prev, error: "Patch branch was deleted — regenerate from the gap row." } : prev);
+            onBranchGone?.();
+            return;
+          }
           setLiveTurn((prev) => prev ? { ...prev, error: chunk.error ?? "error" } : prev);
         } else if (chunk.type === "done") {
           break;

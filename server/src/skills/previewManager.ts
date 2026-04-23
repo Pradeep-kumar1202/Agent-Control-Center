@@ -14,7 +14,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
 import { REPOS, type RepoKey } from "../config.js";
-import { forceCheckoutBranch } from "./submoduleGit.js";
+import { checkoutOrRecover } from "./submoduleGit.js";
 import { ensureMockServer, stopMockServer } from "./mockServerManager.js";
 import { ensureWsScrcpy, stopWsScrcpy } from "./wsScrcpyManager.js";
 
@@ -483,8 +483,11 @@ export async function startPreview(
 
   const repoDir = REPOS[repoKey].dir;
 
-  // Reset submodules + force-checkout the feature branch via the shared helper.
-  await forceCheckoutBranch(repoDir, repoKey, branch);
+  // Reset submodules + checkout the feature branch. checkoutOrRecover fetches
+  // the branch transparently from origin if it's missing locally; throws
+  // BranchGoneError if it's gone entirely (the preview route converts that
+  // to a 409 so the UI can mark the patch row stale).
+  await checkoutOrRecover(repoDir, repoKey, branch);
 
   // Create the slot up front so the emulator boot logs and any boot errors
   // land in the same ring buffer the UI is already polling.
@@ -542,17 +545,40 @@ export async function startPreview(
     }
 
     pushLog(slot, `── phase 5/5: install + launch APK ─────────────────`);
+
+    // Force-uninstall the app before gradle decides nothing needs doing.
+    // Gradle's installDebug is keyed on APK content hash + device state —
+    // when the emulator already has a (possibly stale / partially-installed)
+    // io.hyperswitch.demoapp package, gradle reports "UP-TO-DATE" and
+    // skips the install. The launcher then tries `am start` and crashes
+    // with "Activity class {…/MainActivity} does not exist" because the
+    // package on the device doesn't actually match what we just built.
+    //
+    // Uninstalling forces installDebug to run. Best-effort — ignore the
+    // exit code because `adb uninstall` errors when the package isn't
+    // present, which is a fine no-op.
+    if (activeEmulatorSerial) {
+      pushLog(slot, `[android] uninstalling io.hyperswitch.demoapp on ${activeEmulatorSerial} to force a fresh install`);
+      try {
+        const r = spawnSync(
+          adbPath(),
+          ["-s", activeEmulatorSerial, "uninstall", "io.hyperswitch.demoapp"],
+          { encoding: "utf8", timeout: 30_000 },
+        );
+        pushLog(slot, `[android] uninstall → ${r.stdout.trim() || r.stderr.trim() || "done"}`);
+      } catch (e) {
+        pushLog(slot, `[android] uninstall skipped: ${(e as Error).message}`);
+      }
+    }
   }
 
-  const cmd = "npm";
-  const args = kind === "web-dev" ? ["start"] : ["run", "android"];
-
-  // ANDROID_SERIAL pins ADB, Gradle, and React Native to one specific device.
-  // This is the only reliable way to handle multiple simultaneous emulators —
-  // --deviceId only affects the RN launcher, not the Gradle installDebug task,
-  // so without ANDROID_SERIAL both emulators still get the APK and then RN
-  // trips over "adb: more than one device/emulator" or "adb: forward takes
-  // two arguments" when it tries to port-forward for each one in turn.
+  // ANDROID_SERIAL pins ADB + Gradle installDebug to our specific device.
+  // But the RN CLI launcher (`runOnAllDevices`) enumerates devices via
+  // `adb devices` which does NOT filter by ANDROID_SERIAL — so if a second
+  // emulator (e.g. a Detox Medium_Phone) was ever up, the launcher would
+  // try `am start` on the wrong one and crash with "Activity class … does
+  // not exist" (the APK is on the OTHER device). The `--deviceId` flag is
+  // how we force RN CLI to stick with our device end-to-end.
   const androidEnv: Record<string, string> = {
     FORCE_COLOR: "0",
     ANDROID_HOME,
@@ -560,8 +586,34 @@ export async function startPreview(
     ...(activeEmulatorSerial ? { ANDROID_SERIAL: activeEmulatorSerial } : {}),
   };
 
+  let cmd: string;
+  let args: string[];
+
+  if (kind === "web-dev") {
+    cmd = "npm";
+    args = ["start"];
+  } else {
+    // Repo's package.json "android" script is:
+    //   react-native run-android --appIdSuffix demoapp --main-activity .demoapp.MainActivity && yarn run adb
+    // We reproduce it here so we can also pass --deviceId. The trailing
+    // `yarn run adb` (= `adb reverse tcp:8081 tcp:8081`) runs as a follow-up
+    // step after the launcher exits — see androidExit handler below.
+    cmd = "npx";
+    args = [
+      "react-native",
+      "run-android",
+      "--appIdSuffix",
+      "demoapp",
+      "--main-activity",
+      ".demoapp.MainActivity",
+    ];
+    if (activeEmulatorSerial) {
+      args.push("--deviceId", activeEmulatorSerial);
+    }
+  }
+
   if (activeEmulatorSerial) {
-    pushLog(slot, `[android] ANDROID_SERIAL=${activeEmulatorSerial} — targeting ${PREVIEW_AVD} only`);
+    pushLog(slot, `[android] ANDROID_SERIAL=${activeEmulatorSerial} + --deviceId=${activeEmulatorSerial}`);
   }
 
   const proc = spawn(cmd, args, {
@@ -577,24 +629,60 @@ export async function startPreview(
   proc.stdout?.on("data", (b) => pushLog(slot, b.toString()));
   proc.stderr?.on("data", (b) => pushLog(slot, b.toString()));
 
-  proc.on("exit", (code, signal) => {
+  // We listen to `close` rather than `exit` so the stdio pipes are fully
+  // drained before we read `slot.logs` — using `exit` directly produced an
+  // intermittent race where BUILD SUCCESSFUL / Starting: lines had been
+  // printed but hadn't reached our ring buffer yet, and we'd mark a
+  // healthy run as failed.
+  proc.on("close", (code, signal) => {
     if (slot.status === "starting") {
-      // Special case for android: `npm run android` is install+launch, not
-      // a long-running process. A clean exit (code 0) after BUILD SUCCESSFUL
-      // is the success case — the APK is installed and the activity is
-      // running on the emulator. Without this branch the watcher's 1.5s
-      // poll loses to the exit handler and we mark a successful run as
-      // failed (race we hit on a 6s gradle build).
+      // `npm run android` is install+launch, not a long-running process. A
+      // clean finish after BUILD SUCCESSFUL means the APK is installed and
+      // (usually) already started. The repo's android script ends with
+      // `&& yarn run adb` which regularly exits non-zero *after* the app
+      // is already live, so we can't trust `code === 0`. Instead we treat
+      // BUILD SUCCESSFUL as the real signal and verify installation via
+      // adb before declaring ready.
       const tail = slot.logs.join("\n");
-      const androidLaunched =
-        kind === "android-emulator" &&
-        code === 0 &&
-        /BUILD SUCCESSFUL/i.test(tail) &&
-        /Starting:\s+Intent|Installed on \d+ device/i.test(tail);
-      if (androidLaunched) {
-        slot.status = "ready";
-        slot.readyAt = Date.now();
-        return;
+      if (kind === "android-emulator" && /BUILD SUCCESSFUL/i.test(tail)) {
+        let installed = false;
+        if (activeEmulatorSerial) {
+          const r = spawnSync(
+            adbPath(),
+            ["-s", activeEmulatorSerial, "shell", "pm", "list", "packages", "io.hyperswitch.demoapp"],
+            { encoding: "utf8", timeout: 10_000 },
+          );
+          installed = r.status === 0 && /io\.hyperswitch\.demoapp/.test(r.stdout);
+        }
+        const launchedByRn = /Starting:\s+Intent|Installed on \d+ device/i.test(tail);
+        if (installed || launchedByRn) {
+          slot.status = "ready";
+          slot.readyAt = Date.now();
+          if (activeEmulatorSerial) {
+            const r = spawnSync(
+              adbPath(),
+              ["-s", activeEmulatorSerial, "reverse", "tcp:8081", "tcp:8081"],
+              { encoding: "utf8", timeout: 10_000 },
+            );
+            pushLog(slot, `[android] adb reverse tcp:8081 → ${r.status === 0 ? "ok" : (r.stderr || r.stdout || "failed").trim()}`);
+            // If the package is on the device but the RN launcher crashed
+            // before `am start` (typical when `yarn run adb` fails mid-
+            // script), launch the activity ourselves so the user sees the
+            // app come up instead of a dead home screen.
+            if (installed && !launchedByRn) {
+              const s = spawnSync(
+                adbPath(),
+                [
+                  "-s", activeEmulatorSerial, "shell", "am", "start", "-n",
+                  "io.hyperswitch.demoapp/.demoapp.MainActivity",
+                ],
+                { encoding: "utf8", timeout: 10_000 },
+              );
+              pushLog(slot, `[android] fallback am start → ${s.status === 0 ? "ok" : (s.stderr || s.stdout || "failed").trim()}`);
+            }
+          }
+          return;
+        }
       }
       slot.status = "failed";
       const hint =
@@ -649,6 +737,22 @@ async function watchForReady(slot: PreviewSlot): Promise<void> {
         slot.status = "ready";
         slot.readyAt = Date.now();
         return;
+      }
+      // Belt-and-braces: even if BUILD SUCCESSFUL hasn't reached the log
+      // ring yet (stdio buffering), the package may already be installed.
+      // Probe adb directly every few polls so the watcher doesn't race
+      // the close-handler on fast builds.
+      if (activeEmulatorSerial) {
+        const r = spawnSync(
+          adbPath(),
+          ["-s", activeEmulatorSerial, "shell", "pm", "list", "packages", "io.hyperswitch.demoapp"],
+          { encoding: "utf8", timeout: 5_000 },
+        );
+        if (r.status === 0 && /io\.hyperswitch\.demoapp/.test(r.stdout)) {
+          slot.status = "ready";
+          slot.readyAt = Date.now();
+          return;
+        }
       }
     }
 

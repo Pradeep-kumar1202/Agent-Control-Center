@@ -1,12 +1,20 @@
 import { useState } from "react";
 import type { Gap, GapPrRow } from "../api";
 import { PreviewButton } from "./PreviewButton";
+import { PrStatusChip } from "./PrStatusChip";
 
 interface Props {
   gaps: Gap[];
   verifying: Set<number>;
   patching: Set<number>;
   patchedGaps: Set<number>;
+  /**
+   * Subset of `patchedGaps` whose branches are gone from both the local
+   * clone and origin. These rows render like "unpatched" (Generate Patch
+   * button) but with a small amber indicator so the user knows WHY the
+   * Chat/Preview affordances disappeared.
+   */
+  stalePatchedGaps: Set<number>;
   patchBuildStatus: Map<number, "pass" | "fail" | "skipped">;
   patchBranches: Map<number, string>;
   gapPrs: Map<string, GapPrRow[]>;
@@ -46,26 +54,12 @@ function evidenceFile(g: Gap): string {
   return f.split("/").pop() ?? f;
 }
 
-function prShortLabel(url: string): string {
-  try {
-    const u = new URL(url);
-    const prMatch = u.pathname.match(/\/pull\/(\d+)/);
-    if (prMatch) {
-      const parts = u.pathname.split("/").filter(Boolean);
-      const repo = parts[1] ?? parts[0] ?? "";
-      return `${repo} #${prMatch[1]}`;
-    }
-    return u.pathname.split("/").slice(-2).join("/");
-  } catch {
-    return url.slice(0, 30);
-  }
-}
-
 export function GapTable({
   gaps,
   verifying,
   patching,
   patchedGaps,
+  stalePatchedGaps,
   patchBuildStatus,
   patchBranches,
   gapPrs,
@@ -106,6 +100,7 @@ export function GapTable({
               isVerifying={verifying.has(g.id)}
               isPatching={patching.has(g.id)}
               hasPatched={patchedGaps.has(g.id)}
+              isStale={stalePatchedGaps.has(g.id)}
               buildStatus={patchBuildStatus.get(g.id)}
               patchBranch={patchBranches.get(g.id)}
               prs={gapPrs.get(gapPrKey(g)) ?? []}
@@ -128,6 +123,7 @@ function GapRow({
   isVerifying,
   isPatching,
   hasPatched,
+  isStale,
   buildStatus,
   patchBranch,
   prs,
@@ -142,6 +138,7 @@ function GapRow({
   isVerifying: boolean;
   isPatching: boolean;
   hasPatched: boolean;
+  isStale: boolean;
   buildStatus: "pass" | "fail" | "skipped" | undefined;
   patchBranch: string | undefined;
   prs: GapPrRow[];
@@ -152,6 +149,11 @@ function GapRow({
   onRemovePr: (prId: number, gapId: number) => Promise<void>;
   onOpenPreview: (repoKey: "web" | "mobile", branch: string, gapId: number) => void;
 }) {
+  // Treat stale rows as "not patched" from an action perspective — the old
+  // branch is gone, so Chat/Preview/build-status reporting would all fail.
+  // The row still gets a visible amber indicator so the user understands
+  // the state change (vs. a silent demotion to unverified).
+  const effectivelyPatched = hasPatched && !isStale;
   const [linkingPr, setLinkingPr] = useState(false);
   const [prInput, setPrInput] = useState("");
   const [prError, setPrError] = useState<string | null>(null);
@@ -184,7 +186,17 @@ function GapRow({
   let statusBadge: React.ReactNode;
   if (g.platform_specific === 1) {
     statusBadge = <span className="badge badge-platform">platform</span>;
-  } else if (hasPatched) {
+  } else if (isStale) {
+    statusBadge = (
+      <span
+        className="badge"
+        style={{ background: "rgba(245,158,11,0.15)", color: "var(--amber)", borderColor: "rgba(245,158,11,0.4)" }}
+        title="The patch branch was deleted — click Regenerate to rebuild."
+      >
+        branch gone
+      </span>
+    );
+  } else if (effectivelyPatched) {
     statusBadge = (
       <span className="badge badge-patched">
         patched
@@ -229,26 +241,14 @@ function GapRow({
 
       {/* Linked PRs */}
       <td>
-        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {prs.map((pr) => (
-            <div key={pr.id} style={{ display: "flex", alignItems: "center", gap: 5 }} className="group">
-              <span style={{ width: 5, height: 5, borderRadius: "50%", background: "var(--accent)", flexShrink: 0, display: "inline-block" }} />
-              <a
-                href={pr.pr_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="mono"
-                style={{ fontSize: 10, color: "var(--accent)", textDecoration: "none", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                title={pr.pr_url}
-                onMouseOver={(e) => (e.currentTarget.style.textDecoration = "underline")}
-                onMouseOut={(e) => (e.currentTarget.style.textDecoration = "none")}
-              >
-                {prShortLabel(pr.pr_url)}
-              </a>
+            <div key={pr.id} style={{ display: "flex", alignItems: "center", gap: 6 }} className="group">
+              <PrStatusChip prUrl={pr.pr_url} />
               <button
                 onClick={() => removePr(pr.id)}
                 disabled={removingPrId === pr.id}
-                style={{ marginLeft: 2, fontSize: 11, color: "var(--text3)", cursor: "pointer", background: "none", border: "none", padding: 0, opacity: 0.5, transition: "opacity .15s" }}
+                style={{ fontSize: 11, color: "var(--text3)", cursor: "pointer", background: "none", border: "none", padding: 0, opacity: 0.5, transition: "opacity .15s" }}
                 title="Remove link"
                 onMouseOver={(e) => (e.currentTarget.style.opacity = "1")}
                 onMouseOut={(e) => (e.currentTarget.style.opacity = "0.5")}
@@ -331,7 +331,7 @@ function GapRow({
             {isVerifying ? "Checking…" : g.verified === 1 ? "Verified" : "Verify"}
           </button>
 
-          {hasPatched ? (
+          {effectivelyPatched ? (
             <>
               <button
                 className="btn btn-sm btn-green"
@@ -354,6 +354,7 @@ function GapRow({
               className={`btn btn-sm ${!g.platform_specific && !isPatching ? "btn-amber" : ""}`}
               disabled={isPatching || g.platform_specific === 1}
               onClick={() => onPatch(g.id)}
+              title={isStale ? "The previous patch's branch was deleted — this will build a fresh one." : undefined}
               style={
                 g.platform_specific === 1
                   ? { borderColor: "var(--border)", color: "var(--text3)", cursor: "default" }
@@ -362,7 +363,7 @@ function GapRow({
                     : {}
               }
             >
-              {isPatching ? "Generating…" : "Generate Patch"}
+              {isPatching ? "Generating…" : isStale ? "Regenerate" : "Generate Patch"}
             </button>
           )}
         </div>

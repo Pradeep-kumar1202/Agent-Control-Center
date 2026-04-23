@@ -3,6 +3,7 @@ import type { SkillResultsProps } from "../registry";
 import { SkillShell } from "../shared/SkillShell";
 import { DiffSection } from "../shared/DiffSection";
 import { TestRunner } from "./TestRunner";
+import { PrStatusChip } from "../../components/PrStatusChip";
 
 export function TestsResults({ result, onClose }: SkillResultsProps) {
   const repos = Object.entries(result.results);
@@ -55,22 +56,9 @@ export function TestsResults({ result, onClose }: SkillResultsProps) {
                   {active.prUrl ? (
                     <>
                       <span className="text-xs text-slate-500">PR:</span>
-                      <a
-                        href={active.prUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="flex-1 truncate text-xs text-emerald-300 hover:text-emerald-200 underline underline-offset-2"
-                      >
-                        {active.prUrl}
-                      </a>
-                      <a
-                        href={active.prUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="rounded border border-emerald-600 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 transition"
-                      >
-                        Open PR ↗
-                      </a>
+                      <div className="flex-1">
+                        <PrStatusChip prUrl={active.prUrl} prNumber={active.prNumber ?? null} />
+                      </div>
                     </>
                   ) : active.prWarning ? (
                     <>

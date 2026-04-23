@@ -2,11 +2,18 @@ import { Router } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../config.js";
-import { db, nowIso, type GapRow } from "../db.js";
+import { db, isPrState, listPrStates, nowIso, setPrState, type GapRow } from "../db.js";
 import { ask, askStream } from "../llm.js";
 import { generateDoc } from "../skills/docs/generator.js";
 import simpleGit from "simple-git";
-import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../skills/submoduleGit.js";
+import {
+  commitWithSubmodules,
+  getDiffWithSubmodules,
+  resetSubmodules,
+  forceCheckoutBranch,
+  listLocalBranches,
+  listRemoteBranches,
+} from "../skills/submoduleGit.js";
 import { runRescriptBuild } from "../skills/buildCheck.js";
 import { pushBranchToFork, createPullRequest, formatPrBody, pushSubmoduleToFork, rewriteGitmodulesToForks, commitsAheadOfForkMain } from "../skills/githubPr.js";
 import { withRepoLock } from "../workspace/mutex.js";
@@ -590,6 +597,59 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
   }
 });
 
+/**
+ * GET /patches/branch-health
+ *
+ * For every row in patches, report whether its branch can actually be
+ * checked out. The dashboard calls this alongside GET /patches on load so
+ * it can mark "stale" rows (patch exists but branch was deleted locally
+ * and isn't recoverable from origin) before the user clicks anything.
+ *
+ * One local `for-each-ref` per repo + at most one `ls-remote --heads` per
+ * repo (only for branches missing locally). Typical cost: <200 ms.
+ *
+ * Registered BEFORE /patches/:id so Express doesn't parse "branch-health"
+ * as a numeric id and reply with "patch not found".
+ */
+patchesRouter.get("/patches/branch-health", async (_req, res) => {
+  try {
+    const rows = db
+      .prepare("SELECT id, repo, branch FROM patches")
+      .all() as Array<{ id: number; repo: string; branch: string }>;
+    if (rows.length === 0) return res.json({});
+
+    const byRepo = new Map<RepoKey, typeof rows>();
+    for (const r of rows) {
+      const key = r.repo as RepoKey;
+      if (!(key in REPOS)) continue;
+      const bucket = byRepo.get(key) ?? [];
+      bucket.push(r);
+      byRepo.set(key, bucket);
+    }
+
+    const result: Record<number, { exists: boolean; recoverable: boolean }> = {};
+    for (const [repoKey, bucket] of byRepo) {
+      const repoDir = REPOS[repoKey].dir;
+      const localSet = new Set(await listLocalBranches(repoDir));
+      const missing = bucket.filter((r) => !localSet.has(r.branch));
+      const remoteSet = missing.length > 0
+        ? await listRemoteBranches(repoDir, missing.map((r) => r.branch))
+        : new Set<string>();
+      for (const r of bucket) {
+        const exists = localSet.has(r.branch);
+        result[r.id] = {
+          exists,
+          recoverable: exists || remoteSet.has(r.branch),
+        };
+      }
+    }
+    res.json(result);
+  } catch (err) {
+    console.error("[patches] branch-health failed:", err);
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 /** GET /patches/:id */
 patchesRouter.get("/patches/:id", async (req, res) => {
   const patchId = Number(req.params.id);
@@ -620,6 +680,40 @@ patchesRouter.get("/patches", (_req, res) => {
     )
     .all();
   res.json(rows);
+});
+
+/**
+ * GET /pr-states — return the full pr_url → state map. The payload is one
+ * row per PR the user has set a status on, so it stays tiny (a few dozen rows
+ * at most). Pages that render PR chips fetch this once on mount.
+ */
+patchesRouter.get("/pr-states", (_req, res) => {
+  const rows = listPrStates();
+  const map: Record<string, { state: string; updated_at: string }> = {};
+  for (const r of rows) map[r.pr_url] = { state: r.state, updated_at: r.updated_at };
+  res.json(map);
+});
+
+/**
+ * POST /pr-state — upsert or clear the manual PR status for a URL.
+ * Body: { pr_url: string, state: PrState | null }
+ * Single URL-keyed source of truth shared across skill result footers, the
+ * patches list, and gap-linked PRs. Independent of patches.status /
+ * patches.build_status.
+ */
+patchesRouter.post("/pr-state", (req, res) => {
+  const body = (req.body ?? {}) as { pr_url?: unknown; state?: unknown };
+  const prUrl = body.pr_url;
+  if (typeof prUrl !== "string" || !prUrl.startsWith("http")) {
+    return res.status(400).json({ error: "pr_url must be a valid URL" });
+  }
+  const raw = body.state;
+  const state = raw === null || raw === undefined ? null : raw;
+  if (state !== null && !isPrState(state)) {
+    return res.status(400).json({ error: "invalid pr state" });
+  }
+  const row = setPrState(prUrl, state);
+  res.json({ pr_url: prUrl, state: row?.state ?? null, updated_at: row?.updated_at ?? null });
 });
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

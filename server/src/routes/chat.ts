@@ -26,7 +26,7 @@ function dlog(msg: string): void {
 }
 import { db, nowIso, type ChatMessageRow, type GapRow, type PatchRow } from "../db.js";
 import { askStream, type StreamChunk } from "../llm.js";
-import { forceCheckoutBranch } from "../skills/submoduleGit.js";
+import { branchExistsLocal, BranchGoneError, checkoutOrRecover, listRemoteBranches } from "../skills/submoduleGit.js";
 import { withRepoLock } from "../workspace/mutex.js";
 
 export const chatRouter = Router();
@@ -226,6 +226,24 @@ chatRouter.post("/patches/:id/chat", async (req, res) => {
   const targetRepo = patch.repo as RepoKey;
   const targetDir = REPOS[targetRepo].dir;
 
+  // Pre-flight branch-existence check. The actual checkout happens inside
+  // withRepoLock below, but that path has already flushed NDJSON headers —
+  // any error there has to be streamed as a typed chunk. Doing a cheap
+  // rev-parse + ls-remote here lets us respond with a proper 409 when the
+  // branch is gone, so the dashboard's refresh loop updates promptly.
+  if (!(await branchExistsLocal(targetDir, patch.branch))) {
+    const remote = await listRemoteBranches(targetDir, [patch.branch]);
+    if (!remote.has(patch.branch)) {
+      return res.status(409).json({
+        error: "branch_gone",
+        code: "BRANCH_GONE",
+        branch: patch.branch,
+        repo: targetRepo,
+        message: `Branch '${patch.branch}' was deleted. Regenerate the patch.`,
+      });
+    }
+  }
+
   // Read stored diff (best-effort).
   let diffText = "";
   try {
@@ -297,7 +315,7 @@ chatRouter.post("/patches/:id/chat", async (req, res) => {
     dlog(`[chat] turn ${turn} — acquiring ${targetRepo} lock`);
     await withRepoLock(targetRepo, async () => {
       dlog(`[chat] turn ${turn} — lock acquired, checking out ${patch.branch}`);
-      await forceCheckoutBranch(targetDir, targetRepo, patch.branch);
+      await checkoutOrRecover(targetDir, targetRepo, patch.branch);
       dlog(`[chat] turn ${turn} — checked out, spawning claude`);
 
       await askStream(
@@ -315,7 +333,21 @@ chatRouter.post("/patches/:id/chat", async (req, res) => {
     });
     dlog(`[chat] turn ${turn} — lock released`);
   } catch (err) {
-    // Errors are already surfaced via an {type:"error"} chunk from askStream.
+    // Race: pre-flight said the branch was reachable, but it disappeared
+    // between that check and the actual checkout inside the lock. Surface
+    // the typed code so the UI can mark the row stale the same way it
+    // would have for a 409.
+    if (err instanceof BranchGoneError) {
+      writeLine({
+        type: "error",
+        code: "BRANCH_GONE",
+        error: err.message,
+        branch: err.branch,
+        repo: err.repo,
+      });
+    }
+    // All other errors are already surfaced via an {type:"error"} chunk
+    // from askStream itself.
     dlog(`[chat] turn ${turn} — FAILED: ${(err as Error).message}`);
   } finally {
     dlog(`[chat] turn ${turn} — finally: assistantLen=${assistantText.length} toolUses=${toolUses.length} clientClosed=${clientClosed} writableEnded=${res.writableEnded}`);

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type PreviewKind, type PreviewState } from "../api";
+import { api, BranchGoneError, type PreviewKind, type PreviewState } from "../api";
 
 interface Props {
   repoKey: "web" | "mobile";
@@ -8,6 +8,12 @@ interface Props {
   autoStart?: boolean;
   /** Height mode — "fill" uses flex-1 min-h-0; "fixed" uses a fixed aspect box. */
   heightMode?: "fill" | "fixed";
+  /**
+   * Called when a start/restart attempt hits a BranchGoneError (the branch
+   * for this patch no longer exists locally or on origin). Lets the parent
+   * mark the patch row stale so the user isn't stranded here.
+   */
+  onBranchGone?: () => void;
 }
 
 /** Map a click on the rendered img to the emulator's pixel coords. */
@@ -57,11 +63,12 @@ function defaultKindFor(repoKey: "web" | "mobile"): PreviewKind {
  * Extracted from the old PreviewDrawer so the PreviewPanel's Emulator tab
  * can drop it in without re-implementing any of the ADB plumbing.
  */
-export function EmulatorView({ repoKey, branch, autoStart = true, heightMode = "fill" }: Props) {
+export function EmulatorView({ repoKey, branch, autoStart = true, heightMode = "fill", onBranchGone }: Props) {
   const kind = defaultKindFor(repoKey);
   const [state, setState] = useState<PreviewState | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [branchGone, setBranchGone] = useState(false);
   const [shotTick, setShotTick] = useState(0);
   const [tapRipple, setTapRipple] = useState<{ x: number; y: number; id: number } | null>(null);
   const [mirrorPort, setMirrorPort] = useState<number | null>(null);
@@ -92,13 +99,20 @@ export function EmulatorView({ repoKey, branch, autoStart = true, heightMode = "
         if (cancelled) return;
         setState(started);
       } catch (e) {
-        if (!cancelled) setError((e as Error).message);
+        if (cancelled) return;
+        if (e instanceof BranchGoneError) {
+          setBranchGone(true);
+          setError(null);
+          onBranchGone?.();
+          return;
+        }
+        setError((e as Error).message);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [repoKey, branch, kind, autoStart]);
+  }, [repoKey, branch, kind, autoStart, onBranchGone]);
 
   // Poll preview state + logs while not stopped.
   useEffect(() => {
@@ -188,6 +202,11 @@ export function EmulatorView({ repoKey, branch, autoStart = true, heightMode = "
       const s = await api.startPreview(repoKey, branch, kind);
       setState(s);
     } catch (e) {
+      if (e instanceof BranchGoneError) {
+        setBranchGone(true);
+        onBranchGone?.();
+        return;
+      }
       setError((e as Error).message);
     }
   };
@@ -249,10 +268,20 @@ export function EmulatorView({ repoKey, branch, autoStart = true, heightMode = "
 
       {/* Viewport */}
       <div className={viewportClass}>
-        {error && (
+        {branchGone && (
+          <div className="max-w-md px-6 py-5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-center space-y-2">
+            <div className="text-sm font-semibold text-amber-300">Branch deleted</div>
+            <div className="text-xs text-amber-200/80 leading-relaxed">
+              The patch branch <code className="font-mono text-amber-100">{branch}</code> no longer exists
+              locally or on origin. The patch row has been marked for regeneration — close this panel
+              and click <span className="font-semibold">Generate Patch</span> on the gap row.
+            </div>
+          </div>
+        )}
+        {error && !branchGone && (
           <div className="text-sm text-red-400 max-w-md text-center px-4">{error}</div>
         )}
-        {!error && (!state || (state.status !== "ready")) && (
+        {!error && !branchGone && (!state || (state.status !== "ready")) && (
           <div className="flex flex-col items-center gap-3 text-center px-4">
             <div className="text-sm text-slate-500">
               {state?.status === "failed"

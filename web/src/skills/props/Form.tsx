@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { api, type PropSpec } from "../../api";
-import { usePreviewPanel } from "../../state/previewPanel";
 import type { SkillFormProps } from "../registry";
 
 const PLATFORMS = [
@@ -27,7 +26,6 @@ export function PropsForm({ onResult, onError }: SkillFormProps) {
     new Set(["web", "mobile", "android_native", "ios_native"]),
   );
   const [generating, setGenerating] = useState(false);
-  const previewPanel = usePreviewPanel();
 
   const togglePlatform = (id: string) => {
     setPlatforms((prev) => {
@@ -182,20 +180,6 @@ export function PropsForm({ onResult, onError }: SkillFormProps) {
           ) : (
             "Generate Prop"
           )}
-        </button>
-        <button
-          type="button"
-          onClick={() =>
-            previewPanel.open({ repoKey: "mobile", branch: "main", initialTab: "emulator" })
-          }
-          className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm font-medium text-slate-300 hover:border-indigo-500 hover:text-indigo-300 inline-flex items-center gap-2"
-          title="Open the global Preview Panel — emulator stream + mock server controls"
-        >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <rect x="3" y="1" width="8" height="12" rx="1.5"/>
-            <line x1="6" y1="11" x2="8" y2="11"/>
-          </svg>
-          Preview on Emulator
         </button>
       </div>
     </div>

@@ -193,6 +193,12 @@ export default function App() {
   const [patchedGaps, setPatchedGaps] = useState<Set<number>>(new Set());
   const [patchBuildStatus, setPatchBuildStatus] = useState<Map<number, "pass" | "fail" | "skipped">>(new Map());
   const [patchData, setPatchData] = useState<Map<number, PatchResponse>>(new Map());
+  // Gaps whose patch branch no longer exists in the local clone AND can't
+  // be recovered from origin. Populated from GET /patches/branch-health on
+  // every refresh, and opportunistically from any 409/BRANCH_GONE response.
+  // Stale rows still render (so the user sees "there was a patch here") but
+  // the action buttons switch to "Regenerate" instead of Chat/Preview.
+  const [stalePatchedGaps, setStalePatchedGaps] = useState<Set<number>>(new Set());
   const [activePatch, setActivePatch] = useState<{ patch: PatchResponse; gapName: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<ActiveAgent>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
@@ -216,10 +222,16 @@ export default function App() {
       const latest = await api.latestReport();
       setReport(latest);
       if (latest && latest.status === "done") {
-        const [list, patches, prRows] = await Promise.all([
+        // Branch-health is fetched alongside the patch list so every row
+        // the UI renders can be cross-checked against actual git state. If
+        // the endpoint is unavailable (old server, transient error) we fall
+        // back to treating everything as fresh — the per-action 409 path
+        // still recovers correctly.
+        const [list, patches, prRows, branchHealth] = await Promise.all([
           api.gaps(latest.id),
           api.listPatches(),
           api.listGapPrs(),
+          api.patchBranchHealth().catch(() => ({} as Awaited<ReturnType<typeof api.patchBranchHealth>>)),
         ]);
 
         const prMap = new Map<string, GapPrRow[]>();
@@ -233,6 +245,7 @@ export default function App() {
         setGaps(list);
 
         const patchedIds = new Set<number>();
+        const staleIds = new Set<number>();
         const buildMap = new Map<number, "pass" | "fail" | "skipped">();
         const dataMap = new Map<number, PatchResponse>();
 
@@ -245,9 +258,12 @@ export default function App() {
             patchedIds.add(gapId);
             if (p.build_status) buildMap.set(gapId, p.build_status as "pass" | "fail" | "skipped");
             dataMap.set(gapId, { ...patchRowToResponse(p), _patchId: p.id } as PatchResponse & { _patchId: number });
+            const health = branchHealth[p.id];
+            if (health && !health.recoverable) staleIds.add(gapId);
           }
         }
         setPatchedGaps(patchedIds);
+        setStalePatchedGaps(staleIds);
         setPatchBuildStatus(buildMap);
         setPatchData(dataMap);
       }
@@ -300,7 +316,10 @@ export default function App() {
   const onPatchGap = (id: number) => {
     const gap = gaps.find((g) => g.id === id);
     if (!gap) return;
-    if (patchedGaps.has(id)) {
+    // A stale patch (branch deleted, not recoverable) should fall through to
+    // the regenerate-from-scratch flow — the old patch branch doesn't exist,
+    // so there's nothing for the chat agent to edit against.
+    if (patchedGaps.has(id) && !stalePatchedGaps.has(id)) {
       const existing = patchData.get(id);
       const patchId = (existing as (PatchResponse & { _patchId?: number }) | undefined)?._patchId;
       setActiveAgent({ gapId: id, gapName: gap.canonical_name, mode: "chat", existingPatchId: patchId });
@@ -352,6 +371,24 @@ export default function App() {
       return next;
     });
   };
+
+  /**
+   * Mark a patch row as stale (branch was deleted and isn't recoverable).
+   * Called on 409 BRANCH_GONE from any patch-scoped action and on the
+   * typed-error stream chunk from the chat route. Updates the UI
+   * immediately (optimistic) then reconciles via refresh().
+   */
+  const onBranchGone = useCallback((gapId: number) => {
+    setStalePatchedGaps((prev) => {
+      if (prev.has(gapId)) return prev;
+      const s = new Set(prev);
+      s.add(gapId);
+      return s;
+    });
+    // Confirm against the server so we don't keep a row marked stale past
+    // a regeneration in another tab.
+    void refresh();
+  }, [refresh]);
 
   // ─── Derived state ─────────────────────────────────────────────────────────
 
@@ -803,6 +840,7 @@ export default function App() {
                         verifying={verifying}
                         patching={patching}
                         patchedGaps={patchedGaps}
+                        stalePatchedGaps={stalePatchedGaps}
                         patchBuildStatus={patchBuildStatus}
                         patchBranches={new Map(Array.from(patchData.entries()).map(([id, p]) => [id, p.branch]))}
                         gapPrs={gapPrs}
@@ -812,6 +850,13 @@ export default function App() {
                         onAddPr={onAddPr}
                         onRemovePr={onRemovePr}
                         onOpenPreview={(repoKey, branch, gapId) => {
+                          // If a concurrent refresh already flagged this gap
+                          // stale, short-circuit — no point mounting the
+                          // emulator view just to surface the same error.
+                          if (gapId != null && stalePatchedGaps.has(gapId)) {
+                            setError(`Patch branch '${branch}' no longer exists. Regenerate the patch.`);
+                            return;
+                          }
                           const p = gapId != null ? patchData.get(gapId) : undefined;
                           const gap = gaps.find((g) => g.id === gapId);
                           previewPanel.open({
@@ -822,6 +867,7 @@ export default function App() {
                             prWarning: p?.prWarning ?? null,
                             patchId: p?.patchId ?? null,
                             gapName: gap?.canonical_name,
+                            onBranchGone: gapId != null ? () => onBranchGone(gapId) : undefined,
                           });
                         }}
                       />
@@ -891,12 +937,22 @@ export default function App() {
               prWarning: patch.prWarning ?? null,
             };
             setPatchedGaps((prev) => { const s = new Set(prev); s.add(id); return s; });
+            // Regeneration produced a fresh branch — clear any stale flag so
+            // the Chat/Preview affordances come back immediately, without
+            // waiting for the refresh() round-trip below.
+            setStalePatchedGaps((prev) => {
+              if (!prev.has(id)) return prev;
+              const s = new Set(prev);
+              s.delete(id);
+              return s;
+            });
             setPatchBuildStatus((prev) => { const m = new Map(prev); m.set(id, "pass"); return m; });
             setPatchData((prev) => { const m = new Map(prev); m.set(id, patchResp); return m; });
             setPatching((prev) => { const s = new Set(prev); s.delete(id); return s; });
             setActiveAgent((prev) => prev ? { ...prev, mode: "chat", existingPatchId: patch.patchId } : null);
             refresh();
           }}
+          onBranchGone={() => onBranchGone(activeAgent.gapId)}
         />
       )}
 

@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { SkillResultsProps } from "../registry";
 import { SkillShell } from "../shared/SkillShell";
 import { DiffSection } from "../shared/DiffSection";
+import { PrStatusChip } from "../../components/PrStatusChip";
 
 export function IntegrationResults({ result, onClose }: SkillResultsProps) {
   const repos = Object.entries(result.results);
@@ -44,14 +45,7 @@ export function IntegrationResults({ result, onClose }: SkillResultsProps) {
               {/* PR link */}
               {active.prUrl && (
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <a
-                    href={active.prUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ fontSize: 12, color: "var(--accent)" }}
-                  >
-                    View PR
-                  </a>
+                  <PrStatusChip prUrl={active.prUrl} prNumber={active.prNumber ?? null} />
                 </div>
               )}
               {active.prWarning && (
