@@ -1,0 +1,91 @@
+{
+  "$comment": [
+    "Curated patch-generation benchmark. Cases are identified by their gap identity",
+    "(category + canonical_name + missing_in) rather than by DB id, because gap ids are",
+    "assigned at seed-import time and are not stable across a fresh data/app.db.",
+    "",
+    "The spread deliberately covers both categories x both directions, two medium-severity",
+    "cases, and element_style_variables as the structured-object / decomposition-mismatch",
+    "class that LEARNINGS iteration 3 identifies as the real source of difficulty.",
+    "",
+    "`pilot: true` marks the three cases used to validate the harness before committing",
+    "hours of agent time to the full set."
+  ],
+  "cases": [
+    {
+      "id": "config-mobile-payment-method-order",
+      "pilot": true,
+      "category": "config",
+      "canonicalName": "payment_method_order",
+      "missingIn": "mobile",
+      "presentIn": "web",
+      "why": "Medium severity, multi-layer: ordering affects type, parser and render order."
+    },
+    {
+      "id": "config-web-enable-partial-loading",
+      "pilot": true,
+      "category": "config",
+      "canonicalName": "enable_partial_loading",
+      "missingIn": "web",
+      "presentIn": "mobile",
+      "why": "Reverse direction (mobile -> web), exercises the other repo's idioms."
+    },
+    {
+      "id": "component-mobile-installment-options",
+      "pilot": true,
+      "category": "component",
+      "canonicalName": "installment_options",
+      "missingIn": "mobile",
+      "presentIn": "web",
+      "why": "Hardest class: medium-severity component, stresses analyst->implementer translation."
+    },
+    {
+      "id": "config-mobile-sdk-handle-confirm-payment",
+      "category": "config",
+      "canonicalName": "sdk_handle_confirm_payment",
+      "missingIn": "mobile",
+      "presentIn": "web",
+      "why": "Medium severity behavioural flag — changes control flow, not just a value."
+    },
+    {
+      "id": "config-mobile-hide-card-nickname-field",
+      "category": "config",
+      "canonicalName": "hide_card_nickname_field",
+      "missingIn": "mobile",
+      "presentIn": "web",
+      "why": "Simple boolean — the floor case. If this needs repair rounds, something is wrong."
+    },
+    {
+      "id": "config-mobile-element-style-variables",
+      "category": "config",
+      "canonicalName": "element_style_variables",
+      "missingIn": "mobile",
+      "presentIn": "web",
+      "why": "Structured object vs flattened keys — the decomposition-mismatch class from LEARNINGS."
+    },
+    {
+      "id": "config-web-hide-confirm-button",
+      "category": "config",
+      "canonicalName": "hide_confirm_button",
+      "missingIn": "web",
+      "presentIn": "mobile",
+      "why": "Second reverse-direction config case."
+    },
+    {
+      "id": "component-mobile-click-to-pay",
+      "category": "component",
+      "canonicalName": "click_to_pay",
+      "missingIn": "mobile",
+      "presentIn": "web",
+      "why": "Component gap likely to need review — records a realistic failure mode."
+    },
+    {
+      "id": "component-web-scan-card-button",
+      "category": "component",
+      "canonicalName": "scan_card_button",
+      "missingIn": "web",
+      "presentIn": "mobile",
+      "why": "Reverse-direction component; native-only capability, may be platform_specific."
+    }
+  ]
+}

@@ -23,7 +23,6 @@
  */
 
 import type { Request, Response } from "express";
-import simpleGit from "simple-git";
 import { REPOS } from "../../config.js";
 import { ask, askJson } from "../../llm.js";
 import { saveReview, saveSkillRun, type ReviewRow } from "../../db.js";
@@ -35,6 +34,7 @@ import {
   parseDiffStats,
 } from "../../agents/validators.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
+import { getBranchDiff } from "../prDiff.js";
 
 export interface ReviewSpec {
   branch: string;
@@ -71,82 +71,6 @@ export interface ReviewResult {
   };
   /** Which passes contributed to this result (for transparency) */
   passesRun: string[];
-}
-
-// ─── Diff fetching ─────────────────────────────────────────────────────────────
-
-async function getBranchDiff(
-  repoDir: string,
-  branch: string,
-  baseBranch: string,
-): Promise<{ diff: string; stat: string }> {
-  const git = simpleGit(repoDir);
-
-  if (
-    branch.startsWith("https://github.com") ||
-    branch.startsWith("http://github.com")
-  ) {
-    const prMatch = branch.match(/\/pull\/(\d+)/);
-    if (!prMatch) {
-      throw new Error(
-        "Unrecognised GitHub URL — expected a /pull/<number> URL",
-      );
-    }
-    const prNum = prMatch[1];
-    try {
-      await git.raw(["fetch", "origin", `pull/${prNum}/head`]);
-    } catch (err) {
-      throw new Error(
-        `Could not fetch PR #${prNum} from origin. ` +
-        `Make sure the workspace repo has network access to GitHub and the PR exists. ` +
-        `(${(err as Error).message ?? err})`,
-      );
-    }
-    let diff = "";
-    let stat = "";
-    try {
-      diff = await git.diff([`${baseBranch}...FETCH_HEAD`]);
-      stat = await git.diff([`${baseBranch}...FETCH_HEAD`, "--stat"]);
-    } catch {
-      diff = await git.diff([`${baseBranch}..FETCH_HEAD`]);
-      stat = await git.diff([`${baseBranch}..FETCH_HEAD`, "--stat"]);
-    }
-    return { diff, stat };
-  }
-
-  try {
-    const branches = await git.branch(["-a"]);
-    const exists = branches.all.some(
-      (b) => b.replace("remotes/origin/", "").trim() === branch,
-    );
-    if (!exists) await git.fetch("origin", branch);
-  } catch {
-    // Proceed — branch may be local-only
-  }
-
-  let diff = "";
-  let stat = "";
-  try {
-    diff = await git.diff([`${baseBranch}...${branch}`]);
-    stat = await git.diff([`${baseBranch}...${branch}`, "--stat"]);
-  } catch {
-    try {
-      diff = await git.diff([`${baseBranch}...origin/${branch}`]);
-      stat = await git.diff([`${baseBranch}...origin/${branch}`, "--stat"]);
-    } catch {
-      try {
-        diff = await git.diff([`${baseBranch}..${branch}`]);
-        stat = await git.diff([`${baseBranch}..${branch}`, "--stat"]);
-      } catch {
-        throw new Error(
-          `Could not diff "${branch}" against "${baseBranch}". ` +
-          `Ensure the branch exists locally or is fetchable from origin.`,
-        );
-      }
-    }
-  }
-
-  return { diff, stat };
 }
 
 // ─── Pass 1: Security & Payment Safety ────────────────────────────────────────
@@ -435,7 +359,7 @@ async function reviewRepo(
   const repoName =
     repoKey === "web" ? "hyperswitch-web" : "hyperswitch-client-core";
 
-  const { diff, stat } = await getBranchDiff(repoDir, spec.branch, baseBranch);
+  const { diff, stat } = await getBranchDiff(repoDir, spec.branch, baseBranch, repoKey);
 
   if (!diff) {
     const empty: ReviewResult = {
@@ -592,4 +516,3 @@ export async function handleReviewSkill(
     res.status(500).json({ error: (err as Error).message });
   }
 }
-

@@ -236,6 +236,7 @@ export async function runPropAgent(
 
   const prompt = buildPrompt(spec, repoDir);
   const summary = await ask(prompt, {
+    slot: "skill.props",
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
@@ -338,6 +339,7 @@ export async function runMobilePropAgent(
   // using submodule-aware operations.
   if (platforms.includes("mobile")) {
     const s = await ask(buildMobilePrompt(spec, repoDir), {
+      slot: "skill.props",
       model: "opus", timeoutMs: 600_000, cwd: repoDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
     });
@@ -346,6 +348,7 @@ export async function runMobilePropAgent(
 
   if (platforms.includes("android_native")) {
     const s = await ask(buildAndroidPrompt(spec, repoDir), {
+      slot: "skill.props",
       model: "opus", timeoutMs: 600_000, cwd: repoDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
     });
@@ -354,6 +357,7 @@ export async function runMobilePropAgent(
 
   if (platforms.includes("ios_native")) {
     const s = await ask(buildIosPrompt(spec, repoDir), {
+      slot: "skill.props",
       model: "opus", timeoutMs: 600_000, cwd: repoDir,
       allowedTools: ["Edit", "Write", "Read", "Glob", "Grep"],
     });

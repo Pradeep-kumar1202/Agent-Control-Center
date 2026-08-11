@@ -20,6 +20,27 @@ export class BranchGoneError extends Error {
   }
 }
 
+/**
+ * No model is assigned for one or more pipeline stages, so nothing can run.
+ * Configuration is deliberately explicit rather than defaulted — a silent
+ * fallback to some other runtime would make quality comparisons lie.
+ */
+export class AgentsNotConfiguredError extends Error {
+  readonly code = "AGENTS_NOT_CONFIGURED" as const;
+  constructor(readonly slots: string[], message?: string) {
+    super(message || `No model assigned for: ${slots.join(", ") || "one or more stages"}`);
+    this.name = "AgentsNotConfiguredError";
+  }
+}
+
+/** A runtime is missing, unauthorized, or cannot honour the requested access. */
+export class RuntimeConfigError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "RuntimeConfigError";
+  }
+}
+
 export interface Report {
   id: number;
   created_at: string;
@@ -245,6 +266,21 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
         );
       }
     }
+    // Same typed-recovery shape for runtime configuration. A run cannot start
+    // until every stage it needs has a model assigned, so the shell catches
+    // this and opens Settings rather than surfacing an opaque failure.
+    if (body && typeof body === "object") {
+      const b = body as Record<string, unknown>;
+      if (b.code === "AGENTS_NOT_CONFIGURED") {
+        throw new AgentsNotConfiguredError(
+          Array.isArray(b.slots) ? (b.slots as string[]) : [],
+          detail,
+        );
+      }
+      if (b.code === "RUNTIME_UNAVAILABLE" || b.code === "UNSUPPORTED_RUNTIME_CAPABILITY" || b.code === "MODEL_UNAUTHORIZED") {
+        throw new RuntimeConfigError(String(b.code), detail);
+      }
+    }
     throw new Error(detail ? `${r.status}: ${detail}` : `${url} → ${r.status}`);
   }
   return r.json() as Promise<T>;
@@ -258,7 +294,60 @@ function skillPost<T>(skillId: string, spec: unknown): Promise<T> {
   });
 }
 
+// ─── runtime settings ────────────────────────────────────────────────────────
+
+export interface RuntimeProfile {
+  runtime: "claude-code" | "codex" | "opencode";
+  invocation: string;
+  effort?: string;
+}
+export interface AgentSettingsPayload {
+  profiles: Record<string, RuntimeProfile>;
+  assignments: Record<string, string>;
+}
+export interface RuntimeInfo {
+  id: "claude-code" | "codex" | "opencode";
+  installed: boolean;
+  version?: string;
+  models: string[];
+  error?: string;
+  accessPolicies: string[];
+  notes: string[];
+}
+export interface SettingsResponse {
+  agents: AgentSettingsPayload;
+  patchQuality: { repairRounds: number; criticPasses: string[]; crossRuntimeVerify: boolean };
+  slots: string[];
+  accessPolicies: string[];
+  unassignedSlots: string[];
+}
+
 export const api = {
+  getSettings: () => jsonFetch<SettingsResponse>(`${BASE}/settings`),
+  putSettings: (body: { agents?: AgentSettingsPayload; patchQuality?: unknown }) =>
+    jsonFetch<{ agents: AgentSettingsPayload; warnings?: string[] }>(`${BASE}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  probeRuntimes: (refresh = false) =>
+    jsonFetch<{ runtimes: RuntimeInfo[]; cached: boolean }>(
+      `${BASE}/runtimes/probe${refresh ? "?refresh=1" : ""}`,
+    ),
+  /**
+   * Live one-token round trip. Returns the failure body instead of throwing,
+   * because "this key is blocked" is the answer the user wants to read, not an
+   * exception to handle.
+   */
+  testRuntimeRoute: async (profile: RuntimeProfile) => {
+    const r = await fetch(`${BASE}/runtimes/probe/route`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(profile),
+    });
+    return (await r.json()) as { ok: boolean; latencyMs: number; reply?: string; error?: string };
+  },
+
   health: () => jsonFetch<Health>(`${BASE}/health`),
   latestReport: () => jsonFetch<Report | null>(`${BASE}/reports/latest`),
   gaps: (reportId?: number) =>

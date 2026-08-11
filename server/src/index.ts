@@ -12,7 +12,10 @@ import { patchesRouter } from "./routes/patches.js";
 import { previewRouter } from "./routes/preview.js";
 import { propsRouter } from "./routes/props.js";
 import { reviewsRouter } from "./routes/reviews.js";
+import { settingsRouter } from "./routes/settings.js";
 import { skillsRouter } from "./routes/skills.js";
+import { lintAgents } from "./agents/loader.js";
+import { seedFromEnvIfEmpty } from "./runtime/index.js";
 import { stopAllPreviews } from "./skills/previewManager.js";
 import { stopMockServer } from "./skills/embeddedMockServer.js";
 
@@ -39,7 +42,16 @@ app.use(patchesRouter);
 app.use(previewRouter);  // /preview/* (dev-server lifecycle for demo videos)
 app.use(propsRouter);    // legacy /props/generate (backward compat)
 app.use(reviewsRouter);  // /reviews/* (review history)
+app.use(settingsRouter); // /settings, /runtimes/* (runtime + model assignment)
 app.use(skillsRouter);   // /skills/* (new unified endpoint)
+
+// Seed runtime profiles from env on first boot only, so headless runs
+// (npm run analyze, cron) work without anyone opening the Settings page.
+seedFromEnvIfEmpty();
+
+// Fail fast on a malformed agent definition: a typo in agents/*.md should
+// surface at `npm run dev`, not eight minutes into a patch run.
+for (const issue of lintAgents()) console.warn(`[agents] ${issue}`);
 
 const server = app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);

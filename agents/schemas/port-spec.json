@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Cross-SDK PR port specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["featureName", "changeKind", "behavior", "sourceFiles", "implementationSteps"],
+  "properties": {
+    "featureName": { "type": "string", "minLength": 1 },
+    "changeKind": { "enum": ["config", "component", "api", "bugfix", "refactor", "infra"] },
+    "behavior": { "type": "string", "minLength": 1 },
+    "sourceFiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "role", "whatChanged"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "role": { "type": "string", "minLength": 1 },
+          "whatChanged": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "implementationSteps": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "typeDefinition": { "type": "string" },
+    "configKey": { "type": "string" },
+    "defaultValue": { "type": "string" },
+    "reScriptGotchas": { "type": "array", "items": { "type": "string" } },
+    "notPorting": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "why"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "why": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

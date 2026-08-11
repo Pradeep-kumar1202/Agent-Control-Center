@@ -179,6 +179,7 @@ Output ONLY a JSON object — no prose, no code fences:
 {"verdict":"confirmed|false_positive|platform_specific","found_in_missing":"<path or omit>","severity":"low|medium|high","rationale":"<≤200 chars>"}`;
 
   const result = await askJson<VerdictPayload>(prompt, {
+    slot: "gap.verify",
     model: MODEL_REASON,
     timeoutMs: 300_000,
     cwd,

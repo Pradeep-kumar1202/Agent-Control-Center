@@ -461,3 +461,231 @@ The blocking endpoint read `evidence[0].file` server-side (≤8000 chars), injec
 - The chat pre-flight and the `checkoutOrRecover` inside the lock are intentionally duplicative — pre-flight handles the common case with a proper HTTP 409, the in-lock path catches races (branch disappeared between pre-flight and lock acquisition) via the stream chunk. Both are needed because NDJSON headers get flushed before the lock.
 - `stalePatchedGaps` stays in sync automatically: `refresh()` rebuilds it from branch-health every run, `onBranchGone` adds optimistically on 409, `onPatchSuccess` clears on regeneration. No manual plumbing needed in skill panels that land a new patch — the subsequent `refresh()` fetches fresh branch-health.
 - The appendix audit items at `~/.claude/plans/inherited-pondering-matsumoto.md` are still outstanding — **this iteration only covered the DB-vs-git drift class**, not the preview process-group kill verification, the submoduleGit pathspec-exclusion fallback, stream/abort correctness, or the missing web error boundary. Those were intentionally deferred after the user asked to ship narrow-scope reliability first and then expand.
+
+---
+
+### 2026-08-11 — Iteration 9: pluggable runtimes + a measured patch baseline
+
+**Context.** Two asks: let teammates run Codex or OpenCode against their own
+models instead of being welded to `claude -p`, and raise the quality of the
+patches the dashboard produces. The plan put measurement first — capture what
+today's pipeline actually does before changing any prompt — and that ordering
+paid for itself immediately.
+
+**The baseline is the headline. 0 of 3 pilot cases produced a usable patch.**
+
+| case | outcome |
+|---|---|
+| `payment_method_order` → mobile | build green, verifier `{"pass":true,"issues":[]}`, 12.1 min — **but the gap is a false positive**. `paymentMethodOrder` already existed (`ClientResponseType.res:346`, `NavigationRouter.res:114`, `HeadlessCommon.res:767`). The run shipped an *unrequested* behavioural change to working sort logic: card-alias matching, inverted `-1` semantics, last-match-wins. |
+| `enable_partial_loading` → web | analyst timed out at 600 s having made **15 Bash calls**, produced nothing. |
+| `installment_options` → mobile | build green; verifier returned **three accurate, file:line-precise defects** — then the branch was deleted and 23.9 min plus 49 file edits were discarded with "Regenerate with more context." |
+
+Every one of these is invisible to the gates we had. Build-green and
+verifier-approved described case 1 exactly, and case 1 is the worst outcome of
+the three because it silently modifies correct code.
+
+**`--allowed-tools` never restricted anything.** Measured against claude
+2.1.226: Bash ran under `--allowed-tools "Read Glob Grep"` (the space-joined
+form `llm.ts` used), under the correct variadic form, and under `--tools ""` —
+with and without `--permission-mode bypassPermissions`. Only
+`--disallowed-tools` blocks. So every "read-only" agent (patch analyst and
+verifier, gap validation, both review passes, feature discovery) had full write
+and shell access, and the "no tools, disable everything for speed" tier behind
+the four extractors, normalize, docs and translations was never enforced —
+squarely against constraint #3. This is not theoretical: it is what made case 2
+burn its whole budget shelling out instead of reading. Fixed in `llm.ts` by
+deriving a denylist from the existing `allowedTools` argument, so all ~30 call
+sites were corrected without touching any of them.
+`scripts/probeAccessPolicy.ts` re-proves each tier, because a capability table
+that is asserted rather than tested is a comment, not a boundary.
+
+**Three diff-capture bugs, all of which would have blinded the new validators.**
+`getDiffWithSubmodules` used `git diff`, which shows neither untracked files nor
+already-staged ones — so a newly created `.res` file (the common case when the
+agent uses Write) was absent from the stored `.patch` and from `files_touched`
+while the commit contained it. The hand-rolled untracked-file synthesizer built
+hunk headers from `content.split("\n")`, which leaves a trailing `""`, so every
+synthesized hunk claimed one extra line and emitted a phantom blank. And the
+path-prefixing regex rewrote only the `diff --git` line, leaving
+`+++ b/SubNew.res` where `+++ b/shared-code/SubNew.res` belonged — an
+unappliable patch whose `extractDiffFilePaths` returns two contradictory paths
+per file. Fixed by letting git do the work: `--intent-to-add` before diffing
+(then resetting the index), `git diff HEAD`, and `--src-prefix`/`--dst-prefix`
+instead of rewriting output. `scripts/probeDiffCapture.ts` covers all three:
+24/24 green on the fix, 11 failures against the pre-fix code.
+
+**Runtimes are not model providers.** OpenCode drives a LiteLLM-hosted model;
+Codex can point at a custom provider. Runtime / model-provider / model are
+recorded separately and the invocation string is preserved verbatim, because it
+is the only part guaranteed to round-trip. Access is an `AccessPolicy`
+(requested authority), owned by code and never by settings — a user changing a
+model assignment must not be able to widen what an agent may touch. Four values,
+not three: two existing call sites want read-plus-exec without writes, which is
+also what a verifier that must run the build needs.
+
+**Capability differences are hard errors, never silent downgrades.** Codex and
+OpenCode cannot express "no tools" (a read-only sandbox still runs commands), so
+`text-only` throws rather than quietly handing a bulk extraction pass a shell.
+OpenCode has no `--add-dir`, so cross-repo reads throw. Verified live.
+
+**Things that were wrong in the plan and only measurement caught:**
+- Redirecting `XDG_CONFIG_HOME`/`XDG_DATA_HOME` to keep OpenCode transcripts out
+  of the shared home **broke authentication entirely** — provider config lives in
+  `~/.config/opencode/opencode.json` and credentials in
+  `~/.local/share/opencode/auth.json`. Same request: "Key is blocked" without the
+  redirect (provider found) vs `ProviderModelNotFoundError` with it. Reverted;
+  `OPENCODE_CONFIG` (verified honoured) carries the permission rules instead. The
+  cost is that OpenCode sessions persist in the user's home — a real deviation,
+  recorded rather than hidden.
+- Emitting a terminal error from `classifyExit` *after* an adapter had already
+  emitted the runtime's own error replaced "Authentication Error, Key is blocked"
+  with a generic exit summary, and broke the one-terminal-event guarantee.
+- `git grep -E` is POSIX ERE and has **no `\b`**. Anchoring that way does not
+  error — it silently matches nothing, and reported a clean 0/23 while missing a
+  real hit. Use `-w`.
+- `git cat-file -e` exits 0 with EMPTY stdout, so a `!tryGit(...)` existence check
+  is always true. Every submodule was skipped by the benchmark's reset-to-baseline.
+
+**The bot forks are a push target, not a source of truth.** `syncRepos` pointed
+submodule origins at `pradeep120230-creator/sdk-agent-*`, which lag upstream —
+so `hyperswitch-web`'s recorded pointer `1669cc2` was not fetchable there and
+`submodule update` silently left the fork's stale main checked out, producing a
+workspace that does not compile (`phoneInvalidText does not belong to type
+localeStrings`). Now normalised to upstream HTTPS (which also solves the original
+SSH-key problem the fork redirect existed for), plus a post-init drift check that
+warns when a checkout disagrees with the parent's recorded pointer. Pushing is
+unaffected — `pushSubmoduleToFork` adds its own `bot` remote.
+Separately, `hyperswitch-client-core@main` still does not build against its OWN
+recorded pointer `07110ad`; it needs `1669cc2` for
+`getPaymentExperienceFromPaymentMethods`. That is the same local-only submodule
+bump iteration 6 described, and it is still required.
+
+**Environment.** Homebrew Node 26.3.0 cannot build `better-sqlite3@11` (no
+prebuild, and the source build fails against V8 headers). nvm's default v22.21.1
+works. The project declares no `engines` field; it should, or ship a `.nvmrc`.
+
+**What this changes about priorities.** The highest-leverage missing gate is not
+"does it compile" or even "does it match the spec" — both were satisfied by the
+worst run. It is **"was there anything to do at all?"** A zero-token whole-word
+grep of the target repo before the implementer starts would have turned case 1
+from a 12-minute semantic rewrite into a 60-second abort. Prototyped across all
+23 verified seed gaps: 1 confirmed false positive, and — importantly — one
+*false alarm* (`terms` appears only in comments and a user-facing error string;
+the gap is real). So the gate must ignore comments and string literals and
+require a declaration-position match, and default to flag-for-review rather than
+hard abort, because a gate that wrongly aborts silently discards real work.
+
+**Next.** The repair loop is now the single most valuable unbuilt thing: case 3
+had a green build and a precise defect list and threw both away. Feeding those
+three findings back to the implementer is a bounded, cheap change against work
+that was already ~90% done.
+
+**Follow-up: the Settings page blanked the whole dashboard.** Reported as "saw
+it once, then everything is blank" — which is the precise signature of a React
+render throw with no error boundary: React 18 unmounts the entire root, sidebar
+included, leaving nothing on screen to explain it or navigate away from.
+
+Cause was a cache-shape mismatch, not the component. `GET /runtimes/probe`
+enriches each runtime with `accessPolicies` and `notes`, caches for 60 s — and
+the cache-hit branch returned `probeCache.value`, the RAW probe result, without
+either field. So the first load (cache miss) rendered correctly and every reload
+inside the TTL crashed on `notes.map`. The fix is to cache the enriched payload
+rather than enrich only on the miss path; a contract check now asserts fresh and
+cached responses have identical shape.
+
+Two general lessons, both cheap:
+- **A cache must store the same shape it serves.** Enriching on one path only is
+  a bug that hides for exactly as long as the TTL, and presents as "works once".
+- **The missing error boundary was already a known outstanding item** and this is
+  what it costs. Added `web/src/components/ErrorBoundary.tsx`, scoped to the page
+  body and keyed on `activeTab` so the sidebar always survives and navigating
+  away clears the error. A blank screen tells a user nothing; a bounded error
+  tells them which view failed and lets them keep working.
+- The page now also normalises every field it indexes into on load. A settings
+  page that crashes takes the whole app with it, so it should tolerate a partial
+  payload rather than trust one.
+
+**Follow-up 2: clicking Preview killed the entire dashboard.** `ensureWsScrcpy`
+spawns the vendored sidecar with `cwd: tools/ws-scrcpy/dist` — a directory that
+does not exist, because the sidecar is vendored but never built by
+`npm run setup`. Two compounding faults:
+
+- **`spawn` into a missing `cwd` reports ENOENT against the COMMAND.** The error
+  reads `spawn node ENOENT`, which sends you hunting for a missing Node
+  installation when the real problem is the working directory. Now pre-checked
+  with a message naming the actual path and the command to fix it.
+- **The ChildProcess had an `exit` handler but no `error` handler.** Node throws
+  on an unhandled `'error'` event, so the failed spawn took the whole server
+  down — and every subsequent request became ECONNREFUSED, which vite surfaces
+  as HTTP 500. That is why "generate" and `/reports/latest` appeared broken:
+  they were fine, the server was dead. An optional side feature must never be
+  able to kill the process; handled and downgraded to a log line, and the route
+  now returns 503 with guidance.
+
+Lesson worth generalising: **every `spawn` needs an `error` handler, not just
+`exit`.** `runtime/proc.ts` already does this; `previewManager` and
+`wsScrcpyManager` predate it and `previewManager` should be audited the same way.
+
+**Runtime assignment surfaced its first real user error correctly.** With every
+stage pointed at `opencode / litellm/open-large`, patch generation streams
+`opencode (litellm/open-large): Authentication Error, Key is blocked` and stops
+— naming the runtime, the model and the cause. The Test button in Settings
+returns the same thing in ~6 s, which is the intended way to find out. Two
+guard rails also fired on save: same-runtime implementer/verifier (no adversarial
+value), and `analysis.extract` assigned to a runtime that cannot run tool-free.
+Note neither codex nor opencode can express the tool-free tier, so
+`analysis.extract`, `analysis.normalize`, `docs.writer` and `skill.translations`
+must stay on claude-code.
+
+**Correction: the LiteLLM key was never blocked — the debugging was.** Every
+model call through the dashboard returned `Authentication Error, Key is blocked`,
+and that was reproduced outside opencode entirely with a raw curl to
+`/chat/completions`, which seemed conclusive. It was not. The user pushed back
+with "if the key is blocked, how am I able to use opencode?" — and they were
+right.
+
+`~/.config/opencode/opencode.json` resolves the provider key as
+`{env:JUSPAY_API_KEY}`. The agent's shell had a STALE value for that variable,
+captured before the key was rotated; the user's live shell had the current one.
+Comparing sha256 prefixes of the two showed `e6d1bb…` (agent shell, blocked)
+vs `ab5644…` (~/.zshrc, valid). The dashboard server inherited the stale key
+because the agent had launched it. Restarted with
+`JUSPAY_API_KEY=$(zsh -c 'source ~/.zshrc; printf %s "$JUSPAY_API_KEY"')` and
+`litellm/open-large` worked immediately — a real gap validation in 17.6 s.
+
+Lessons:
+- **Reproducing a failure in a second tool does not isolate the cause when both
+  read the same environment.** The raw curl felt like proof it was server-side;
+  it only proved both paths used the same stale credential.
+- **An env-var-sourced secret makes "works for me" and "fails for the agent" a
+  routine divergence.** Compare a hash of the value the process actually holds
+  against the value the shell profile declares before blaming the remote end.
+- The server inherits the environment of whoever launched it. Started from the
+  user's own terminal it picks up the right key; started by an agent it may not.
+  Worth an explicit startup check that fails loudly when a configured provider's
+  key env var is missing or differs from the shell profile.
+
+**Aborted patch runs left the agent alive, editing the repo.** Reported as "I
+clicked generate and it's been 2 minutes" — which was fine; the real problem
+surfaced while checking. The reflog showed six start→abort cycles in 11 minutes,
+no patch stream was open, and yet an opencode process was still running 13
+minutes later, writing files into `hyperswitch-client-core`. By then the route
+had already checked `main` back out, so those edits landed on main belonging to
+no run, ready to be swept into whatever ran next and silently corrupt its diff.
+
+Two causes, both introduced while bridging `llm.ts` to the runtime layer:
+- **The AbortSignal was never threaded through.** `proc.ts` had process-group
+  cancellation from the start; nothing ever called it. `AskOptions.signal` now
+  exists and reaches both the runtime adapters and the legacy claude path.
+- **The route only tracked `clientClosed` to stop WRITING.** It never cancelled
+  the work. Now an `AbortController` per run is aborted on disconnect and passed
+  to all three patch agents. Bound to `res.on("close")`, not `req.on("close")` —
+  on a streaming response the request ends once its body is read, so `req` fires
+  early on some clients; the chat route had already documented this.
+
+Verified by starting a run, disconnecting after 20 s, and confirming the log
+reports `opencode cancelled` with no surviving process and a clean workspace.
+
+General rule this earns: **spawning a long-running child from a request handler
+requires a cancellation path, not just a "don't write to a dead socket" flag.**
+The flag makes the symptom invisible while the work keeps running.

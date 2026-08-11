@@ -321,6 +321,7 @@ chatRouter.post("/patches/:id/chat", async (req, res) => {
       await askStream(
         message,
         {
+          slot: "chat.patch",
           model: "opus",
           cwd: targetDir,
           system: systemPrompt,

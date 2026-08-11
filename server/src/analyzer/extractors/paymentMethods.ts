@@ -39,6 +39,7 @@ export async function extractPaymentMethods(
   );
 
   const result = await askJson<{ payment_methods: ExtractedFeature[] }>(prompt, {
+    slot: "analysis.extract",
     model: MODEL_EXTRACT,
     timeoutMs: 240_000,
   });

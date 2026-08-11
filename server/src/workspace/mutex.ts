@@ -34,6 +34,26 @@ export async function withRepoLock<T>(
   }
 }
 
+/**
+ * Lock several workspace repos in a stable order.
+ *
+ * PR porting reads one repo while mutating the other. Locking only the target
+ * lets a concurrent opposite-direction job check the source onto another
+ * branch halfway through analysis; acquiring in sorted order avoids that race
+ * without introducing the web->mobile / mobile->web deadlock.
+ */
+export async function withRepoLocks<T>(
+  repoKeys: RepoKey[],
+  fn: () => Promise<T>,
+): Promise<T> {
+  const keys = [...new Set(repoKeys)].sort() as RepoKey[];
+  const acquire = (index: number): Promise<T> =>
+    index >= keys.length
+      ? fn()
+      : withRepoLock(keys[index], () => acquire(index + 1));
+  return acquire(0);
+}
+
 /** For diagnostics only — is anyone holding the lock for this repo? */
 export function isRepoLocked(repoKey: RepoKey): boolean {
   return chains[repoKey] !== undefined;
