@@ -187,6 +187,7 @@ After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path from repo root>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
   const summaryRaw = await ask(prompt, {
+    slot: "skill.tests",
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
@@ -402,6 +403,7 @@ After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path from repo root>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
   const summaryRaw = await ask(prompt, {
+    slot: "skill.tests",
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,

@@ -1,0 +1,19 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PatchVerifierResult",
+  "description": "Verdict from the patch verifier. Enforced natively by runtimes that support structured output (claude-code --json-schema, codex --output-schema); parse-and-repair is used only for runtimes that do not.",
+  "type": "object",
+  "properties": {
+    "pass": {
+      "type": "boolean",
+      "description": "Whether the implementation matches the spec. NOTE: the workflow does not trust this field on its own — a true value alongside a non-empty issues list is downgraded to needs_review."
+    },
+    "issues": {
+      "type": "array",
+      "description": "Specific, actionable problems. Empty when pass is true.",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["pass", "issues"],
+  "additionalProperties": false
+}

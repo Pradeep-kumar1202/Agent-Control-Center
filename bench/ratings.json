@@ -1,0 +1,52 @@
+{
+  "$comment": [
+    "Human disposition per benchmark run, keyed '<label>/<caseId>'.",
+    "",
+    "This is the one pass criterion a machine cannot supply: whether a maintainer",
+    "would actually take the patch. The notes below record the evidence gathered",
+    "while capturing the baseline; the `disposition` values are marked NEEDS-REVIEW",
+    "because they are an assessment, not the maintainer's judgement.",
+    "",
+    "Replace each disposition with one of: accept | accept-with-edits | reject | invalid-gap"
+  ],
+  "baseline-claude/config-mobile-payment-method-order": {
+    "disposition": "NEEDS-REVIEW (suggest: invalid-gap)",
+    "evidence": [
+      "The gap is a false positive: paymentMethodOrder already exists in mobile at the base commit",
+      "  src/types/AllApiDataTypes/ClientResponseType.res:346  paymentMethodOrder: array<string>",
+      "  src/routes/NavigationRouter.res:114                   nativeProp.configuration.paymentMethodOrder",
+      "  src/headless/HeadlessCommon.res:767                   nativeProp.configuration.paymentMethodOrder",
+      "The seed gap's rationale ('no merchant-configurable ordering option') is factually wrong.",
+      "Having found the feature present, the agent instead changed existing sort behaviour:",
+      "card-alias matching, inverted -1 semantics, and last-match-wins in sortCustomerPaymentMethods.",
+      "Build passed and the verifier returned {pass:true, issues:[]}, so every gate approved it.",
+      "Deterministic validators flag size/single_file only — they cannot see that the gap was unreal."
+    ]
+  },
+  "baseline-claude/config-web-enable-partial-loading": {
+    "disposition": "NEEDS-REVIEW (suggest: reject — no artifact produced)",
+    "evidence": [
+      "Analyst timed out at 600s in the 'analysing' phase; no diff, no patch row.",
+      "Tool calls: Grep 12, Read 10, Bash 15 — for an agent configured read-only.",
+      "Root cause was the --allowed-tools finding: the tier was never enforced, so the",
+      "analyst shelled out instead of reading and exhausted its budget.",
+      "Re-run after the denylist fix before treating this as a model-quality signal."
+    ]
+  },
+  "baseline-claude/component-mobile-installment-options": {
+    "disposition": "NEEDS-REVIEW (suggest: accept-with-edits — work was discarded)",
+    "evidence": [
+      "23.9 min, build GREEN, 46 Edit + 3 Write calls — a substantial implementation.",
+      "The verifier produced three specific, file:line-accurate defects:",
+      "  1. isInstallmentValid not gated on payment method; showInstallments lives in app-level",
+      "     context and is never reset on tab change -> dead Pay button with an unreachable error.",
+      "  2. The same ungated flags feed FormStatusEmitter, so a stale card checkbox makes the SDK",
+      "     emit hasRequiredFields=true for unrelated non-card methods.",
+      "  3. InstallmentOptions keeps selectedIndex locally while the plan lives in context, so on",
+      "     remount the list reopens with no radio selected.",
+      "The pipeline then DELETED the branch and discarded everything, telling the user to regenerate.",
+      "This is the clearest possible case for the bounded repair loop: three actionable findings",
+      "against a green-building implementation that was close to correct."
+    ]
+  }
+}

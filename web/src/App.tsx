@@ -11,9 +11,12 @@ import { ReviewHistory } from "./skills/review/History";
 import { SkillHistory } from "./skills/shared/SkillHistory";
 import { AchievementsPage } from "./skills/achievements/AchievementsPage";
 import { DocsPage } from "./skills/docs/DocsPage";
+import SettingsPage from "./settings/SettingsPage";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FeatureAgent } from "./skills/feature/FeatureAgent";
 import { PropsResults } from "./skills/props/Results";
 import { TestsResults } from "./skills/tests/Results";
+import { PrPortResults } from "./skills/pr-port/Results";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -36,6 +39,7 @@ const SKILL_HISTORY_CONFIG: Record<
 > = {
   props: { name: "Add Prop", formatLabel: (i) => `Prop: ${i.propName ?? "?"}`, ResultsComponent: PropsResults },
   tests: { name: "Test Writer", formatLabel: (i) => `Tests for ${i.branch ?? "?"}`, ResultsComponent: TestsResults },
+  "pr-port": { name: "PR Port", formatLabel: (i) => `Port: ${i.prUrl ?? "?"}`, ResultsComponent: PrPortResults },
 };
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
@@ -149,6 +153,15 @@ function IconGrid4() {
   );
 }
 
+function IconGear() {
+  return (
+    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="7" cy="7" r="2.2"/>
+      <path d="M7 1.2v1.6M7 11.2v1.6M12.8 7h-1.6M2.8 7H1.2M11.1 2.9l-1.1 1.1M4 10l-1.1 1.1M11.1 11.1L10 10M4 4L2.9 2.9"/>
+    </svg>
+  );
+}
+
 function IconDoc() {
   return (
     <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
@@ -176,6 +189,7 @@ function skillIcon(id: string) {
   if (id === "translations") return <IconGlobe />;
   if (id === "review")       return <IconPR />;
   if (id === "integration")  return <IconPlug />;
+  if (id === "pr-port")      return <IconFlow />;
   return <IconGrid />;
 }
 
@@ -549,6 +563,15 @@ export default function App() {
             <span className="sidebar-item-label">Achievements</span>
           </div>
 
+          <div className="sidebar-section-label">System</div>
+          <div
+            className={`sidebar-item ${activeTab === "settings" ? "active" : ""}`}
+            onClick={() => setActiveTab("settings")}
+          >
+            <IconGear />
+            <span className="sidebar-item-label">Settings</span>
+          </div>
+
           <div className="sidebar-section-label">Coming soon</div>
           <div className="sidebar-item soon">
             <IconFlow />
@@ -711,6 +734,20 @@ export default function App() {
             </div>
           )}
 
+          {/* Page header — Settings */}
+          {activeTab === "settings" && (
+            <div className="page-header">
+              <div className="page-header-row" style={{ marginBottom: 16 }}>
+                <div>
+                  <div className="page-title">Settings</div>
+                  <div className="page-subtitle">
+                    Choose which runtime and model runs each stage of the pipeline.
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Page header — Achievements */}
           {activeTab === "achievements" && (
             <div className="page-header">
@@ -724,6 +761,10 @@ export default function App() {
           )}
 
           {/* ── Page body ─────────────────────────────────────────────── */}
+          {/* Keyed on activeTab so navigating away clears a crashed page.
+              Scoped to the body, not the shell, so the sidebar always survives
+              and there is somewhere to navigate to. */}
+          <ErrorBoundary resetKey={activeTab} label={`The "${activeTab}" view`}>
           <div className="page-body">
 
             {/* Skill views */}
@@ -777,6 +818,8 @@ export default function App() {
 
             {/* Achievements */}
             {activeTab === "achievements" && <AchievementsPage />}
+
+            {activeTab === "settings" && <SettingsPage />}
 
             {/* ── Gaps view ─────────────────────────────────────────── */}
             {activeTab === "gaps" && (
@@ -896,6 +939,7 @@ export default function App() {
             )}
 
           </div>{/* end page-body */}
+          </ErrorBoundary>
         </div>{/* end main */}
       </div>{/* end workspace */}
 

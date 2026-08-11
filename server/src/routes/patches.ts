@@ -244,8 +244,26 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
+  // Abort the whole run when the client goes away.
+  //
+  // Marking `clientClosed` only stopped us WRITING; the agents kept running.
+  // One was seen still editing the workspace 13 minutes after its stream
+  // closed — by then the route had checked `main` back out, so it was writing
+  // onto main, and its edits would have been swept into whatever ran next.
+  //
+  // `res.on("close")` rather than `req.on("close")`: on a streaming response
+  // the request ends as soon as the body is read, so `req` fires early on some
+  // clients. The response closing is the real disconnect signal, and the chat
+  // route already documented this.
+  const runAbort = new AbortController();
   let clientClosed = false;
-  req.on("close", () => { clientClosed = true; });
+  const onClientGone = () => {
+    if (clientClosed) return;
+    clientClosed = true;
+    runAbort.abort();
+  };
+  res.on("close", onClientGone);
+  req.on("aborted", onClientGone);
 
   const writeLine = (obj: unknown) => {
     if (!clientClosed && !res.writableEnded) {
@@ -331,6 +349,8 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       await askStream(
         analystPrompt,
         {
+          slot: "patch.source-analyst",
+          signal: runAbort.signal,
           model: "opus",
           cwd: sourceDir,
           allowedTools: ["Read", "Glob", "Grep"],
@@ -365,6 +385,8 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       await askStream(
         implementerPrompt,
         {
+          slot: "patch.implementer",
+          signal: runAbort.signal,
           model: "opus",
           cwd: targetDir,
           allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
@@ -441,6 +463,8 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       await askStream(
         verifierPrompt,
         {
+          slot: "patch.verifier",
+          signal: runAbort.signal,
           model: "opus",
           cwd: targetDir,
           allowedTools: ["Read", "Grep", "Glob"],

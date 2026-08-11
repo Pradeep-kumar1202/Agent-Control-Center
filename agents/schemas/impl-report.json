@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ImplementationReport",
+  "description": "The implementer's self-report, emitted only after the build exits 0. Treated as untrusted narrative: the server re-derives the real file list from the git diff and re-runs the build itself, so build_status here is a claim, not evidence.",
+  "type": "object",
+  "properties": {
+    "what": { "type": "string", "description": "One-line description of the change" },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string", "description": "Relative to the target repo root" },
+          "change": { "type": "string" }
+        },
+        "required": ["path", "change"],
+        "additionalProperties": false
+      }
+    },
+    "backward_compatible": { "type": "boolean" },
+    "build_status": { "type": "string", "enum": ["passed"] },
+    "build_attempts": { "type": "integer", "minimum": 1 },
+    "notes": { "type": "string" }
+  },
+  "required": ["what", "files", "backward_compatible", "build_status", "build_attempts"],
+  "additionalProperties": false
+}

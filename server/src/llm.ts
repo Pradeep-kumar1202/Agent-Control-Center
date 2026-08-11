@@ -1,4 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { RUNTIMES } from "./runtime/index.js";
+import { getAgentSettings, resolveSlot } from "./runtime/settings.js";
+import type { AccessPolicy, AgentSlot, ModelRef } from "./runtime/types.js";
 
 /**
  * LLM wrapper that shells out to the local `claude` CLI in print mode.
@@ -30,10 +33,24 @@ export function activeSubprocessCount(): number {
   return activeChildren.size;
 }
 
+/**
+ * @deprecated Anthropic-specific. Use `slot` and assign a runtime in Settings,
+ * or pass `model` as a raw string when you need to pin one.
+ */
 export type Model = "sonnet" | "opus" | "haiku";
 
 export interface AskOptions {
-  model?: Model;
+  /**
+   * Which pipeline stage this call is. Settings map slots to a runtime + model,
+   * so assigning `patch.implementer` to an OpenCode profile moves exactly that
+   * stage without touching any code.
+   *
+   * When omitted, the `default` assignment applies. When nothing is assigned at
+   * all, the call falls back to the legacy claude-code path with `model`, so
+   * behaviour is unchanged until someone configures a profile.
+   */
+  slot?: AgentSlot;
+  model?: Model | string;
   /** Hard timeout for the subprocess. */
   timeoutMs?: number;
   /** System prompt prepended to the user prompt. */
@@ -49,6 +66,16 @@ export interface AskOptions {
    * filesystem itself. Defaults to disabled (no tools).
    */
   allowedTools?: string[];
+  /**
+   * Cancels the run and kills the spawned agent's whole process group.
+   *
+   * Not optional in practice for streaming routes. Without it a client
+   * disconnect or a route error leaves the agent alive: one was observed still
+   * editing the workspace 13 minutes after its stream had closed, writing onto
+   * `main` after the route had already checked the feature branch back out.
+   * Those edits belong to no run and silently contaminate the next one's diff.
+   */
+  signal?: AbortSignal;
 }
 
 export class LLMError extends Error {
@@ -58,11 +85,137 @@ export class LLMError extends Error {
 }
 
 /**
+ * Translate the legacy `allowedTools` list into a requested authority.
+ *
+ * This is what lets every existing call site work on a non-Claude runtime with
+ * no edit: the list already encodes intent, so the tier can be derived from it
+ * instead of being hand-written into 30 places.
+ */
+export function accessFromAllowedTools(allowedTools?: string[]): AccessPolicy {
+  const t = new Set(allowedTools ?? []);
+  if (t.size === 0) return "text-only";
+  if (t.has("Edit") || t.has("Write") || t.has("NotebookEdit")) return "repo-write";
+  if (t.has("Bash")) return "repo-read-exec";
+  return "repo-read";
+}
+
+/**
+ * Decide which runtime serves this call.
+ *
+ * Returns null to mean "use the built-in claude-code path unchanged" — the case
+ * when nothing has been configured yet, which keeps the dashboard behaving
+ * exactly as before until someone opens Settings.
+ */
+function routeFor(opts: AskOptions): ModelRef | null {
+  try {
+    const settings = getAgentSettings();
+    if (Object.keys(settings.profiles).length === 0) return null;
+    const ref = opts.slot
+      ? resolveSlot(opts.slot, settings)
+      : resolveSlot("analysis.extract", { ...settings, assignments: { default: settings.assignments.default ?? "" } });
+    if (!ref) return null;
+    // The assigned profile wins over `opts.model`, deliberately. Every legacy
+    // call site hardcodes an Anthropic name ("opus"/"sonnet"), so honouring it
+    // would make assignment pointless — and worse, silently forward "opus" to
+    // Codex, which rejects it ("The 'opus' model is not supported when using
+    // Codex with a ChatGPT account"). `opts.model` still applies on the
+    // fallback path, where no profile is configured at all.
+    return ref;
+  } catch {
+    return null;   // a broken settings row must never take the pipeline down
+  }
+}
+
+/**
+ * Run a call on a non-Claude runtime, forwarding normalized chunks.
+ *
+ * The adapter's event union is a superset of StreamChunk, so forwarding is a
+ * pass-through rather than a translation — adapters already emit Claude-shaped
+ * tool names precisely so the UI and every existing NDJSON consumer keep
+ * working unchanged.
+ */
+async function runViaRuntime(
+  prompt: string,
+  opts: AskOptions,
+  model: ModelRef,
+  onChunk?: (c: StreamChunk) => void,
+): Promise<string> {
+  const runtime = RUNTIMES[model.runtime];
+  const access = accessFromAllowedTools(opts.allowedTools);
+  let text = "";
+  let failure: string | null = null;
+
+  for await (const ev of runtime.run({
+    slot: opts.slot ?? "analysis.extract",
+    prompt,
+    developerInstructions: opts.system,
+    access,
+    cwd: opts.cwd,
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    model,
+  })) {
+    if (ev.type === "text") text += ev.text;
+    if (ev.type === "error") failure = ev.error;
+    onChunk?.(ev as StreamChunk);
+  }
+
+  if (failure) throw new LLMError(`${model.runtime} (${model.invocation}): ${failure}`);
+  return text.trim();
+}
+
+/** Every tool the CLI can expose. Anything not permitted is explicitly denied. */
+const ALL_TOOLS = [
+  "Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep",
+  "WebFetch", "WebSearch", "Task",
+] as const;
+
+/**
+ * Translate an allow-list into the CLI flags that actually enforce it.
+ *
+ * `--allowed-tools` does NOT restrict anything — it only pre-approves. Measured
+ * against claude 2.1.226, Bash ran under all of:
+ *
+ *   --allowed-tools "Read Glob Grep"     (the space-joined form this used)
+ *   --allowed-tools Read Glob Grep       (correct variadic form)
+ *   --tools ""                           ("disable everything for speed")
+ *
+ * with and without `--permission-mode bypassPermissions`. Only
+ * `--disallowed-tools` blocks. So every "read-only" agent here — the patch
+ * analyst and verifier, gap validation, both review passes, feature discovery —
+ * had full write and shell access, and the no-tools tier behind the extractors
+ * and normalize was never cheap in the way it claimed to be.
+ *
+ * This was not hypothetical: a read-only analyst spent its entire 600 s budget
+ * making 15 Bash calls and timed out having produced nothing.
+ *
+ * `server/src/scripts/probeAccessPolicy.ts` re-proves this per tier, so a CLI
+ * upgrade that changes the semantics fails a check instead of silently
+ * reopening the hole.
+ */
+function toolGateArgs(allowedTools?: string[]): string[] {
+  const allowed = new Set(allowedTools ?? []);
+  const denied = ALL_TOOLS.filter((t) => !allowed.has(t));
+  if (denied.length === 0) return ["--permission-mode", "bypassPermissions"];
+
+  const args = ["--disallowed-tools", ...denied];
+  // Only meaningful when some tool remains; with everything denied it just
+  // pre-approves an empty set.
+  if (allowed.size > 0) args.push("--permission-mode", "bypassPermissions");
+  return args;
+}
+
+/**
  * Send a prompt to Claude via the CLI. Returns the raw text response.
  */
 export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
+  const route = routeFor(opts);
+  if (route && route.runtime !== "claude-code") return runViaRuntime(prompt, opts, route);
+
   const {
-    model = "sonnet",
+    // A claude-code profile still gets to pick the model; with no profile at
+    // all this is the caller's own value, unchanged.
+    model = route?.invocation ?? "sonnet",
     timeoutMs = 180_000,
     system,
     cwd,
@@ -79,13 +232,7 @@ export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
   ];
   if (system) args.push("--append-system-prompt", system);
 
-  if (allowedTools && allowedTools.length > 0) {
-    args.push("--allowed-tools", allowedTools.join(" "));
-    args.push("--permission-mode", "bypassPermissions");
-  } else {
-    // No tool use — disable everything for speed.
-    args.push("--tools", "");
-  }
+  args.push(...toolGateArgs(allowedTools));
 
   return new Promise((resolve, reject) => {
     const child = spawn("claude", args, {
@@ -94,6 +241,17 @@ export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
       cwd,
     });
     activeChildren.add(child);
+
+    // Cancel on abort. The runtime adapters kill the whole process group via
+    // proc.ts; this legacy path can only reach the direct child, which is
+    // still far better than leaving an agent editing the repo after its
+    // stream has closed.
+    const onAbort = () => { try { child.kill("SIGKILL"); } catch { /* already gone */ } };
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    child.on("close", () => opts.signal?.removeEventListener("abort", onAbort));
 
     let stdout = "";
     let stderr = "";
@@ -148,7 +306,15 @@ export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
  * per-event lines (the CLI is strict about this).
  */
 export interface StreamChunk {
-  type: "text" | "tool_use" | "tool_result" | "done" | "error";
+  // "status" | "warning" | "usage" are additive — emitted only by the non-Claude
+  // runtimes. Existing consumers ignore chunk types they don't recognise.
+  type: "text" | "tool_use" | "tool_result" | "done" | "error" | "status" | "warning" | "usage";
+  /** Coarse progress from runtimes that don't stream token deltas (codex). */
+  status?: string;
+  /** Non-fatal notice, e.g. an access policy that was narrower than the work needed. */
+  warning?: string;
+  /** Token counts and, where the runtime reports one, a list-price equivalent. */
+  usage?: Record<string, number | undefined>;
   /** Assistant text delta (type: "text"). */
   text?: string;
   /** Tool call details (type: "tool_use"). */
@@ -164,8 +330,13 @@ export function askStream(
   opts: AskOptions,
   onChunk: (chunk: StreamChunk) => void,
 ): Promise<void> {
+  const route = routeFor(opts);
+  if (route && route.runtime !== "claude-code") {
+    return runViaRuntime(prompt, opts, route, onChunk).then(() => undefined);
+  }
+
   const {
-    model = "sonnet",
+    model = route?.invocation ?? "sonnet",
     timeoutMs = 180_000,
     system,
     cwd,
@@ -183,12 +354,7 @@ export function askStream(
     "--no-session-persistence",
   ];
   if (system) args.push("--append-system-prompt", system);
-  if (allowedTools && allowedTools.length > 0) {
-    args.push("--allowed-tools", allowedTools.join(" "));
-    args.push("--permission-mode", "bypassPermissions");
-  } else {
-    args.push("--tools", "");
-  }
+  args.push(...toolGateArgs(allowedTools));
 
   return new Promise((resolve, reject) => {
     const child = spawn("claude", args, {
@@ -197,6 +363,17 @@ export function askStream(
       cwd,
     });
     activeChildren.add(child);
+
+    // Cancel on abort. The runtime adapters kill the whole process group via
+    // proc.ts; this legacy path can only reach the direct child, which is
+    // still far better than leaving an agent editing the repo after its
+    // stream has closed.
+    const onAbort = () => { try { child.kill("SIGKILL"); } catch { /* already gone */ } };
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    child.on("close", () => opts.signal?.removeEventListener("abort", onAbort));
 
     let buf = "";
     let stderr = "";

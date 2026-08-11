@@ -4,10 +4,17 @@ This file is auto-loaded by Claude Code when working in this directory. It exist
 
 ## What this project is
 
-A local-only web dashboard at `/home/sdk/sdk/pradeep.kumar/feature-gap-dashboard/` that compares two payment SDK repos — `hyperswitch-web` (ReScript web SDK) and `hyperswitch-client-core` (ReScript mobile SDK) — and surfaces feature gaps the user can turn into local patches.
+A local-only web dashboard at `/Users/pradeep.kumar/Documents/Agent-Control-Center/` that compares two payment SDK repos — `hyperswitch-web` (ReScript web SDK) and `hyperswitch-client-core` (ReScript mobile SDK) — and surfaces feature gaps the user can turn into local patches.
 
 Stack:
-- Server: Node + Express + better-sqlite3 + TypeScript. Shells out to `claude -p` with `--permission-mode bypassPermissions`, `--allowed-tools`, and a `cwd` option. Uses the logged-in Max plan session — **no API key, no `ANTHROPIC_API_KEY`, never import `@anthropic-ai/sdk`**.
+- Server: Node + Express + better-sqlite3 + TypeScript. **Requires Node 22** —
+  `better-sqlite3@11` has no prebuild for Node 26 and its source build fails.
+  Model calls go through `server/src/runtime/`, which drives whichever agent CLI
+  a stage is assigned (`claude`, `codex`, `opencode`) using that CLI's own login
+  — **no API key, no `ANTHROPIC_API_KEY`, never import `@anthropic-ai/sdk`**.
+  Tool access is enforced with `--disallowed-tools`, **not** `--allowed-tools`:
+  the latter only pre-approves and restricts nothing (measured — see LEARNINGS
+  iteration 9). `server/src/scripts/probeAccessPolicy.ts` re-proves this per tier.
 - Web: Vite + React + Tailwind, proxies `/api` to `http://localhost:5174`.
 - Data: SQLite at `data/app.db`, SHA-keyed disk cache at `data/cache/{extract,normalize,validate}/`, patches at `data/patches/`.
 - Workspace clones: `workspace/hyperswitch-web` and `workspace/hyperswitch-client-core`, synced via simple-git.
@@ -23,7 +30,18 @@ Current pipeline:
 
 Every proposal must be checked against all four:
 
-1. **No API key.** Max plan only. Everything goes through `claude -p` subprocess.
+1. **No vendor SDKs. Subscription auth only, via CLI subprocesses.** Never
+   `npm install @anthropic-ai/sdk` / `openai` / similar, and never put an API key
+   in this repo. Every model call shells out to an agent CLI that already holds
+   the user's own login: `claude`, `codex`, or `opencode`.
+
+   **Which runtimes are permitted is data, not prose.** It lives in the
+   `settings` table (see `server/src/runtime/settings.ts`) and is surfaced at
+   `GET /runtimes/probe`. This wording exists because the old "Max plan only,
+   `claude -p` only" rule flip-flopped twice — LEARNINGS 2026-04-10 declared it
+   superseded by GitHub Models, the code silently reverted to `claude -p`, and
+   `.env.example` still documents a dead `GITHUB_TOKEN`. A sentence here cannot
+   track that; a probed, persisted setting can.
 2. **No false positives.** Quality is non-negotiable. A real gap buried in noise is worse than a smaller, trustworthy list.
 3. **No token waste.** No bulk Opus+tools passes. Prefer deterministic filtering, cache hits, and on-demand escalation.
 4. **Shared machine, scoped credentials only.** This box is shared across the team — never write per-user credentials, never write project context to `~/.claude`. All persistent project context goes in this repo (CLAUDE.md, LEARNINGS.md). **GitHub push is now allowed via the shared `pradeep120230-creator` bot account only**, authenticated via `gh auth login` (token in `~/.config/gh/hosts.yml`, marked as `keyring`). The patches route uses this to push feature branches to bot forks under `pradeep120230-creator/sdk-agent-*` and open PRs against `juspay/*`. See LEARNINGS.md iteration 5 for the full story. **Do not** generate per-user PATs, do not write tokens into the repo, do not push from any account other than the bot.
