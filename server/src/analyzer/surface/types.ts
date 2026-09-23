@@ -12,4 +12,4 @@ export interface SurfaceItem {
   snippet: string;
 }
 
-export type SurfaceCategory = Exclude<Category, "payment_method">;
+export type SurfaceCategory = Category;

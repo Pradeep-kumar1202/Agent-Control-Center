@@ -47,10 +47,16 @@ analyzeRouter.get("/analyze/status", (_req, res) => {
   });
 });
 
-analyzeRouter.get("/reports/latest", (_req, res) => {
-  const row = db
-    .prepare(`SELECT * FROM reports ORDER BY id DESC LIMIT 1`)
-    .get();
+/**
+ * Latest report; `?status=done` returns the latest successful one. The UI
+ * shows the last successful table while a new run is in flight or after one
+ * fails, instead of blanking the page.
+ */
+analyzeRouter.get("/reports/latest", (req, res) => {
+  const row =
+    req.query.status === "done"
+      ? db.prepare(`SELECT * FROM reports WHERE status = 'done' ORDER BY id DESC LIMIT 1`).get()
+      : db.prepare(`SELECT * FROM reports ORDER BY id DESC LIMIT 1`).get();
   res.json(row ?? null);
 });
 
@@ -68,7 +74,7 @@ analyzeRouter.get("/gaps", (req, res) => {
       ? Number(reportIdParam)
       : (
           db
-            .prepare(`SELECT id FROM reports ORDER BY id DESC LIMIT 1`)
+            .prepare(`SELECT id FROM reports WHERE status = 'done' ORDER BY id DESC LIMIT 1`)
             .get() as { id: number } | undefined
         )?.id;
 

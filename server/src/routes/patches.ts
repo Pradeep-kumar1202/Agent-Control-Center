@@ -4,6 +4,7 @@ import path from "node:path";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../config.js";
 import { db, isPrState, listPrStates, nowIso, setPrState, type GapRow } from "../db.js";
 import { ask, askStream, extractBalancedJson } from "../llm.js";
+import { checkPatchable } from "../analyzer/patchGate.js";
 import { generateDoc } from "../skills/docs/generator.js";
 import { localGit } from "../workspace/git.js";
 import {
@@ -37,6 +38,9 @@ patchesRouter.post("/gaps/:id/patch", async (req, res) => {
     | GapRow
     | undefined;
   if (!gap) return res.status(404).json({ error: "gap not found" });
+
+  const gate = checkPatchable(gap);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
 
   const existing = db
     .prepare(
@@ -207,6 +211,9 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
     | GapRow
     | undefined;
   if (!gap) return res.status(404).json({ error: "gap not found" });
+
+  const gate = checkPatchable(gap);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code });
 
   const existing = db
     .prepare(

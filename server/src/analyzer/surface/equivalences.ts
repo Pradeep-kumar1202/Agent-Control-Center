@@ -146,6 +146,13 @@ export const PLATFORM_SCOPED: PlatformScoped[] = [
     key: "health",
     reason: "network reachability probe used by the mobile SDK's offline handling (NetworkStatusHook); browsers expose navigator.onLine",
   },
+  // ── payment_method (next_action handling) ──
+  {
+    category: "payment_method",
+    side: "web",
+    key: "next_action/redirect_inside_popup",
+    reason: "opens the redirect in a browser popup window; native apps present redirects in an in-app browser via redirect_to_url",
+  },
   // ── component ──
   ...(["tabSheet", "buttonSheet", "widgetPaymentSheet", "widgetTabSheet", "widgetButtonSheet", "widgetPaymentMethodsManagement"] as const).map(
     (key): PlatformScoped => ({
@@ -215,9 +222,9 @@ export const IMPLICIT_PRESENCE: ImplicitPresence[] = [
   },
 ];
 
-/** Normalised comparison key: config/component names compare case- and separator-insensitively; API paths exactly. */
+/** Normalised comparison key: config/component names compare case- and separator-insensitively; API paths and next_action types exactly. */
 export function compareKey(category: SurfaceCategory, key: string): string {
-  return category === "backend_api" ? key : key.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return category === "backend_api" || category === "payment_method" ? key : key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 export function implicitPresenceHolds(rule: ImplicitPresence, repoDir: string): boolean {

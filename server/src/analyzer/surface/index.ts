@@ -1,5 +1,6 @@
 /**
- * Deterministic gap derivation for config, backend_api and component.
+ * Deterministic gap derivation for every category: config, backend_api,
+ * component, and payment_method (as next_action handling).
  *
  *   parse both SDKs' declarations  →  apply the checked-in equivalence table
  *   →  every declared key with no counterpart (by name, alias, or re-checked
@@ -13,6 +14,7 @@
 import { extractBackendApiSurface } from "./backendApi.js";
 import { extractComponentSurface } from "./components.js";
 import { extractConfigSurface } from "./config.js";
+import { extractPaymentFlowSurface } from "./paymentFlows.js";
 import {
   compareKey,
   EQUIVALENCES,
@@ -26,12 +28,13 @@ import type { Side, SurfaceCategory, SurfaceItem } from "./types.js";
 export { SurfaceParseError } from "./source.js";
 export type { Side, SurfaceCategory, SurfaceItem } from "./types.js";
 
-export const SURFACE_CATEGORIES: SurfaceCategory[] = ["config", "backend_api", "component"];
+export const SURFACE_CATEGORIES: SurfaceCategory[] = ["config", "backend_api", "component", "payment_method"];
 
 const EXTRACT: Record<SurfaceCategory, (side: Side, repoDir: string) => SurfaceItem[]> = {
   config: extractConfigSurface,
   backend_api: extractBackendApiSurface,
   component: extractComponentSurface,
+  payment_method: extractPaymentFlowSurface,
 };
 
 /** Where each category was read from — quoted in gap rationales so a reader knows what "absent" was checked against. */
@@ -47,6 +50,10 @@ const SEARCHED: Record<SurfaceCategory, Record<Side, string>> = {
   component: {
     web: "CardThemeType.res getPaymentMode entry points and the feature catalogue",
     mobile: "SdkTypes.res parseSdkState/parsePmmState entry points and the feature catalogue",
+  },
+  payment_method: {
+    web: "every next_action type comparison and next_action switch under src/ and shared-code/ (comments excluded)",
+    mobile: "every next_action type comparison and next_action switch under src/ and shared-code/ (comments excluded)",
   },
 };
 
@@ -170,9 +177,9 @@ export function diffSurface(
   return { category, surface, gaps, matched, excluded, tableWarnings };
 }
 
-/** `paymentMethodOrder` → `payment_method_order`; `netceteraSDKApiKey` → `netcetera_sdk_api_key`; API paths unchanged. */
+/** `paymentMethodOrder` → `payment_method_order`; `netceteraSDKApiKey` → `netcetera_sdk_api_key`; API paths and next_action keys unchanged. */
 export function canonicalName(category: SurfaceCategory, key: string): string {
-  if (category === "backend_api") return key;
+  if (category === "backend_api" || category === "payment_method") return key;
   return key
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")

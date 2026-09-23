@@ -1082,3 +1082,46 @@ The seed files were re-serialised with 2-space indentation, hence the large diff
 categories/flows as a fourth surface; gate "Generate Patch" on verified rows and
 remove "Verify all" (bulk Opus + tools violates constraint #3); promote Verify
 `false_positive` findings into the equivalence table instead of a per-DB dismissal.
+
+### 2026-09-23 — Iteration 11: gaps must be confirmed before work starts; payment methods compared as flows
+
+**Patch gate (`analyzer/patchGate.ts`, both patch routes).** Before any agent runs:
+the row must be verified and not platform-specific, and the gap must still exist in
+the current checkout — its category is re-derived (<1 s) and a gap whose key is now
+declared on the missing side is refused with the file:line where it lives
+(`GAP_CLOSED`). This is the "was there anything to do at all?" gate iteration 9
+asked for; with declared-key identities it is exact rather than a grep heuristic.
+Enforced on the server (422/409 with a message the patch panels already display),
+mirrored in the UI (Generate Patch disabled with a reason in the tooltip).
+
+**Removed "Verify all".** It ran Opus + tools over every unverified row in sequence
+— the bulk pass iteration 1 ruled out, re-added in the UI. Verify stays per-row.
+
+**Payment methods as next_action handling (`surface/paymentFlows.ts`).** Names were
+the wrong question (mobile renders whatever the backend lists). What decides whether
+a method works is whether the SDK completes the `next_action` the backend returns.
+Both idioms (`nextAction.type_ === "x"` chains; `switch …getActionType { | "x" => }`)
+are read on both SDKs, with comments blanked first (client-core has commented-out
+arms). Current result: web handles 10 types, mobile 5; mobile lacks
+`qr_code_information`, `display_voucher_information`, `invoke_hidden_iframe`,
+`invoke_sdk_client` (`redirect_inside_popup` is platform-scoped: browser popup).
+Rows are visible by default under "Payment flows".
+
+**UI reliability.** The table always shows the last *successful* report
+(`/reports/latest?status=done`, `/gaps` defaults to it), with a running/failed banner
+above — a failed or in-flight run no longer blanks the page. The Verified count and
+filter exclude platform-specific rows (they are verified=1 in the DB but never work
+items), and all counts use the same filtered list.
+
+**A blind test caught by mutation.** The first "commented-out arms don't count" check
+passed with comment stripping deleted: its fixture put `//` and `/*` on the arm's own
+line, which the line-anchored arm regex already ignores. Real risk is an arm on its
+own line inside a multi-line `/* … */` and a commented-out `if` comparison; the
+fixture now has both and fails without stripping. Mutation-test every new check.
+
+**First real Verify under the new path.** `authentication/{}/eligibility-check` →
+confirmed (low): mobile only calls `payments/{}/eligibility`. Cached under the
+category-scoped key and carried forward by declared identity across re-runs.
+
+**State.** 67 gaps (16 platform-specific); eval: 16/16 seed recall, 0 dismissed
+regressions, 0 table warnings; `check:surface` 41 checks.

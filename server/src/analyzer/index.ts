@@ -29,9 +29,9 @@ export interface AnalysisResult {
  * find its declaration throws, and the report is marked failed — a one-sided
  * surface would otherwise turn every feature on the other side into a gap.
  *
- * `payment_method` is not compared here. Method names are the wrong question
- * (mobile renders whatever the backend lists); comparing payment-method
- * categories and flows is tracked as the next surface to add.
+ * `payment_method` compares the backend next_action types each SDK can
+ * complete, not method names — mobile renders whatever methods the backend
+ * lists, but a missing next_action handler breaks every method that needs it.
  *
  * Judgement stays on demand: POST /gaps/:id/validate (Opus + read tools).
  */

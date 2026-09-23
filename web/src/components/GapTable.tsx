@@ -159,6 +159,9 @@ function GapRow({
   // The row still gets a visible amber indicator so the user understands
   // the state change (vs. a silent demotion to unverified).
   const effectivelyPatched = hasPatched && !isStale;
+  // Mirrors the server's patch gate (analyzer/patchGate.ts): only confirmed,
+  // non-platform gaps are work items. The server also re-checks the code.
+  const patchable = g.verified === 1 && g.platform_specific === 0;
   const [linkingPr, setLinkingPr] = useState(false);
   const [prInput, setPrInput] = useState("");
   const [prError, setPrError] = useState<string | null>(null);
@@ -363,12 +366,20 @@ function GapRow({
             </>
           ) : (
             <button
-              className={`btn btn-sm ${!g.platform_specific && !isPatching ? "btn-amber" : ""}`}
-              disabled={isPatching || g.platform_specific === 1}
+              className={`btn btn-sm ${patchable && !isPatching ? "btn-amber" : ""}`}
+              disabled={isPatching || !patchable}
               onClick={() => onPatch(g.id)}
-              title={isStale ? "The previous patch's branch was deleted — this will build a fresh one." : undefined}
-              style={
+              title={
                 g.platform_specific === 1
+                  ? "Platform-specific — not a work item"
+                  : g.verified !== 1
+                    ? "Verify this gap first — patching an unconfirmed gap risks rewriting code that already works"
+                    : isStale
+                      ? "The previous patch's branch was deleted — this will build a fresh one."
+                      : undefined
+              }
+              style={
+                !patchable
                   ? { borderColor: "var(--border)", color: "var(--text3)", cursor: "default" }
                   : isPatching
                     ? { borderColor: "rgba(245,158,11,.3)", color: "var(--amber)", cursor: "wait" }

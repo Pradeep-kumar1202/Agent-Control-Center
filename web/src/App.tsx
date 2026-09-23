@@ -197,11 +197,16 @@ function skillIcon(id: string) {
 
 export default function App() {
   const [report, setReport] = useState<Report | null>(null);
+  // Last successful report — what the table shows. Kept separate from
+  // `report` (the newest run, for status) so a running or failed run never
+  // blanks a good table.
+  const [doneReport, setDoneReport] = useState<Report | null>(null);
   const [gaps, setGaps] = useState<Gap[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | "mobile" | "web">("all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [showPaymentMethods, setShowPaymentMethods] = useState(false);
+  // Payment-method rows are next_action handling gaps (real flows), shown by default.
+  const [showPaymentMethods, setShowPaymentMethods] = useState(true);
   const [verifying, setVerifying] = useState<Set<number>>(new Set());
   const [patching, setPatching] = useState<Set<number>>(new Set());
   const [patchedGaps, setPatchedGaps] = useState<Set<number>>(new Set());
@@ -217,16 +222,10 @@ export default function App() {
   const [activeAgent, setActiveAgent] = useState<ActiveAgent>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
   const previewPanel = usePreviewPanel();
-  const [verifyAllProgress, setVerifyAllProgress] = useState<{
-    current: number;
-    total: number;
-    currentName: string;
-  } | null>(null);
   const [activeTab, setActiveTab] = useState<string>("gaps");
   const [skillResults, setSkillResults] = useState<Map<string, SkillEnvelopeClient>>(new Map());
   const [gapPrs, setGapPrs] = useState<Map<string, GapPrRow[]>>(new Map());
   const [seedResetting, setSeedResetting] = useState(false);
-  const verifyAllAbort = useRef(false);
   const pollTimer = useRef<number | null>(null);
 
   // ─── Data loading ──────────────────────────────────────────────────────────
@@ -234,15 +233,17 @@ export default function App() {
   const refresh = useCallback(async () => {
     try {
       const latest = await api.latestReport();
+      const done = latest?.status === "done" ? latest : await api.latestReport("done");
       setReport(latest);
-      if (latest && latest.status === "done") {
+      setDoneReport(done);
+      if (done) {
         // Branch-health is fetched alongside the patch list so every row
         // the UI renders can be cross-checked against actual git state. If
         // the endpoint is unavailable (old server, transient error) we fall
         // back to treating everything as fresh — the per-action 409 path
         // still recovers correctly.
         const [list, patches, prRows, branchHealth] = await Promise.all([
-          api.gaps(latest.id),
+          api.gaps(done.id),
           api.listPatches(),
           api.listGapPrs(),
           api.patchBranchHealth().catch(() => ({} as Awaited<ReturnType<typeof api.patchBranchHealth>>)),
@@ -343,27 +344,6 @@ export default function App() {
     setPatching((prev) => { const s = new Set(prev); s.add(id); return s; });
   };
 
-  const onVerifyAll = async () => {
-    const unverified = gaps.filter((g) => g.verified === 0 && g.platform_specific === 0);
-    if (unverified.length === 0) return;
-    verifyAllAbort.current = false;
-    setVerifyAllProgress({ current: 0, total: unverified.length, currentName: "" });
-
-    for (let i = 0; i < unverified.length; i++) {
-      if (verifyAllAbort.current) break;
-      const g = unverified[i];
-      setVerifyAllProgress({ current: i + 1, total: unverified.length, currentName: g.canonical_name });
-      setVerifying((prev) => { const s = new Set(prev); s.add(g.id); return s; });
-      try {
-        const result = await api.validateGap(g.id);
-        if (result.removed) setGaps((prev) => prev.filter((x) => x.id !== g.id));
-        else setGaps((prev) => prev.map((x) => (x.id === g.id ? result.gap : x)));
-      } catch (e) { setError((e as Error).message); break; }
-      finally { setVerifying((prev) => { const s = new Set(prev); s.delete(g.id); return s; }); }
-    }
-    setVerifyAllProgress(null);
-  };
-
   const onAddPr = async (gapId: number, prUrl: string) => {
     const newRow = await api.addGapPr(gapId, prUrl);
     const key = `${newRow.canonical_name}:${newRow.category}:${newRow.missing_in}`;
@@ -412,7 +392,7 @@ export default function App() {
   const sideFilteredGaps = categoryFilteredGaps.filter((g) => filter === "all" ? true : g.missing_in === filter);
   const visibleGaps = sideFilteredGaps.filter((g) => {
     switch (statusFilter) {
-      case "verified":          return g.verified === 1;
+      case "verified":          return g.verified === 1 && g.platform_specific === 0;
       case "unverified":        return g.verified === 0 && g.platform_specific === 0;
       case "platform_specific": return g.platform_specific === 1;
       case "patched":           return patchedGaps.has(g.id);
@@ -424,9 +404,11 @@ export default function App() {
     total:               categoryFilteredGaps.length,
     mobile:              categoryFilteredGaps.filter((g) => g.missing_in === "mobile").length,
     web:                 categoryFilteredGaps.filter((g) => g.missing_in === "web").length,
-    verified:            gaps.filter((g) => g.verified === 1).length,
-    unverified:          gaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length,
-    platformSpecific:    gaps.filter((g) => g.platform_specific === 1).length,
+    // Verified = confirmed, actionable gaps. Platform-specific rows are also
+    // verified=1 in the DB but are never work items, so they count only there.
+    verified:            categoryFilteredGaps.filter((g) => g.verified === 1 && g.platform_specific === 0).length,
+    unverified:          categoryFilteredGaps.filter((g) => g.verified === 0 && g.platform_specific === 0).length,
+    platformSpecific:    categoryFilteredGaps.filter((g) => g.platform_specific === 1).length,
     patched:             patchedGaps.size,
     hiddenPaymentMethods:gaps.filter((g) => g.category === "payment_method").length,
   };
@@ -451,9 +433,9 @@ export default function App() {
         <div className="topbar-spacer" />
         <div className="topbar-status">
           <div className={`status-dot ${status}`} title={status} />
-          {status === "done" && report && (
-            <span className="topbar-sha">
-              web {report.web_sha.slice(0, 7)} · mob {report.mobile_sha.slice(0, 7)}
+          {status !== "running" && doneReport && (
+            <span className="topbar-sha" title={status === "failed" ? "Showing the last successful analysis" : undefined}>
+              web {doneReport.web_sha.slice(0, 7)} · mob {doneReport.mobile_sha.slice(0, 7)}
             </span>
           )}
           {status === "running" && <span className="topbar-sha">Running…</span>}
@@ -597,20 +579,11 @@ export default function App() {
                   <div className="page-title">Gap Analysis</div>
                   <div className="page-subtitle">
                     hyperswitch-web ↔ hyperswitch-client-core
-                    {report?.status === "done" && ` · ${counts.total} gap${counts.total !== 1 ? "s" : ""}`}
+                    {doneReport && ` · ${counts.total} gap${counts.total !== 1 ? "s" : ""}`}
                   </div>
                 </div>
-                {report?.status === "done" && (
+                {doneReport && (
                   <div className="page-header-actions">
-                    <button
-                      className="btn btn-sm btn-green"
-                      disabled={verifyAllProgress !== null || counts.unverified === 0}
-                      onClick={onVerifyAll}
-                    >
-                      {verifyAllProgress
-                        ? `Verifying ${verifyAllProgress.current}/${verifyAllProgress.total}…`
-                        : `Verify all (${counts.unverified})`}
-                    </button>
                     <button className="btn btn-sm" disabled={seedResetting} onClick={onSeedReset} title="Reset to seed data">
                       {seedResetting ? "Resetting…" : "↺ Seed"}
                     </button>
@@ -618,7 +591,7 @@ export default function App() {
                 )}
               </div>
 
-              {report?.status === "done" && (
+              {doneReport && (
                 <div className="filter-tabs">
                   <button
                     className={`filter-tab ${filter === "all" && statusFilter === "all" ? "active" : ""}`}
@@ -670,7 +643,7 @@ export default function App() {
                         className={`filter-tab ${showPaymentMethods ? "active" : ""}`}
                         onClick={() => setShowPaymentMethods((v) => !v)}
                       >
-                        Payments <span className="filter-tab-count">{counts.hiddenPaymentMethods}</span>
+                        Payment flows <span className="filter-tab-count">{counts.hiddenPaymentMethods}</span>
                       </button>
                     </>
                   )}
@@ -824,29 +797,6 @@ export default function App() {
             {/* ── Gaps view ─────────────────────────────────────────── */}
             {activeTab === "gaps" && (
               <>
-                {/* Verify-all progress banner */}
-                {verifyAllProgress && (
-                  <div className="verify-progress-bar" style={{ margin: "12px 24px 0" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                      <span style={{ fontSize: 12, color: "var(--accent)" }}>
-                        Verifying {verifyAllProgress.current}/{verifyAllProgress.total}
-                        <span className="mono" style={{ fontSize: 10, color: "var(--text3)", marginLeft: 8 }}>
-                          {verifyAllProgress.currentName}
-                        </span>
-                      </span>
-                      <button className="btn btn-red btn-sm" onClick={() => { verifyAllAbort.current = true; }}>
-                        Stop
-                      </button>
-                    </div>
-                    <div className="progress-bar-track">
-                      <div
-                        className="progress-bar-fill fill-green"
-                        style={{ width: `${(verifyAllProgress.current / verifyAllProgress.total) * 100}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-
                 {/* Running */}
                 {status === "running" && (
                   <div className="empty-state">
@@ -856,7 +806,7 @@ export default function App() {
                     </svg>
                     <div className="empty-state-title">Analysing repos…</div>
                     <div className="empty-state-sub">
-                      Cloning and extracting features — takes ~1 minute. Cached runs are instant.
+                      Syncing both repos and reading their declared surfaces — a few seconds.
                     </div>
                   </div>
                 )}
@@ -864,17 +814,19 @@ export default function App() {
                 {/* Failed */}
                 {status === "failed" && report?.error && (
                   <div style={{ margin: 24, padding: 20, border: "1px solid rgba(248,113,113,.2)", borderRadius: 8, background: "var(--red-dim)", color: "var(--red)" }}>
-                    <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13 }}>Analysis failed</div>
+                    <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
+                      Analysis failed{doneReport ? " — showing the last successful analysis below" : ""}
+                    </div>
                     <pre style={{ fontSize: 11, whiteSpace: "pre-wrap", margin: 0, opacity: 0.85 }}>{report.error}</pre>
                   </div>
                 )}
 
-                {/* Done — gap table */}
-                {report?.status === "done" && (
+                {/* Gap table — always the last successful report */}
+                {doneReport && (
                   <>
                     {!showPaymentMethods && counts.hiddenPaymentMethods > 0 && (
                       <div style={{ margin: "10px 24px 0", padding: "5px 12px", border: "1px solid var(--border)", borderRadius: 6, fontSize: 11, color: "var(--text3)" }}>
-                        {counts.hiddenPaymentMethods} payment-method gap{counts.hiddenPaymentMethods !== 1 ? "s" : ""} hidden — mobile SDK loads payment methods dynamically.
+                        {counts.hiddenPaymentMethods} payment-flow gap{counts.hiddenPaymentMethods !== 1 ? "s" : ""} (unhandled next_action types) hidden.
                       </div>
                     )}
                     <div style={{ padding: "12px 24px 24px" }}>

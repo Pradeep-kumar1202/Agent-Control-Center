@@ -13,7 +13,10 @@ import os from "node:os";
 import path from "node:path";
 import { extractBackendApiSurface, normalisePath } from "../analyzer/surface/backendApi.js";
 import { extractConfigSurface } from "../analyzer/surface/config.js";
+import { extractPaymentFlowSurface, stripLineComments } from "../analyzer/surface/paymentFlows.js";
 import { canonicalName, diffSurface, SurfaceParseError } from "../analyzer/surface/index.js";
+import { checkPatchable } from "../analyzer/patchGate.js";
+import type { GapRow } from "../db.js";
 
 let failed = 0;
 function check(name: string, ok: boolean, detail = "") {
@@ -161,6 +164,88 @@ let notUrl = \`\${name}/payments/x\`
   check("inline URL literals are read", k.has("payments/{}/confirm"));
   check("static assets are not endpoints", !k.has("app.css"));
   check("literals not rooted at a url/endpoint variable are ignored", !k.has("payments/x"));
+}
+
+
+// ── payment flows (next_action handling) ───────────────────────────────────
+{
+  const mobile = tree({
+    "src/hooks/AllPaymentHooks.res": `
+let handleApiRes = (~nextAction) => {
+  switch nextAction->PaymentUtils.getActionType {
+  | "three_ds_invoke" => a()
+  | "third_party_sdk_session_token" => b()
+  | "redirect_to_url" if redirectUrl !== "" => c()
+  | _ => d()
+  }
+}
+`,
+    "src/headless/HeadlessCommon.res": `
+let f = nextAction =>
+  switch nextAction->PaymentUtils.getActionType {
+  // | "qr_code_information" => handleQr(~nextAction)
+  /*
+  | "display_voucher_information" => v()
+  */
+  | "invoke_ddc" => e()
+  | _ => ()
+  }
+`,
+  });
+  const m = extractPaymentFlowSurface("mobile", mobile);
+  const mk = new Set(m.map((i) => i.key));
+  check("switch arms on the next_action type are read (incl. guarded arms)", mk.has("next_action/three_ds_invoke") && mk.has("next_action/redirect_to_url") && mk.has("next_action/invoke_ddc"));
+  check("commented-out arms (// and /* */) do not count as handled", !mk.has("next_action/qr_code_information") && !mk.has("next_action/display_voucher_information"));
+  const ddc = m.find((i) => i.key === "next_action/invoke_ddc")!;
+  check("comment stripping preserves line numbers", ddc.line === 8 && ddc.snippet.startsWith('| "invoke_ddc"'), `${ddc.line}: ${ddc.snippet}`);
+
+  const web = tree({
+    "src/Utilities/PaymentHelpers.res": `
+if intent.nextAction.type_ == "redirect_to_url" { a() }
+else if intent.nextAction.type_ === "qr_code_information" { b() }
+else if "display_voucher_information" === nextActionType { c() }
+// else if intent.nextAction.type_ === "invoke_hidden_iframe" { d() }
+let url = "https://example.com/next" // a URL is not a comment
+`,
+  });
+  const wk = new Set(extractPaymentFlowSurface("web", web).map((i) => i.key));
+  check("==/=== comparisons are read in both operand orders", wk.has("next_action/redirect_to_url") && wk.has("next_action/qr_code_information") && wk.has("next_action/display_voucher_information"));
+  check("a commented-out comparison does not count as handled", !wk.has("next_action/invoke_hidden_iframe"));
+  check("stripping leaves URLs in strings intact", stripLineComments('let u = "https://x.io/a"').includes("https://x.io/a"));
+}
+
+
+// ── patch gate ─────────────────────────────────────────────────────────────
+{
+  const flows = (mobileArms: string[]) => ({
+    web: tree({
+      "src/Utilities/PaymentHelpers.res": ["redirect_to_url", "qr_code_information", "three_ds_invoke", "invoke_ddc"]
+        .map((t) => `if intent.nextAction.type_ === "${t}" { x() }`)
+        .join("\n"),
+    }),
+    mobile: tree({
+      "src/hooks/AllPaymentHooks.res": `switch nextAction->PaymentUtils.getActionType {\n${mobileArms.map((t) => `  | "${t}" => x()`).join("\n")}\n  | _ => ()\n}\n`,
+    }),
+  });
+  const row = (over: Partial<GapRow>): GapRow => ({
+    id: 1, report_id: 1, category: "payment_method", canonical_name: "next_action/qr_code_information",
+    missing_in: "mobile", present_in: "web", rationale: "r", severity: "medium", platform_specific: 0, verified: 1,
+    evidence: JSON.stringify([{ name: "next_action/qr_code_information", file: "f", line: 1, snippet: "s" }]),
+    ...over,
+  });
+  const open = flows(["redirect_to_url", "three_ds_invoke", "invoke_ddc"]);
+  const r1 = checkPatchable(row({ verified: 0 }), open);
+  check("an unverified gap cannot be patched", !r1.ok && r1.code === "GAP_NOT_VERIFIED");
+  const r2 = checkPatchable(row({ platform_specific: 1 }), open);
+  check("a platform-specific gap cannot be patched", !r2.ok && r2.code === "GAP_PLATFORM_SPECIFIC");
+  check("a verified gap that still exists can be patched", checkPatchable(row({}), open).ok);
+  const closed = flows(["redirect_to_url", "three_ds_invoke", "invoke_ddc", "qr_code_information"]);
+  const r3 = checkPatchable(row({}), closed);
+  check(
+    "a gap closed upstream is refused, citing where it now lives",
+    !r3.ok && r3.code === "GAP_CLOSED" && r3.error.includes("src/hooks/AllPaymentHooks.res:"),
+    r3.ok ? "ok" : r3.error,
+  );
 }
 
 // ── comparison ─────────────────────────────────────────────────────────────

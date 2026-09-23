@@ -379,7 +379,8 @@ export const api = {
   },
 
   health: () => jsonFetch<Health>(`${BASE}/health`),
-  latestReport: () => jsonFetch<Report | null>(`${BASE}/reports/latest`),
+  latestReport: (status?: "done") =>
+    jsonFetch<Report | null>(`${BASE}/reports/latest${status ? `?status=${status}` : ""}`),
   gaps: (reportId?: number) =>
     jsonFetch<Gap[]>(
       `${BASE}/gaps${reportId ? `?report_id=${reportId}` : ""}`,
