@@ -68,8 +68,9 @@ async function asJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
-      const body = await res.json() as { error?: string };
+      const body = await res.json() as { error?: string; slots?: string[] };
       if (body?.error) detail = body.error;
+      if (body?.slots?.length) detail += ` Configure these slots in Settings: ${body.slots.join(", ")}.`;
     } catch { /* keep the status */ }
     throw new Error(detail);
   }
@@ -94,6 +95,15 @@ export async function startJob(
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify({ input, clientKey }),
   });
+  // 409 with a jobId means "this exact work is already running" — attach to
+  // that run instead of failing, so a second tab or a retry watches the same job.
+  if (res.status === 409) {
+    const body = await res.clone().json().catch(() => ({})) as { jobId?: number };
+    if (typeof body.jobId === "number") {
+      rememberJob(skillId, body.jobId);
+      return body.jobId;
+    }
+  }
   const { jobId } = await asJson<{ jobId: number }>(res);
   rememberJob(skillId, jobId);
   return jobId;

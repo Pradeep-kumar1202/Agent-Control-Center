@@ -1125,3 +1125,75 @@ category-scoped key and carried forward by declared identity across re-runs.
 
 **State.** 67 gaps (16 platform-specific); eval: 16/16 seed recall, 0 dismissed
 regressions, 0 table warnings; `check:surface` 41 checks.
+
+### 2026-09-23 — Iteration 12: PR Port runs in pinned per-run worktrees, as a durable job
+
+**Why.** The PR-Port audit's high-severity findings mostly shared one cause: every
+run worked inside the single shared clone per repo. The source "read" was local
+`main` (files the PR adds did not exist for the agents); other skills reset the same
+clone mid-run; cleanup had to `checkout main && clean -fd` the clone, so a closed tab
+or a cancel destroyed uncommitted work; unpushed local commits rode into PRs; the
+implementer could write into the source clone. And the durable job runner existed
+(`jobs/`) but no skill used it — PR Port was still one streaming POST, so closing the
+tab aborted the run.
+
+**What.**
+- `workspace/worktree.ts`: each run gets `data/worktrees/run-<job>/{source,target}`.
+  Source = detached at the PR head fetched from `refs/pull/<n>/head` (aborts if the
+  head moved since the diff was fetched). Target = new branch from `origin/main`'s
+  SHA. `shared-code` initialised at the recorded pin (borrowing objects from the
+  clone); native `android`/`ios` skipped. `node_modules` symlinked from the clone.
+  Shared clones are only fetched and have worktree metadata added/removed, briefly,
+  under the repo lock — never checked out, cleaned or reset by a port.
+- Deterministic branch `port/pr-<n>-<source>` (was derived from the model's
+  feature name): a re-run updates the same upstream PR instead of opening a duplicate.
+  An existing branch of that name is archived (`…-attempt-<job>-before`), never
+  deleted; an empty re-run gives it its name back.
+- Work is committed on every exit path including cancel, then worktrees are removed;
+  the branch is the durable artifact. On boot, leftover run worktrees (server killed
+  mid-run) have their work committed onto the branch, then are removed.
+- PR Port is a job: `POST /skills/pr-port/jobs` (validates, resolves agents, refuses a
+  second live run for the same PR with 409 + the running job's id), events replay on
+  reconnect, only `POST /jobs/:id/cancel` stops it. Form rewritten on `useJob`; the
+  client attaches to the running job on 409. Old `/skills/pr-port/generate` removed.
+- Build gate is async (`runRescriptBuildAsync`): no more 3-minute event-loop freeze;
+  cancellation kills the build.
+- Job runner: a cancelled executor that returns an error envelope (to report
+  preserved work) now ends `cancelled`, not `error`.
+
+**Bugs the checks found before any real run.**
+- `node_modules/` (client-core's ignore rule, trailing slash) matches directories
+  only; git sees the symlink as a file — every mobile-target port would have
+  committed it into the PR. Fixed with `/node_modules` in the repo's shared
+  `info/exclude`. The worktree check's fixture uses client-core's exact rule.
+- Web's `postinstall` runs `update:submodules`, moving `shared-code` to upstream
+  HEAD in the shared clone (unpinned builds, dirty clone). Worktrees init at the pin;
+  for the clones, install with care and `git submodule update --init` afterwards.
+- client-core commits a Yarn-3-format lockfile (`version: 6`) but ships Yarn 4.4.1,
+  so `yarn install --immutable` fails on a fresh clone (CI likely too). Local installs
+  must restore `yarn.lock`/`.yarnrc.yml` afterwards to keep the clone clean.
+
+**Verified.** `check:worktrees` (21 checks on synthetic git repos: PR-head pinning,
+origin/main base, no local-commit leak, submodule pin despite drift, symlink not
+committed, preserve+teardown, archive/restore, moved-head abort, crash recovery, live
+runs untouched) — 4 reintroduced bugs each turned a check red. `checkJobs` +1
+(cancel-returning-envelope, fails without the fix). Live smoke on
+juspay/hyperswitch-web#1774 → client-core: 201 then 409 dedupe; worktrees pinned in
+~12 s (source @bd17be9, base @fa6d533); cancel killed the Codex agent; worktrees
+removed; empty branch deleted; clones unchanged.
+
+**Mistake worth recording.** Re-running the smoke script reused its idempotency key,
+so "start" correctly returned the finished job 1 and the "duplicate" request started
+a real job 2 that the script never cancelled. Caught and cancelled during triage
+(seconds into the first Codex turn); nothing written or published. Rule: a smoke
+test must cancel every job id any of its requests returned, and use fresh keys.
+
+**Settings restored.** The Aug 12 agent configuration (profiles `deep` = codex
+gpt-5.6-sol, `fast` = opencode litellm/open-large; all stages → `deep`) was re-applied
+through `PUT /settings` from the Agent-Control-Center checkout's database.
+
+**Next (Phase 2 of the plan).** Give the verifier the source diff; deterministic
+check that backend field names/enum literals in the source diff appear in the port;
+a target-assessor stage (`already_present | needs_port | partial`) before
+implementation; repair loop from verifier findings; submodule-diff expansion;
+build gate matching CI (`re:check`, jest).

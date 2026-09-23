@@ -10,9 +10,7 @@
 import type { Request, Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
-import { localGit } from "../../workspace/git.js";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../../config.js";
-import { db, saveSkillRun } from "../../db.js";
 import type { VarBag } from "../../agents/loader.js";
 import { extractJson, isRecord, isStringArray } from "../../agents/json.js";
 import {
@@ -33,35 +31,33 @@ import {
   abortIfNeeded,
   beginPhase,
   makeEnvelope,
-  newTotals,
   resolveWithRepair,
   resultFor,
   runStage,
-  slugify,
   type StageContext,
 } from "../pipeline.js";
 import {
-  assertWorkspaceReady,
-  cleanupTarget,
-  preserveWork,
-} from "../../workspace/session.js";
+  createPortWorktrees,
+  finishPortWorktrees,
+  portBranchName,
+  preserveTargetWork,
+} from "../../workspace/worktree.js";
+import { listJobs, startJob } from "../../jobs/runner.js";
+import { registerJobSkill } from "../../jobs/routes.js";
 import { requestOverride } from "../../routes/profile.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
 import { getBranchDiff } from "../prDiff.js";
 import { resolvePortDirection, type PortDirection } from "../prUrl.js";
-import { runRescriptBuild } from "../buildCheck.js";
+import { runRescriptBuildAsync } from "../buildCheck.js";
 import {
-  captureSubmoduleHeads,
-  forceCheckoutBranch,
+  commitWithSubmodules,
   getDiffWithSubmodules,
-  restoreSubmoduleHeads,
-  type SubmoduleHead,
+  type SubmoduleCommitResult,
 } from "../submoduleGit.js";
 import {
   formatPortPrBody,
   publishPullRequest,
 } from "../githubPr.js";
-import { withRepoLocks } from "../../workspace/mutex.js";
 
 export interface PrPortInput {
   prUrl: string;
@@ -182,6 +178,10 @@ interface PipelineContext extends StageContext {
   portSpecRepair?: PortSpecRepairDiagnostics;
   /** Open the resulting PR as a draft; see PrPortInput.draft. */
   draft: boolean;
+  /** The job id; names the run's worktree directory and patch artifact. */
+  runId: number;
+  /** Job runner hook: queued → running once the worktrees exist. */
+  setRunning?: () => void;
 }
 
 const PORT_SLOTS: AgentSlot[] = [
@@ -212,9 +212,9 @@ const PORT_ACCESS: Partial<Record<AgentSlot, AccessPolicy>> = {
 };
 
 /**
- * Branches this skill owns. `cleanupTarget` will only ever delete a branch
- * starting with this, so a bug that passed the wrong name cannot remove a
- * human's branch. Distinct from the patch pipeline's prefix on purpose, so
+ * Branches this skill owns (`port/pr-<n>-<source>`, see portBranchName). An
+ * empty branch is only ever deleted when it starts with this, so a bug that
+ * passed the wrong name cannot remove a human's branch. Distinct from the patch pipeline's prefix on purpose, so
  * branch-health and cleanup can tell the two apart.
  */
 const BRANCH_PREFIX = "port/pr-";
@@ -513,43 +513,85 @@ function envelope(
 
 // ─── pipeline ───────────────────────────────────────────────────────────────
 
+/**
+ * One port run, executed as a durable job (jobs/runner.ts) inside its own
+ * pinned worktrees (workspace/worktree.ts):
+ *
+ *   source worktree  detached at the PR's head SHA — the code the PR contains
+ *   target worktree  branch `port/pr-<n>-<source>` from origin/main's SHA
+ *
+ * The shared clones are never checked out, cleaned or reset by a port, so no
+ * other skill can race it and it cannot race them. Whatever the implementer
+ * produced is committed onto the branch on every exit path — success, gate
+ * failure, error and cancel — before the worktrees are removed. The branch is
+ * the durable artifact; the worktrees are scratch.
+ */
 async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
   const { direction, emit, signal } = ctx;
-  const sourceDir = REPOS[direction.source].dir;
-  const targetDir = REPOS[direction.target].dir;
+  abortIfNeeded(signal);
 
-  return withRepoLocks([direction.source, direction.target], async () => {
-    abortIfNeeded(signal);
-    await assertWorkspaceReady(direction.source, true);
-    await assertWorkspaceReady(direction.target, true);
-    if (!fs.existsSync(path.join(targetDir, "node_modules"))) {
-      throw new Error(
-        `node_modules not installed in ${targetDir}. Run npm install there before starting a PR port.`,
-      );
-    }
+  beginPhase(ctx, "fetching");
+  const source = await getBranchDiff(REPOS[direction.source].dir, direction.pr.url, "main", direction.source);
+  if (!source.diff.trim()) {
+    return envelope(
+      ctx,
+      "error",
+      "error",
+      resultFor(direction.target, "", "", 0, "The source PR contains no diff against its PR base.", {
+        error: "Source PR diff is empty",
+      }),
+      { sourceBaseSha: source.baseSha, sourceHeadSha: source.headSha },
+    );
+  }
+  emit({
+    type: "diff_ready",
+    source: direction.source,
+    target: direction.target,
+    stat: source.stat,
+    fileCount: parseDiffFiles(source.diff).length,
+  });
 
-    beginPhase(ctx, "fetching");
-    const source = await getBranchDiff(sourceDir, direction.pr.url, "main", direction.source);
-    if (!source.diff.trim()) {
-      return envelope(
-        ctx,
-        "error",
-        "error",
-        resultFor(direction.target, "", "", 0, "The source PR contains no diff against its PR base.", {
-          error: "Source PR diff is empty",
-        }),
-        { sourceBaseSha: source.baseSha, sourceHeadSha: source.headSha },
-      );
-    }
-    emit({
-      type: "diff_ready",
-      source: direction.source,
-      target: direction.target,
-      stat: source.stat,
-      fileCount: parseDiffFiles(source.diff).length,
-    });
+  const branchName = portBranchName(direction.source, direction.pr.number);
+  const wt = await createPortWorktrees({
+    runId: ctx.runId,
+    source: direction.source,
+    target: direction.target,
+    prNumber: direction.pr.number,
+    expectedHeadSha: source.headSha,
+    branch: branchName,
+  });
+  ctx.setRunning?.();
+  emit({
+    type: "workspace_ready",
+    sourceSha: wt.source.sha,
+    targetBaseSha: wt.target.baseSha,
+    branch: branchName,
+    ...(wt.archivedBranch ? { archivedBranch: wt.archivedBranch } : {}),
+  });
+  if (wt.archivedBranch) {
+    emit({ type: "warning", warning: `An earlier attempt's branch was kept as ${wt.archivedBranch}.` });
+  }
 
-    const deterministic = deterministicPortabilityHints(direction.source, direction.target, source.diff);
+  const sourceDir = wt.source.dir;
+  const targetDir = wt.target.dir;
+  const provenance = { sourceHeadSha: wt.source.sha, targetBaseSha: wt.target.baseSha, sourceBaseSha: source.baseSha };
+  const label = `${direction.pr.owner}/${direction.pr.repo}#${direction.pr.number}`;
+
+  let triage: TriageResult | undefined;
+  let spec: PortSpec | undefined;
+  let committed = false;
+  let latestDiff = "";
+  let latestFiles = 0;
+  let patchPath: string | undefined;
+  const deterministic = deterministicPortabilityHints(direction.source, direction.target, source.diff);
+
+  const commit = async (message: string): Promise<SubmoduleCommitResult> => {
+    const result = await commitWithSubmodules(targetDir, direction.target, message);
+    committed = true;
+    return result;
+  };
+
+  try {
     beginPhase(ctx, "triaging");
     const triageText = await runDefinition(ctx, "pr-port/triage", {
       PR_URL: direction.pr.url,
@@ -579,40 +621,21 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       throw err;
     }
     ctx.triageRepair = triageResolution.diagnostics;
-    const triage = triageResolution.triage;
+    triage = triageResolution.triage;
     emit({ type: "triage_result", triage, repaired: triageResolution.diagnostics.repaired });
 
-    // Triage scopes the work; it does not get to end the run on its own opinion.
-    //
-    // It sees only the diff, has not read the target repo, and is the cheapest,
-    // least-informed stage in the pipeline — yet a "no" here used to cancel
-    // everything. On hyperswitch-web#1593 ("eligibility enhancement with
-    // surcharge calculation", 29 files) that produced a flat refusal to port a
-    // straightforwardly portable feature.
-    //
-    // A refusal is therefore only honoured when the DETERMINISTIC rules agree.
-    // Those encode structural facts about the two SDKs (mobile has no static
-    // payment-method registry, native-only changes have no web counterpart) and
-    // cost no tokens. Absent that corroboration the pipeline continues, and the
-    // analyst — which reads actual code in both repos — decides.
+    // Triage scopes the work; it does not get to end the run on its own opinion
+    // (hyperswitch-web#1593 — LEARNINGS 2026-08-12). A refusal is honoured only
+    // when the zero-token deterministic rules agree.
     if (triage.portability === "no" && deterministic.length > 0) {
       const reason = triage.reasons.join(" ") || "No meaningful target-SDK behavior remains.";
-      return envelope(
-        ctx,
-        "partial",
-        "non_portable",
-        resultFor(direction.target, "", "", 0, reason),
-        {
-          triage,
-          deterministicHints: deterministic,
-          sourceBaseSha: source.baseSha,
-          sourceHeadSha: source.headSha,
-        },
-      );
+      return envelope(ctx, "partial", "non_portable", resultFor(direction.target, "", "", 0, reason), {
+        triage,
+        deterministicHints: deterministic,
+        ...provenance,
+      });
     }
     if (triage.portability === "no") {
-      // Recorded, not obeyed: the analyst is told triage wanted to decline and
-      // must either find portable behavior or say plainly that none exists.
       emit({
         type: "warning",
         warning: "Triage proposed declining this PR but no deterministic rule supports that; continuing to source analysis.",
@@ -648,224 +671,163 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       throw err;
     }
     ctx.portSpecRepair = specResolution.diagnostics;
-    const spec = specResolution.spec;
+    spec = specResolution.spec;
     emit({ type: "spec_result", spec, repaired: specResolution.diagnostics.repaired });
 
-    const branchName = `${BRANCH_PREFIX}${direction.pr.number}-${slugify(spec.featureName)}`;
-    const baseline = await captureSubmoduleHeads(targetDir, direction.target);
-    let branchCreated = false;
-    let keepBranch = false;
-    let committed = false;
-    let latestDiff = "";
-    let latestFiles = 0;
-    let patchPath: string | undefined;
+    beginPhase(ctx, "implementing", { branch: branchName });
+    // The implementer reads the source worktree directly (see LEARNINGS
+    // 2026-08-12, "blindness is not a substitute for instruction"). It is the
+    // run's own disposable checkout, so a stray write cannot reach a clone.
+    const implementerText = await runDefinition(ctx, "pr-port/implementer", {
+      TARGET_REPO: REPOS[direction.target].name,
+      SOURCE_REPO: REPOS[direction.source].name,
+      PR_URL: direction.pr.url,
+      PORT_SPEC_JSON: JSON.stringify(spec, null, 2),
+      SOURCE_DIFF: source.diff,
+    }, targetDir, sourceDir, targetDir, false, [sourceDir]);
 
-    try {
-      abortIfNeeded(signal);
-      await forceCheckoutBranch(targetDir, direction.target, "main");
-      await restoreSubmoduleHeads(targetDir, baseline);
-      const targetGit = localGit(targetDir);
-      try { await targetGit.deleteLocalBranch(branchName, true); } catch { /* first run */ }
-      await targetGit.checkoutLocalBranch(branchName);
-      branchCreated = true;
-
-      beginPhase(ctx, "implementing", { branch: branchName });
-      // The implementer reads the source repo directly.
-      //
-      // It used to be deliberately source-blind, with the JSON spec as the only
-      // bridge — the idea being that blindness prevents verbatim copying. In
-      // practice the spec is lossy: anything the analyst failed to write down
-      // became invisible, and the implementer had no way to check an edge case,
-      // a default, or a backend field name. The result was mechanical output.
-      //
-      // Copying is better prevented by instruction and by the validators than by
-      // withholding context. `readDirs` is honoured by claude-code and codex via
-      // --add-dir; opencode has no equivalent and `resolveRun` rejects the slot
-      // up front rather than silently running without it.
-      const implementerText = await runDefinition(ctx, "pr-port/implementer", {
-        TARGET_REPO: REPOS[direction.target].name,
-        SOURCE_REPO: REPOS[direction.source].name,
-        PR_URL: direction.pr.url,
-        PORT_SPEC_JSON: JSON.stringify(spec, null, 2),
-        SOURCE_DIFF: source.diff,
-      }, targetDir, sourceDir, targetDir, false, [sourceDir]);
-
-      ({ diff: latestDiff, fileCount: latestFiles } = await getDiffWithSubmodules(targetDir, direction.target));
-      if (!latestDiff.trim() || latestFiles === 0) {
-        return envelope(
-          ctx,
-          "error",
-          "error",
-          resultFor(direction.target, branchName, "", 0, implementerText, { error: "Implementer produced no target changes" }),
-          { triage, spec, deterministicHints: deterministic },
-        );
-      }
-
-      fs.mkdirSync(PATCHES_DIR, { recursive: true });
-      patchPath = path.join(PATCHES_DIR, `port-${direction.source}-pr-${direction.pr.number}-${slugify(spec.featureName)}.patch`);
-      fs.writeFileSync(patchPath, latestDiff);
-
-      beginPhase(ctx, "building");
-      const build = runRescriptBuild(targetDir);
-      emit({ type: "build_result", passed: build.passed, log: build.log });
-      if (!build.passed) {
-        await preserveWork(direction.target, `wip: port ${direction.pr.owner}/${direction.pr.repo}#${direction.pr.number} — build failed`);
-        committed = true;
-        keepBranch = true;
-        return envelope(
-          ctx,
-          "partial",
-          "build_failed",
-          resultFor(direction.target, branchName, latestDiff, latestFiles, implementerText, {
-            error: "ReScript build failed; work was preserved on the local branch",
-          }),
-          { triage, spec, buildStatus: "fail", buildLog: build.log, patchPath, deterministicHints: deterministic },
-        );
-      }
-
-      beginPhase(ctx, "validating");
-      const quality = runPatchValidators({
-        diff: latestDiff,
-        repoDir: targetDir,
-        category: "pr-port",
-        patchPath,
-        spec: {
-          configKey: spec.configKey,
-          typeDefinition: spec.typeDefinition,
-          allRelatedFiles: spec.sourceFiles.map((f) => ({ path: f.path, role: f.role })),
-        },
-      });
-      emit({ type: "validators", report: quality });
-
-      if (quality.rejected) {
-        await preserveWork(direction.target, `wip: port ${direction.pr.owner}/${direction.pr.repo}#${direction.pr.number} — validator rejection`);
-        committed = true;
-        keepBranch = true;
-        return envelope(
-          ctx,
-          "partial",
-          "rejected",
-          resultFor(direction.target, branchName, latestDiff, latestFiles, implementerText),
-          { triage, spec, buildStatus: "pass", buildLog: build.log, quality, patchPath, deterministicHints: deterministic },
-        );
-      }
-
-      beginPhase(ctx, "verifying");
-      const verifierText = await runDefinition(ctx, "pr-port/verifier", {
-        FEATURE_NAME: spec.featureName,
-        SOURCE_REPO: REPOS[direction.source].name,
-        TARGET_REPO: REPOS[direction.target].name,
-        PORT_SPEC_JSON: JSON.stringify(spec, null, 2),
-        TARGET_DIFF: latestDiff,
-      }, targetDir, sourceDir, targetDir, true);
-      const verifier = parseVerifier(verifierText);
-      const verdict = computePatchVerdict(quality, verifier);
-      emit({ type: "verifier_result", verifier, verdict });
-
-      const commitMessage = `feat: port ${direction.pr.owner}/${direction.pr.repo}#${direction.pr.number} — ${spec.featureName}`;
-      const commitResult = await preserveWork(direction.target, commitMessage);
-      committed = true;
-      keepBranch = true;
-
-      let prUrl: string | null = null;
-      let prNumber: number | null = null;
-      let prWarning: string | null = null;
-      try {
-        const body = formatPortPrBody({
-          sourcePrUrl: direction.pr.url,
-          sourceRepo: REPOS[direction.source].name,
-          targetRepo: REPOS[direction.target].name,
-          featureName: spec.featureName,
-          portability: triage.portability,
-          portabilityReasons: triage.reasons,
-          summaryJson: implementerText,
-          filesTouched: latestFiles,
-          skippedFiles: [...triage.skippedFiles, ...spec.notPorting],
-          buildLog: build.log,
-          verdict: verdict === "pass" ? "pass" : "needs_review",
-          findings: quality.findings,
-          verifierIssues: verifier.issues,
-        });
-        const created = await publishPullRequest({
-          repoDir: targetDir,
-          repoKey: direction.target,
-          branch: branchName,
-          title: `feat: port ${spec.featureName}`,
-          body,
-          draft: ctx.draft || verdict !== "pass",
-          submodulesChanged: commitResult.submodulesChanged,
-        });
-        prUrl = created.prUrl;
-        prNumber = created.prNumber;
-      } catch (err) {
-        prWarning = `PR creation failed; the local branch is preserved: ${(err as Error).message}`;
-      }
-
-      return envelope(
-        ctx,
-        verdict === "pass" ? "ok" : "partial",
-        verdict === "pass" ? "pass" : "needs_review",
-        resultFor(direction.target, branchName, latestDiff, latestFiles, implementerText, {
-          prUrl,
-          prNumber,
-          prWarning,
-        }),
-        {
-          triage,
-          spec,
-          buildStatus: "pass",
-          buildLog: build.log,
-          quality,
-          verifier,
-          patchPath,
-          deterministicHints: deterministic,
-          sourceBaseSha: source.baseSha,
-          sourceHeadSha: source.headSha,
-        },
-      );
-    } catch (err) {
-      const aborted = signal.aborted || (err as Error).name === "AbortError";
-      if (branchCreated && !committed && !aborted) {
-        try {
-          ({ diff: latestDiff, fileCount: latestFiles } = await getDiffWithSubmodules(targetDir, direction.target));
-          if (latestDiff.trim()) {
-            await preserveWork(direction.target, `wip: port ${direction.pr.owner}/${direction.pr.repo}#${direction.pr.number} — interrupted`);
-            keepBranch = true;
-            committed = true;
-          }
-        } catch { /* patch artifact and error still surface below */ }
-      }
+    ({ diff: latestDiff, fileCount: latestFiles } = await getDiffWithSubmodules(targetDir, direction.target));
+    if (!latestDiff.trim() || latestFiles === 0) {
       return envelope(
         ctx,
         "error",
-        aborted ? "cancelled" : "error",
-        resultFor(direction.target, branchName, latestDiff, latestFiles, "", {
-          error: aborted ? "PR port cancelled" : (err as Error).message,
-        }),
-        { triage, spec, patchPath, deterministicHints: deterministic },
+        "error",
+        resultFor(direction.target, branchName, "", 0, implementerText, { error: "Implementer produced no target changes" }),
+        { triage, spec, deterministicHints: deterministic, ...provenance },
       );
-    } finally {
-      if (branchCreated) {
-        try { await cleanupTarget(direction.target, baseline, branchName, keepBranch, BRANCH_PREFIX); }
-        catch (err) { console.error(`[pr-port] target cleanup failed: ${(err as Error).message}`); }
+    }
+
+    fs.mkdirSync(PATCHES_DIR, { recursive: true });
+    patchPath = path.join(PATCHES_DIR, `port-${direction.source}-pr-${direction.pr.number}-run-${ctx.runId}.patch`);
+    fs.writeFileSync(patchPath, latestDiff);
+
+    beginPhase(ctx, "building");
+    const build = await runRescriptBuildAsync(targetDir, signal);
+    emit({ type: "build_result", passed: build.passed, log: build.log });
+    if (!build.passed) {
+      await commit(`wip: port ${label} — build failed`);
+      return envelope(
+        ctx,
+        "partial",
+        "build_failed",
+        resultFor(direction.target, branchName, latestDiff, latestFiles, implementerText, {
+          error: "ReScript build failed; work was preserved on the local branch",
+        }),
+        { triage, spec, buildStatus: "fail", buildLog: build.log, patchPath, deterministicHints: deterministic, ...provenance },
+      );
+    }
+
+    beginPhase(ctx, "validating");
+    const quality = runPatchValidators({
+      diff: latestDiff,
+      repoDir: targetDir,
+      category: "pr-port",
+      patchPath,
+      spec: {
+        configKey: spec.configKey,
+        typeDefinition: spec.typeDefinition,
+        allRelatedFiles: spec.sourceFiles.map((f) => ({ path: f.path, role: f.role })),
+      },
+    });
+    emit({ type: "validators", report: quality });
+    if (quality.rejected) {
+      await commit(`wip: port ${label} — validator rejection`);
+      return envelope(
+        ctx,
+        "partial",
+        "rejected",
+        resultFor(direction.target, branchName, latestDiff, latestFiles, implementerText),
+        { triage, spec, buildStatus: "pass", buildLog: build.log, quality, patchPath, deterministicHints: deterministic, ...provenance },
+      );
+    }
+
+    beginPhase(ctx, "verifying");
+    const verifierText = await runDefinition(ctx, "pr-port/verifier", {
+      FEATURE_NAME: spec.featureName,
+      SOURCE_REPO: REPOS[direction.source].name,
+      TARGET_REPO: REPOS[direction.target].name,
+      PORT_SPEC_JSON: JSON.stringify(spec, null, 2),
+      TARGET_DIFF: latestDiff,
+    }, targetDir, sourceDir, targetDir, true);
+    const verifier = parseVerifier(verifierText);
+    const verdict = computePatchVerdict(quality, verifier);
+    emit({ type: "verifier_result", verifier, verdict });
+
+    const commitResult = await commit(`feat: port ${label} — ${spec.featureName}`);
+
+    let prUrl: string | null = null;
+    let prNumber: number | null = null;
+    let prWarning: string | null = null;
+    try {
+      const body = formatPortPrBody({
+        sourcePrUrl: direction.pr.url,
+        sourceRepo: REPOS[direction.source].name,
+        targetRepo: REPOS[direction.target].name,
+        featureName: spec.featureName,
+        portability: triage.portability,
+        portabilityReasons: triage.reasons,
+        summaryJson: implementerText,
+        filesTouched: latestFiles,
+        skippedFiles: [...triage.skippedFiles, ...spec.notPorting],
+        buildLog: build.log,
+        verdict: verdict === "pass" ? "pass" : "needs_review",
+        findings: quality.findings,
+        verifierIssues: verifier.issues,
+      });
+      // Deterministic branch name => a re-run of the same source PR updates the
+      // PR it already opened (publishPullRequest reuses an open PR for the
+      // branch) instead of opening a duplicate.
+      const created = await publishPullRequest({
+        repoDir: targetDir,
+        repoKey: direction.target,
+        branch: branchName,
+        title: `feat: port ${spec.featureName}`,
+        body,
+        draft: ctx.draft || verdict !== "pass",
+        submodulesChanged: commitResult.submodulesChanged,
+      });
+      prUrl = created.prUrl;
+      prNumber = created.prNumber;
+    } catch (err) {
+      prWarning = `PR creation failed; the local branch is preserved: ${(err as Error).message}`;
+    }
+
+    return envelope(
+      ctx,
+      verdict === "pass" ? "ok" : "partial",
+      verdict === "pass" ? "pass" : "needs_review",
+      resultFor(direction.target, branchName, latestDiff, latestFiles, implementerText, { prUrl, prNumber, prWarning }),
+      { triage, spec, buildStatus: "pass", buildLog: build.log, quality, verifier, patchPath, deterministicHints: deterministic, ...provenance },
+    );
+  } catch (err) {
+    const aborted = signal.aborted || (err as Error).name === "AbortError";
+    // Preserve on EVERY failure path, cancel included: a user pressing Stop is
+    // asking the agent to stop, not asking for its work to be thrown away.
+    if (!committed) {
+      try {
+        ({ diff: latestDiff, fileCount: latestFiles } = await getDiffWithSubmodules(targetDir, direction.target));
+        if (await preserveTargetWork(wt, `wip: port ${label} — ${aborted ? "cancelled" : "interrupted"}`)) committed = true;
+      } catch (preserveErr) {
+        emit({ type: "warning", warning: `Could not preserve work: ${(preserveErr as Error).message}` });
       }
     }
-  });
-}
-
-// ─── HTTP interface + persistence ──────────────────────────────────────────
-
-function persistEnvelope(input: PrPortInput, value: SkillEnvelope): number | null {
-  try {
-    const runId = saveSkillRun("pr-port", value.status, JSON.stringify(input), JSON.stringify(value));
-    value.meta = { ...value.meta, runId };
-    db.prepare("UPDATE skill_runs SET result_json = ? WHERE id = ?").run(JSON.stringify(value), runId);
-    return runId;
-  } catch (err) {
-    console.error(`[pr-port] failed to persist run: ${(err as Error).message}`);
-    return null;
+    return envelope(
+      ctx,
+      "error",
+      aborted ? "cancelled" : "error",
+      resultFor(direction.target, committed ? branchName : "", latestDiff, latestFiles, "", {
+        error: aborted ? "PR port cancelled" : (err as Error).message.slice(0, MAX_STREAM_ERROR),
+      }),
+      { triage, spec, patchPath, deterministicHints: deterministic, workPreserved: committed, ...provenance },
+    );
+  } finally {
+    await finishPortWorktrees(wt, committed, BRANCH_PREFIX).catch((err) =>
+      console.error(`[pr-port] worktree teardown failed for run ${ctx.runId}: ${(err as Error).message}`),
+    );
   }
 }
+
+// ─── HTTP interface ────────────────────────────────────────────────────────
 
 export function handleResolvePrPort(req: Request, res: Response): void {
   try {
@@ -876,14 +838,23 @@ export function handleResolvePrPort(req: Request, res: Response): void {
   }
 }
 
-export async function handlePrPortSkill(req: Request, res: Response): Promise<void> {
-  const input = req.body as Partial<PrPortInput>;
+/**
+ * POST /skills/pr-port/jobs — validate, then start a durable job and return its
+ * id. The run survives page reloads and dropped connections; only
+ * POST /jobs/:id/cancel stops it.
+ *
+ * Everything that can fail fast (bad URL, unconfigured agents, a runtime that
+ * cannot read the source worktree, a port of this PR already in flight) is
+ * answered here with a status code, before a job exists.
+ */
+async function startPrPortJob(req: Request, res: Response): Promise<void> {
+  const body = (req.body ?? {}) as { input?: Partial<PrPortInput>; clientKey?: string };
+  const input = body.input ?? {};
   let direction: PortDirection;
   let snapshot: ProfileSnapshot;
   try {
     direction = resolvePortDirection(String(input.prUrl ?? ""));
-    const override = requestOverride(req);
-    snapshot = resolveRun(PORT_SLOTS, { override, access: PORT_ACCESS, readDirs: PORT_READ_DIRS });
+    snapshot = resolveRun(PORT_SLOTS, { override: requestOverride(req), access: PORT_ACCESS, readDirs: PORT_READ_DIRS });
   } catch (err) {
     if (err instanceof AgentsNotConfiguredError) {
       res.status(428).json({ code: err.code, error: err.message, slots: err.slots });
@@ -897,52 +868,53 @@ export async function handlePrPortSkill(req: Request, res: Response): Promise<vo
     return;
   }
 
-  res.setHeader("Content-Type", "application/x-ndjson");
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders?.();
-
-  const controller = new AbortController();
-  let clientClosed = false;
-  const onClientGone = () => {
-    if (clientClosed) return;
-    clientClosed = true;
-    controller.abort();
-  };
-  res.on("close", onClientGone);
-  req.on("aborted", onClientGone);
-
-  const emit = (event: unknown): void => {
-    if (clientClosed || res.writableEnded) return;
-    try { res.write(`${JSON.stringify(event)}\n`); } catch { onClientGone(); }
-  };
-
-  const ctx: PipelineContext = {
-    direction,
-    snapshot,
-    emit,
-    signal: controller.signal,
-    usage: { stages: 0 },
-    draft: input.draft !== false,
-    timings: [],
-  };
-
-  let finalEnvelope: SkillEnvelope;
-  try {
-    finalEnvelope = await runPrPort(ctx);
-  } catch (err) {
-    finalEnvelope = envelope(
-      ctx,
-      "error",
-      controller.signal.aborted ? "cancelled" : "error",
-      resultFor(direction.target, "", "", 0, "", {
-        error: (err as Error).message.slice(0, MAX_STREAM_ERROR),
-      }),
-    );
-    emit({ type: "error", error: (err as Error).message.slice(0, MAX_STREAM_ERROR) });
+  // One live port per source PR: two runs would fight over the same branch
+  // and the same upstream PR.
+  const inFlight = listJobs({ status: ["queued", "running"], skillId: "pr-port" }).find((job) => {
+    try { return (JSON.parse(job.input_json) as { prUrl?: string }).prUrl === direction.pr.url; } catch { return false; }
+  });
+  if (inFlight) {
+    res.status(409).json({
+      code: "PORT_IN_PROGRESS",
+      error: `A port of ${direction.pr.url} is already running (job ${inFlight.id}).`,
+      jobId: inFlight.id,
+    });
+    return;
   }
 
-  persistEnvelope({ prUrl: direction.pr.url }, finalEnvelope);
-  emit({ type: "port_done", envelope: finalEnvelope });
-  if (!res.writableEnded && !clientClosed) res.end();
+  const draft = input.draft !== false;
+  const jobInput: PrPortInput = { prUrl: direction.pr.url, draft };
+  const jobId = startJob(
+    "pr-port",
+    jobInput,
+    async (job) => {
+      const ctx: PipelineContext = {
+        direction,
+        snapshot,
+        emit: job.emit,
+        signal: job.signal,
+        usage: { stages: 0 },
+        draft,
+        timings: [],
+        runId: job.jobId,
+        setRunning: job.setRunning,
+      };
+      try {
+        return await runPrPort(ctx);
+      } catch (err) {
+        const message = (err as Error).message.slice(0, MAX_STREAM_ERROR);
+        job.emit({ type: "error", error: message });
+        return envelope(
+          ctx,
+          "error",
+          job.signal.aborted ? "cancelled" : "error",
+          resultFor(direction.target, "", "", 0, "", { error: message }),
+        );
+      }
+    },
+    { clientKey: body.clientKey },
+  );
+  res.status(201).json({ jobId });
 }
+
+registerJobSkill("pr-port", startPrPortJob);

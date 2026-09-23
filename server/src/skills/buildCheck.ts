@@ -7,7 +7,7 @@
  * the agent should NOT mark its work as successful.
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -44,6 +44,64 @@ export function runRescriptBuild(repoDir: string): BuildCheckResult {
       (e.stdout ?? "") + "\n" + (e.stderr ?? "") + "\n" + (e.message ?? "");
     return { passed: false, log: tail(combined) };
   }
+}
+
+/**
+ * Non-blocking variant of runRescriptBuild. `execSync` freezes the whole
+ * server's event loop for the length of the build (up to 3 minutes) — every
+ * other request and stream stalls. This spawns the build, enforces the same
+ * timeout, and stops it if `signal` aborts (a cancelled run should not keep
+ * compiling). A timeout is reported as a failure that says so, not as a
+ * generic build failure.
+ */
+export function runRescriptBuildAsync(repoDir: string, signal?: AbortSignal): Promise<BuildCheckResult> {
+  if (!fs.existsSync(path.join(repoDir, "node_modules"))) {
+    return Promise.reject(
+      new Error(`node_modules not installed in ${repoDir} — cannot run mandatory ReScript build check. Run \`npm install\` first.`),
+    );
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn("npm", ["run", "--silent", "re:build"], {
+      cwd: repoDir,
+      env: { ...process.env, FORCE_COLOR: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    let out = "";
+    const append = (b: Buffer) => {
+      out += b.toString();
+      if (out.length > 1024 * 1024) out = out.slice(-512 * 1024);
+    };
+    child.stdout.on("data", append);
+    child.stderr.on("data", append);
+    let timedOut = false;
+    const killTree = () => {
+      try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+    };
+    const timer = setTimeout(() => { timedOut = true; killTree(); }, BUILD_TIMEOUT_MS);
+    const onAbort = () => killTree();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted) {
+        const err = new Error("build cancelled");
+        err.name = "AbortError";
+        reject(err);
+        return;
+      }
+      if (timedOut) {
+        resolve({ passed: false, log: tail(`${out}\n[build timed out after ${BUILD_TIMEOUT_MS / 1000}s]`) });
+        return;
+      }
+      resolve({ passed: code === 0, log: tail(out) });
+    });
+  });
 }
 
 /**

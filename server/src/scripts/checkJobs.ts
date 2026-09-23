@@ -133,6 +133,18 @@ async function testCancel(): Promise<void> {
   check("cancelled run ends as 'cancelled'", status === "cancelled", `status=${status}`);
   check("executor observed the abort signal", observedAbort);
 
+  // An executor that catches its own abort and RETURNS an error envelope (PR
+  // Port does, to report preserved work) must still end as 'cancelled'.
+  const returningId = startJob("test", {}, async (ctx: JobContext) => {
+    ctx.setRunning();
+    await new Promise((r) => setTimeout(r, 3000));
+    return { ...envelope(), status: "error" as const };
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  cancelJob(returningId);
+  const returningStatus = await settle(returningId, 6000);
+  check("a cancelled run that returns an error envelope ends as 'cancelled'", returningStatus === "cancelled", `status=${returningStatus}`);
+
   // Queued: the executor may be blocked on a repo lock and cannot observe the
   // signal yet, so the status must flip immediately for the user.
   let startedWork = false;

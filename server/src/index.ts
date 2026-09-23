@@ -16,6 +16,7 @@ import { settingsRouter } from "./routes/settings.js";
 import { skillsRouter } from "./routes/skills.js";
 import { jobsRouter } from "./jobs/routes.js";
 import { pruneJobEvents, sweepInterruptedJobs } from "./jobs/runner.js";
+import { recoverOrphanedWorktrees } from "./workspace/worktree.js";
 import { lintAgents } from "./agents/loader.js";
 import { seedFromEnvIfEmpty } from "./runtime/index.js";
 import { stopAllPreviews } from "./skills/previewManager.js";
@@ -61,6 +62,13 @@ for (const issue of lintAgents()) console.warn(`[agents] ${issue}`);
 // them 'interrupted' and append a terminal event, so the history shows what
 // happened and a replaying client reaches a clean end instead of hanging.
 sweepInterruptedJobs();
+// A fresh process owns no runs, so every leftover run worktree is an orphan
+// of a crash or restart: commit its work onto the branch, then remove it.
+void recoverOrphanedWorktrees(() => false)
+  .then((recovered) => {
+    if (recovered.length > 0) console.log(`[worktree] recovered ${recovered.length} interrupted run(s): ${recovered.join("; ")}`);
+  })
+  .catch((err) => console.error(`[worktree] orphan recovery failed: ${(err as Error).message}`));
 
 // Transcripts of long-finished runs are the only unbounded thing here; the job
 // rows themselves are small and stay.

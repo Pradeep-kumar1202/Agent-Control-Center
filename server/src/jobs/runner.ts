@@ -310,7 +310,13 @@ export function startJob(
   void (async () => {
     try {
       const envelope = await executor(ctx);
-      finalize(job, envelope.status === "error" ? "error" : "done", skillId, input, envelope, null);
+      // An executor may catch its own abort and return an envelope (so it can
+      // report what it preserved) rather than throw. A cancelled run is still
+      // 'cancelled' — the envelope's "error" status must not relabel it.
+      const status: JobStatus = job.controller.signal.aborted
+        ? "cancelled"
+        : envelope.status === "error" ? "error" : "done";
+      finalize(job, status, skillId, input, envelope, null);
     } catch (err) {
       const aborted = (err as Error)?.name === "AbortError" || job.controller.signal.aborted;
       const message = (err as Error)?.message ?? String(err);
