@@ -150,6 +150,9 @@ Keep your response concise and focused.`;
   res.setHeader("Cache-Control", "no-cache");
   res.flushHeaders?.();
 
+  const abortController = new AbortController();
+  req.on("close", () => { abortController.abort(); });
+
   let assistantText = "";
 
   function writeLine(obj: unknown): void {
@@ -164,6 +167,7 @@ Keep your response concise and focused.`;
       cwd: repoDir,
       allowedTools: ["Read", "Glob", "Grep"],
       timeoutMs: 300_000,
+      signal: abortController.signal,
     }, (chunk) => {
       writeLine(chunk);
       if (chunk.type === "text") assistantText += chunk.text;
@@ -210,6 +214,9 @@ featureRouter.post("/feature/sessions/:id/implement", async (req, res) => {
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Cache-Control", "no-cache");
   res.flushHeaders?.();
+
+  const abortController = new AbortController();
+  req.on("close", () => { abortController.abort(); });
 
   function writeLine(obj: unknown): void {
     if (!res.writableEnded) {
@@ -260,6 +267,7 @@ Output a JSON spec (no fences):
             cwd: repoDir,
             allowedTools: ["Read", "Glob", "Grep"],
             timeoutMs: 600_000,
+            signal: abortController.signal,
           }, (chunk) => {
             writeLine(chunk);
             if (chunk.type === "text") planText += chunk.text;
@@ -288,6 +296,7 @@ When build is green, output a one-line summary.`;
             cwd: repoDir,
             allowedTools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
             timeoutMs: 1_200_000,
+            signal: abortController.signal,
           }, (chunk) => {
             writeLine(chunk);
             if (chunk.type === "text") agentText += chunk.text;
@@ -310,6 +319,7 @@ When build is green, output a one-line summary.`;
             cwd: repoDir,
             allowedTools: ["Read", "Glob", "Grep", "Bash"],
             timeoutMs: 300_000,
+            signal: abortController.signal,
           }, (chunk) => { writeLine(chunk); });
 
           // Commit & push

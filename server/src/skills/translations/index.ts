@@ -122,7 +122,6 @@ Return ONLY the JSON object, no explanation:
 }`;
 
   return askJson<Record<string, string>>(prompt, {
-    slot: "skill.translations",
     model: "opus",
     timeoutMs: 120_000,
   });

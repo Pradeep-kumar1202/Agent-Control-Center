@@ -14,7 +14,7 @@
 import type { Request, Response } from "express";
 import { REPOS, type RepoKey } from "../../config.js";
 import { db, nowIso, saveSkillRun } from "../../db.js";
-import { askStream } from "../../llm.js";
+import { askStream, extractBalancedJson } from "../../llm.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
 import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../submoduleGit.js";
 import { runRescriptBuild } from "../buildCheck.js";
@@ -62,6 +62,9 @@ export async function handleIntegrationSkill(req: Request, res: Response): Promi
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
+  const abortController = new AbortController();
+  req.on("close", () => { abortController.abort(); });
+
   function writeLine(obj: unknown): void {
     if (!res.writableEnded) {
       res.write(JSON.stringify(obj) + "\n");
@@ -74,7 +77,7 @@ export async function handleIntegrationSkill(req: Request, res: Response): Promi
     for (const repoKey of input.targetRepos) {
       writeLine({ type: "repo_marker", repo: repoKey });
 
-      const result = await runIntegrationPipeline(repoKey, docText, input.description, writeLine);
+      const result = await runIntegrationPipeline(repoKey, docText, input.description, writeLine, abortController.signal);
       results[repoKey] = result;
     }
 
@@ -119,6 +122,7 @@ async function runIntegrationPipeline(
   docText: string,
   description: string,
   writeLine: (obj: unknown) => void,
+  signal: AbortSignal,
 ): Promise<SkillRepoResult> {
   const repoDir = REPOS[repoKey].dir;
   const repoName = repoKey === "web" ? "hyperswitch-web" : "hyperswitch-client-core";
@@ -160,9 +164,9 @@ Output a JSON object with these fields (output ONLY valid JSON, no markdown fenc
 }`;
 
       await askStream(docAnalystPrompt, {
-        slot: "skill.integration",
         model: "opus",
         timeoutMs: 300_000,
+        signal,
       }, (chunk) => {
         writeLine(chunk);
         if (chunk.type === "text") specText += chunk.text;
@@ -170,8 +174,8 @@ Output a JSON object with these fields (output ONLY valid JSON, no markdown fenc
 
       let docSpec: Record<string, unknown> | null = null;
       try {
-        const match = specText.match(/\{[\s\S]*\}/);
-        if (match) docSpec = JSON.parse(match[0]);
+        const j = extractBalancedJson(specText);
+        if (j) docSpec = JSON.parse(j);
       } catch { /* fall back to raw text */ }
 
       // ── Phase 1: Codebase Pattern Analysis ──────────────────────────
@@ -197,11 +201,11 @@ Output a JSON object (no fences):
 }`;
 
       await askStream(patternPrompt, {
-        slot: "skill.integration",
         model: "opus",
         cwd: repoDir,
         allowedTools: ["Read", "Glob", "Grep"],
         timeoutMs: 600_000,
+        signal,
       }, (chunk) => {
         writeLine(chunk);
         if (chunk.type === "text") planText += chunk.text;
@@ -209,8 +213,8 @@ Output a JSON object (no fences):
 
       let plan: Record<string, unknown> | null = null;
       try {
-        const match = planText.match(/\{[\s\S]*\}/);
-        if (match) plan = JSON.parse(match[0]);
+        const j = extractBalancedJson(planText);
+        if (j) plan = JSON.parse(j);
       } catch { /* fall back */ }
 
       // ── Phase 2: Implementation ─────────────────────────────────────
@@ -239,11 +243,11 @@ When build is green, output a one-line summary of what you implemented.`;
 
       let agentText = "";
       await askStream(implementerPrompt, {
-        slot: "skill.integration",
         model: "opus",
         cwd: repoDir,
         allowedTools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
         timeoutMs: 1_200_000,
+        signal,
       }, (chunk) => {
         writeLine(chunk);
         if (chunk.type === "text") agentText += chunk.text;
@@ -282,10 +286,10 @@ Check:
 Output JSON: {pass: boolean, issues: string[]}`;
 
       await askStream(verifierPrompt, {
-        slot: "skill.integration",
         model: "opus",
         cwd: repoDir,
         allowedTools: ["Read", "Glob", "Grep", "Bash"],
+        signal,
         timeoutMs: 300_000,
       }, (chunk) => {
         writeLine(chunk);

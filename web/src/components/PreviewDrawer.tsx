@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type PreviewKind, type PreviewState } from "../api";
+import { api, type ChatMessageRow, type ChatStreamChunk, type PreviewKind, type PreviewState } from "../api";
+import { readNdjson } from "./ndjson";
 
 interface Props {
   repoKey: "web" | "mobile";
@@ -494,6 +495,301 @@ export function PreviewDrawer({ repoKey, branch, prUrl, prWarning, patchId, gapN
             )}
           </div>
         </div>
+
+        {/* ── Chat panel (right side) ────────────────────────────────── */}
+        {patchId != null && patchId > 0 && (
+          <PreviewChatPanel patchId={patchId} gapName={gapName} />
+        )}
+
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Embedded Chat Panel ─────────────────────────────────────────────────────
+
+function PreviewChatPanel({ patchId, gapName }: { patchId: number; gapName?: string }) {
+  const [messages, setMessages] = useState<ChatMessageRow[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const [liveText, setLiveText] = useState("");
+  const [liveTools, setLiveTools] = useState<string[]>([]);
+  const [livePhase, setLivePhase] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Load existing messages
+  useEffect(() => {
+    api.getChatMessages(patchId)
+      .then((res) => setMessages(res.messages))
+      .catch(() => {});
+  }, [patchId]);
+
+  // Auto-scroll
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, liveText]);
+
+  async function runTestInDemo() {
+    if (streaming) return;
+    setError(null);
+    setLiveText("");
+    setLiveTools([]);
+    setLivePhase("checkout");
+
+    const syntheticUser: ChatMessageRow = {
+      id: -Date.now(),
+      patch_id: patchId,
+      turn: (messages[messages.length - 1]?.turn ?? -1) + 1,
+      role: "user",
+      content: "Test this feature in the demo app.",
+      tool_name: null,
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, syntheticUser]);
+    setStreaming(true);
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    let accumulated = "";
+
+    try {
+      const r = await api.testFeatureInDemo(patchId, ctrl.signal);
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+
+      type TestFeatureChunk = {
+        type: string;
+        phase?: string;
+        text?: string;
+        tool?: { name: string };
+        error?: string;
+        buildLogTail?: string;
+      };
+      for await (const chunk of readNdjson<TestFeatureChunk>(r.body)) {
+        if (chunk.type === "phase_marker" && chunk.phase) {
+          setLivePhase(chunk.phase);
+        } else if (chunk.type === "text" && chunk.text) {
+          accumulated += chunk.text;
+          setLiveText((prev) => prev + chunk.text!);
+        } else if (chunk.type === "tool_use" && chunk.tool) {
+          setLiveTools((prev) => [...prev.slice(-9), chunk.tool!.name]);
+        } else if (chunk.type === "recompile_done") {
+          setLivePhase("relaunched");
+        } else if (chunk.type === "error" && chunk.error) {
+          setError(chunk.error);
+        } else if (chunk.type === "done") {
+          break;
+        }
+      }
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") setError((e as Error).message);
+    } finally {
+      setStreaming(false);
+      abortRef.current = null;
+      // Preserve the agent's behavioural summary as a real assistant message
+      // so the developer can read "I set X = ... the app should now show Y"
+      // after the stream ends. Without this, the text disappears on phase
+      // reset and the user is left with a silent recompile.
+      const trimmed = accumulated.trim();
+      if (trimmed) {
+        const assistantMsg: ChatMessageRow = {
+          id: -Date.now() - 1,
+          patch_id: patchId,
+          turn: syntheticUser.turn,
+          role: "assistant",
+          content: trimmed,
+          tool_name: null,
+          created_at: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+      } else {
+        // Agent produced no text at all — leave a visible marker so the user
+        // doesn't just see a silent relaunch.
+        const fallback: ChatMessageRow = {
+          id: -Date.now() - 1,
+          patch_id: patchId,
+          turn: syntheticUser.turn,
+          role: "assistant",
+          content: "App rebuilt and relaunched on the emulator. (No behaviour summary was produced — check the emulator to see what changed.)",
+          tool_name: null,
+          created_at: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, fallback]);
+      }
+      setLiveText("");
+      setLiveTools([]);
+      // Keep the livePhase banner at "relaunched" for a moment so the user
+      // sees the emulator is ready; clear after a short delay.
+      setTimeout(() => setLivePhase(null), 4000);
+    }
+  }
+
+  async function sendChat() {
+    const msg = chatInput.trim();
+    if (!msg || streaming) return;
+    setChatInput("");
+    setError(null);
+    setLiveText("");
+    setLiveTools([]);
+
+    // Optimistic add
+    const userMsg: ChatMessageRow = {
+      id: -Date.now(),
+      patch_id: patchId,
+      turn: (messages[messages.length - 1]?.turn ?? -1) + 1,
+      role: "user",
+      content: msg,
+      tool_name: null,
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setStreaming(true);
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    try {
+      const r = await fetch(`/api/patches/${patchId}/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: msg }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+
+      for await (const chunk of readNdjson<ChatStreamChunk>(r.body)) {
+        if (chunk.type === "text" && chunk.text) {
+          setLiveText((prev) => prev + chunk.text!);
+        } else if (chunk.type === "tool_use" && chunk.tool) {
+          setLiveTools((prev) => [...prev.slice(-9), chunk.tool!.name]);
+        } else if (chunk.type === "error" && chunk.error) {
+          setError(chunk.error);
+        } else if (chunk.type === "done") {
+          break;
+        }
+      }
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") setError((e as Error).message);
+    } finally {
+      setStreaming(false);
+      abortRef.current = null;
+      try {
+        const { messages: m } = await api.getChatMessages(patchId);
+        setMessages(m);
+      } catch { /* keep optimistic */ }
+      setLiveText("");
+      setLiveTools([]);
+    }
+  }
+
+  return (
+    <div className="hidden lg:flex flex-col lg:w-[35%] border-l border-slate-800 bg-slate-950/40">
+      {/* Header */}
+      <div className="px-3 py-2 border-b border-slate-800 flex items-center gap-2 shrink-0">
+        <div className="w-1.5 h-1.5 rounded-full bg-indigo-400" />
+        <span className="text-xs font-medium text-slate-300">Agent Chat</span>
+        {gapName && <span className="text-[10px] text-slate-500 truncate flex-1">{gapName}</span>}
+        <button
+          onClick={() => void runTestInDemo()}
+          disabled={streaming}
+          title="Edit the demo app to exercise the patched feature, then recompile + relaunch"
+          className="shrink-0 rounded border border-emerald-500/50 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-40"
+        >
+          Test in demo app
+        </button>
+      </div>
+      {livePhase && (
+        <div className="px-3 py-1 border-b border-slate-800 text-[10px] text-emerald-300/80 bg-emerald-500/5">
+          {livePhase === "checkout" && "Checking out patch branch…"}
+          {livePhase === "editing_demo_app" && "Agent editing demo app…"}
+          {livePhase === "recompile" && "Rebuilding + relaunching app on emulator…"}
+          {livePhase === "relaunched" && "App relaunched — check the emulator."}
+        </div>
+      )}
+
+      {/* Messages */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-2">
+        {messages.length === 0 && !streaming && (
+          <div className="text-[11px] text-slate-500 text-center py-8">
+            Chat with the agent that generated this patch. Ask it to fix issues or refine the implementation.
+          </div>
+        )}
+        {messages
+          .filter((m) => m.role === "user" || m.role === "assistant")
+          .map((m, i) => (
+            <div
+              key={i}
+              className={`max-w-[90%] rounded-lg px-2.5 py-1.5 text-[11px] leading-relaxed whitespace-pre-wrap break-words ${
+                m.role === "user"
+                  ? "ml-auto bg-indigo-600/80 text-white"
+                  : "bg-slate-800/80 text-slate-300"
+              }`}
+            >
+              {m.content}
+            </div>
+          ))}
+
+        {/* Live streaming text */}
+        {streaming && liveText && (
+          <div className="max-w-[90%] rounded-lg px-2.5 py-1.5 text-[11px] leading-relaxed bg-slate-800/80 text-slate-300 whitespace-pre-wrap">
+            {liveText}
+            <span className="opacity-40 animate-pulse">|</span>
+          </div>
+        )}
+
+        {/* Tool chips */}
+        {streaming && liveTools.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {liveTools.map((name, i) => (
+              <span key={i} className="inline-flex rounded border border-slate-700 bg-slate-800/50 px-1.5 py-0.5 text-[9px] text-slate-400">
+                {name}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {error && (
+          <div className="text-[10px] text-red-400 px-2">{error}</div>
+        )}
+
+        <div ref={chatEndRef} />
+      </div>
+
+      {/* Input */}
+      <div className="px-3 py-2 border-t border-slate-800 shrink-0 flex gap-2">
+        <textarea
+          placeholder="Ask the agent..."
+          value={chatInput}
+          onChange={(e) => setChatInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void sendChat();
+            }
+          }}
+          disabled={streaming}
+          rows={2}
+          className="flex-1 bg-slate-900 border border-slate-700 rounded-md px-2.5 py-1.5 text-[11px] text-slate-200 resize-none outline-none placeholder-slate-600 focus:border-indigo-500/50"
+        />
+        <div className="flex flex-col gap-1">
+          <button
+            onClick={() => void sendChat()}
+            disabled={streaming || !chatInput.trim()}
+            className="rounded border border-indigo-500/50 bg-indigo-500/20 px-2 py-1 text-[10px] text-indigo-300 hover:bg-indigo-500/30 disabled:opacity-40"
+          >
+            Send
+          </button>
+          {streaming && (
+            <button
+              onClick={() => abortRef.current?.abort()}
+              className="rounded border border-red-500/50 bg-red-500/10 px-2 py-1 text-[10px] text-red-300"
+            >
+              Stop
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -20,47 +20,6 @@ const SUBMODULE_DIRS: Record<string, string[]> = {
   mobile: ["shared-code", "android", "ios"],
 };
 
-export function submoduleDirsFor(repoKey: "web" | "mobile"): string[] {
-  return [...(SUBMODULE_DIRS[repoKey] ?? [])];
-}
-
-export interface SubmoduleHead {
-  dir: string;
-  sha: string;
-}
-
-/** Capture the prepared local submodule baseline without changing it. */
-export async function captureSubmoduleHeads(
-  repoDir: string,
-  repoKey: "web" | "mobile",
-): Promise<SubmoduleHead[]> {
-  const heads: SubmoduleHead[] = [];
-  for (const dir of SUBMODULE_DIRS[repoKey] ?? []) {
-    const subDir = path.join(repoDir, dir);
-    if (!fs.existsSync(path.join(subDir, ".git"))) continue;
-    try {
-      heads.push({ dir, sha: (await simpleGit(subDir).revparse(["HEAD"])).trim() });
-    } catch { /* an uninitialised submodule is handled by the build gate */ }
-  }
-  return heads;
-}
-
-/**
- * Restore the exact prepared submodule heads captured before a generated run.
- * Parent `main` may intentionally be paired with an ahead-of-pointer shared
- * checkout for local builds, so `git submodule update` would be incorrect.
- */
-export async function restoreSubmoduleHeads(
-  repoDir: string,
-  heads: SubmoduleHead[],
-): Promise<void> {
-  for (const head of heads) {
-    const subDir = path.join(repoDir, head.dir);
-    if (!fs.existsSync(path.join(subDir, ".git"))) continue;
-    await simpleGit(subDir).raw(["checkout", "--force", "--detach", head.sha]);
-  }
-}
-
 /**
  * Check whether a submodule directory has uncommitted changes.
  */
@@ -81,131 +40,27 @@ async function submoduleHasChanges(subDir: string): Promise<boolean> {
 }
 
 /**
- * Diff the entire working tree against HEAD, INCLUDING untracked files.
- *
- * Why this exists (and why plain `git diff` is wrong here):
- *
- *   1. `git diff` shows only UNSTAGED changes to TRACKED files. The patch
- *      agent routinely creates brand-new `.res` files with Write — those are
- *      untracked, so they were silently absent from the stored `.patch`, from
- *      `files_touched`, and from the DiffViewer, even though
- *      `commitWithSubmodules` staged and committed them. The PR was right and
- *      every artifact describing it was wrong.
- *   2. `git diff HEAD` (rather than `git diff`) also picks up anything already
- *      staged, so a partially-staged tree can't hide changes either.
- *
- * Untracked files are surfaced by marking them `--intent-to-add` so git itself
- * renders them as proper `new file` hunks — correct line counts, correct
- * `\ No newline at end of file` handling, correct mode. The previous
- * hand-rolled synthesizer got all three wrong (`content.split("\n")` leaves a
- * trailing "" for newline-terminated files, so every synthesized hunk header
- * overcounted by one and emitted a spurious trailing `+`; such patches do not
- * round-trip through `git apply`).
- *
- * The index is restored afterwards: we only ever `-N` paths that git reported
- * as untracked, and we reset exactly those paths, so the tree ends as it began.
+ * Get the diff of uncommitted changes inside a submodule.
+ * Returns both staged and unstaged changes.
  */
-async function diffWorkingTree(
-  dir: string,
-  excludePathspecs: string[] = [],
-  pathPrefix = "",
-): Promise<string> {
-  const git = simpleGit(dir);
-  const untracked = await untrackedPaths(git, excludePathspecs);
-
-  // `pathPrefix` re-roots a submodule's paths under the parent repo. We ask git
-  // for the prefixes rather than regex-rewriting its output, because a diff has
-  // FOUR path-bearing header lines (`diff --git a/X b/Y`, `--- a/X`, `+++ b/Y`,
-  // plus rename/copy from/to) and rewriting only the first produces a patch
-  // whose `---`/`+++` paths disagree with its `diff --git` line. Such a patch
-  // applies to the wrong location, and `extractDiffFilePaths` reports two
-  // contradictory paths for the same file. `/dev/null` is left untouched by
-  // git's own prefixing, which hand-rolled rewriting also tends to get wrong.
-  const prefixArgs = pathPrefix
-    ? [`--src-prefix=a/${pathPrefix}`, `--dst-prefix=b/${pathPrefix}`]
-    : [];
-
-  if (untracked.length > 0) {
-    try {
-      await git.raw(["add", "--intent-to-add", "--", ...untracked]);
-    } catch { /* fall through — we still report tracked changes */ }
-  }
+async function submoduleDiff(subDir: string): Promise<string> {
   try {
-    return (
-      await git.raw(["diff", "HEAD", ...prefixArgs, "--", ".", ...excludePathspecs])
-    ).trim();
-  } finally {
-    if (untracked.length > 0) {
-      // Undo the intent-to-add markers so the index is exactly as we found it.
-      try { await git.raw(["reset", "-q", "--", ...untracked]); } catch { /* */ }
-    }
-  }
-}
-
-/**
- * Number of files differing from HEAD, including untracked ones.
- * Counted from `--numstat` rather than by regex-matching `diff --git` headers,
- * so renames and binary files are counted correctly.
- */
-async function countChangedFiles(
-  dir: string,
-  excludePathspecs: string[] = [],
-): Promise<number> {
-  const git = simpleGit(dir);
-  const untracked = await untrackedPaths(git, excludePathspecs);
-
-  if (untracked.length > 0) {
-    try {
-      await git.raw(["add", "--intent-to-add", "--", ...untracked]);
-    } catch { /* */ }
-  }
-  try {
-    const out = await git.raw(["diff", "HEAD", "--numstat", "--", ".", ...excludePathspecs]);
-    return out.split("\n").filter((l) => l.trim().length > 0).length;
-  } catch {
-    return 0;
-  } finally {
-    if (untracked.length > 0) {
-      try { await git.raw(["reset", "-q", "--", ...untracked]); } catch { /* */ }
-    }
-  }
-}
-
-/**
- * Untracked, non-ignored paths, minus anything matching an `:(exclude)` spec.
- *
- * simple-git's `status()` does not apply pathspecs, so submodule directories
- * are filtered here by hand — otherwise an uninitialised submodule dir would
- * get intent-to-added into the parent index.
- */
-async function untrackedPaths(
-  git: ReturnType<typeof simpleGit>,
-  excludePathspecs: string[],
-): Promise<string[]> {
-  const excluded = excludePathspecs
-    .map((s) => s.replace(/^:\(exclude\)/, ""))
-    .filter(Boolean);
-  try {
+    const git = simpleGit(subDir);
+    // Unstaged changes (files modified on disk but not yet git-added)
+    const unstaged = await git.diff();
+    // Also check for untracked files — list them in diff-like format
     const status = await git.status();
-    return status.not_added.filter(
-      (p) => !excluded.some((e) => p === e || p.startsWith(`${e}/`)),
-    );
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Get the diff of uncommitted changes inside a submodule, including untracked
- * files, with every path already re-rooted under `<subName>/` so the hunk
- * headers agree with the parent repo's layout.
- *
- * See `diffWorkingTree` for why this isn't `git diff` and why the prefixing
- * is done by git rather than by rewriting its output.
- */
-async function submoduleDiff(subDir: string, subName: string): Promise<string> {
-  try {
-    return await diffWorkingTree(subDir, [], `${subName}/`);
+    let untracked = "";
+    for (const f of status.not_added) {
+      try {
+        const content = fs.readFileSync(path.join(subDir, f), "utf8");
+        untracked += `diff --git a/${f} b/${f}\nnew file mode 100644\n--- /dev/null\n+++ b/${f}\n`;
+        const lines = content.split("\n");
+        untracked += `@@ -0,0 +1,${lines.length} @@\n`;
+        untracked += lines.map((l) => `+${l}`).join("\n") + "\n";
+      } catch { /* skip unreadable */ }
+    }
+    return (unstaged + "\n" + untracked).trim();
   } catch {
     return "";
   }
@@ -251,10 +106,16 @@ export async function commitWithSubmodules(
     const hasChanges = await submoduleHasChanges(subDir);
     if (!hasChanges) continue;
 
-    // Collect the diff BEFORE staging (so we get the real file diffs).
-    // Paths are already re-rooted under `<subName>/` by submoduleDiff.
-    const diff = await submoduleDiff(subDir, subName);
-    if (diff) diffs.push(diff);
+    // Collect the diff BEFORE staging (so we get the real file diffs)
+    const diff = await submoduleDiff(subDir);
+    if (diff) {
+      // Prefix paths in the diff with the submodule name for clarity
+      const prefixed = diff.replace(
+        /^(diff --git a\/)(.+?)( b\/)(.+)$/gm,
+        `$1${subName}/$2$3${subName}/$4`,
+      );
+      diffs.push(prefixed);
+    }
 
     // Stage and commit inside the submodule
     const subGit = simpleGit(subDir);
@@ -274,10 +135,11 @@ export async function commitWithSubmodules(
   // Step 3: Collect parent-level diff (files in src/, etc. — NOT submodule pointers)
   // Use pathspec exclusions so we don't see `Subproject commit xxx-dirty` noise
   const excludePaths = submodules.map((s) => `:(exclude)${s}`);
-  const parentDiff = await diffWorkingTree(repoDir, excludePaths);
+  const parentDiff = await parentGit.diff(["--", ".", ...excludePaths]);
   if (parentDiff) {
     diffs.push(parentDiff);
-    totalFiles += await countChangedFiles(repoDir, excludePaths);
+    const parentStat = await parentGit.diffSummary(["--", ".", ...excludePaths]);
+    totalFiles += parentStat.files.length;
   }
 
   // Step 4: Stage parent-level files ONLY (exclude all submodule pointers)
@@ -326,6 +188,7 @@ export async function getDiffWithSubmodules(
   repoDir: string,
   repoKey: "web" | "mobile",
 ): Promise<{ diff: string; fileCount: number }> {
+  const parentGit = simpleGit(repoDir);
   const submodules = SUBMODULE_DIRS[repoKey] ?? [];
 
   const diffs: string[] = [];
@@ -338,19 +201,25 @@ export async function getDiffWithSubmodules(
     const hasChanges = await submoduleHasChanges(subDir);
     if (!hasChanges) continue;
 
-    const diff = await submoduleDiff(subDir, subName);
+    const diff = await submoduleDiff(subDir);
     if (diff) {
-      diffs.push(diff);
-      fileCount += await countChangedFiles(subDir);
+      const prefixed = diff.replace(
+        /^(diff --git a\/)(.+?)( b\/)(.+)$/gm,
+        `$1${subName}/$2$3${subName}/$4`,
+      );
+      diffs.push(prefixed);
+      // Rough file count from diff headers
+      fileCount += (diff.match(/^diff --git /gm) || []).length;
     }
   }
 
   // Parent diff excluding submodule pointer noise
   const excludePaths = submodules.map((s) => `:(exclude)${s}`);
-  const parentDiff = await diffWorkingTree(repoDir, excludePaths);
+  const parentDiff = await parentGit.diff(["--", ".", ...excludePaths]);
   if (parentDiff) {
     diffs.push(parentDiff);
-    fileCount += await countChangedFiles(repoDir, excludePaths);
+    const parentStat = await parentGit.diffSummary(["--", ".", ...excludePaths]);
+    fileCount += parentStat.files.length;
   }
 
   return { diff: diffs.join("\n"), fileCount };
@@ -377,8 +246,110 @@ export async function resetSubmodules(
 }
 
 /**
+ * Re-align every submodule HEAD with the SHA declared by parent main, then
+ * fetch origin inside each submodule and hard-reset its working tree.
+ *
+ * Without this, a submodule left on a prior patch's branch tip will contribute
+ * unrelated commits to the next PR. `resetSubmodules` only cleans the working
+ * tree — it doesn't move HEAD — so we need the explicit `submodule update
+ * --init --recursive --force` here.
+ */
+export async function syncSubmodulesToMain(
+  repoDir: string,
+  repoKey: "web" | "mobile",
+): Promise<void> {
+  const submodules = SUBMODULE_DIRS[repoKey] ?? [];
+  const parentGit = simpleGit(repoDir);
+  try {
+    await parentGit.raw(["submodule", "update", "--init", "--recursive", "--force"]);
+  } catch (err) {
+    console.error("[submoduleGit] submodule update --force failed:", (err as Error).message);
+  }
+  for (const subName of submodules) {
+    const subDir = path.join(repoDir, subName);
+    if (!fs.existsSync(path.join(subDir, ".git"))) continue;
+    try {
+      const subGit = simpleGit(subDir);
+      await subGit.fetch("origin");
+      await subGit.raw(["reset", "--hard", "HEAD"]);
+      await subGit.clean("f", ["-d"]);
+    } catch { /* offline tolerable */ }
+  }
+}
+
+/**
+ * Advance every submodule to its OWN origin/main (not parent-declared SHA).
+ *
+ * Called right after the feature branch is created but before the agent runs.
+ * If parent main declares SHA X for shared-code but shared-code's origin/main
+ * is at X+3, we want the patch to be built on top of X+3 — so the native
+ * files reviewers see are the freshest upstream code, not a month-old snapshot.
+ *
+ * After this runs, the parent working tree sees dirty submodule pointers. The
+ * subsequent `commitWithSubmodules` call will fold those pointer bumps into
+ * the patch commit, which is what we want: a single parent commit that bumps
+ * submodules AND adds the feature changes.
+ *
+ * Returns the names of submodules that actually advanced (so the caller can
+ * mention them in the commit/PR body).
+ */
+export async function advanceSubmodulesToOriginMain(
+  repoDir: string,
+  repoKey: "web" | "mobile",
+): Promise<string[]> {
+  const submodules = SUBMODULE_DIRS[repoKey] ?? [];
+  const advanced: string[] = [];
+  for (const subName of submodules) {
+    const subDir = path.join(repoDir, subName);
+    if (!fs.existsSync(path.join(subDir, ".git"))) continue;
+    try {
+      const subGit = simpleGit(subDir);
+      const before = (await subGit.revparse(["HEAD"])).trim();
+      await subGit.fetch("origin", "main");
+      // Hard-reset to origin/main so we're exactly at the latest upstream SHA.
+      await subGit.raw(["checkout", "-B", "main", "origin/main"]);
+      const after = (await subGit.revparse(["HEAD"])).trim();
+      if (before !== after) advanced.push(subName);
+    } catch (err) {
+      console.error(`[submoduleGit] advance ${subName} failed:`, (err as Error).message);
+    }
+  }
+  return advanced;
+}
+
+/**
+ * Throw if any submodule is not in sync with what parent main declares.
+ * Call right before creating a fresh feature branch so a dirty submodule can't
+ * silently leak commits into the PR.
+ *
+ * `git submodule status --recursive` prefixes:
+ *   " " clean
+ *   "+" HEAD differs from declared SHA
+ *   "-" uninitialised
+ *   "U" merge conflict
+ */
+export async function ensureSubmodulesClean(
+  repoDir: string,
+  _repoKey: "web" | "mobile",
+): Promise<void> {
+  const parentGit = simpleGit(repoDir);
+  const status = await parentGit.raw(["submodule", "status", "--recursive"]);
+  const dirty = status.split("\n").filter((l) => /^[+\-U]/.test(l));
+  if (dirty.length > 0) {
+    throw new Error(
+      `Submodule(s) not in sync with parent main — prior patch state may leak into the next PR.\n${dirty.join("\n")}`,
+    );
+  }
+}
+
+/**
  * Force checkout back to a branch, resetting submodules first.
  * Prevents "your local changes would be overwritten" errors.
+ *
+ * When branch="main", also fetches origin/main and ff-merges so every
+ * new patch starts from the latest upstream code — not stale local state.
+ * Cleans untracked files from the parent repo to prevent leftovers from
+ * prior agent runs leaking into new branches.
  */
 export async function forceCheckoutBranch(
   repoDir: string,
@@ -388,113 +359,19 @@ export async function forceCheckoutBranch(
   await resetSubmodules(repoDir, repoKey);
   const git = simpleGit(repoDir);
   await git.raw(["checkout", "--force", branch]);
-}
-
-/**
- * Thrown when a branch cannot be checked out because it exists neither
- * locally nor on the configured remote. Routes catch this to respond with
- * 409 + a typed body, so the UI can self-heal (mark the patch row stale and
- * prompt the user to regenerate) instead of showing a raw pathspec error.
- */
-export class BranchGoneError extends Error {
-  readonly code = "BRANCH_GONE" as const;
-  constructor(
-    readonly branch: string,
-    readonly repo: "web" | "mobile",
-  ) {
-    super(`Branch '${branch}' does not exist locally or on remote for repo '${repo}'`);
-    this.name = "BranchGoneError";
+  // Clean untracked files from parent repo so no leftovers from prior agent runs
+  await git.clean("f", ["-d"]);
+  // If checking out main, fast-forward to origin/main so patches start from latest upstream
+  if (branch === "main") {
+    try {
+      await git.fetch("origin", "main");
+      // FF-only merge — never creates merge commits. Silently skipped if
+      // local main has the submodule-bump commit ahead of origin.
+      await git.raw(["merge", "--ff-only", "origin/main"]).catch(() => {});
+    } catch { /* offline or fetch failed — proceed with local main */ }
+    // Realign submodule HEADs with what the (possibly-updated) parent main
+    // now declares. Without this, a submodule left on a prior patch's branch
+    // tip would leak unrelated commits into the next PR.
+    await syncSubmodulesToMain(repoDir, repoKey);
   }
-}
-
-/** All local branch short names in the given repo. */
-export async function listLocalBranches(repoDir: string): Promise<string[]> {
-  try {
-    const git = simpleGit(repoDir);
-    const out = await git.raw(["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
-    return out.split("\n").map((l) => l.trim()).filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-/**
- * True if `refs/heads/<branch>` exists locally.
- *
- * Implemented via listLocalBranches rather than `rev-parse --verify --quiet`
- * because simple-git's `raw()` does NOT throw when rev-parse exits non-zero
- * under --quiet (it just resolves with an empty stdout string). Using a
- * positive-confirmation list avoids that footgun entirely.
- */
-export async function branchExistsLocal(repoDir: string, branch: string): Promise<boolean> {
-  const all = await listLocalBranches(repoDir);
-  return all.includes(branch);
-}
-
-/**
- * Check which of `branches` exist on `origin`. One network call per repo.
- * Returns a Set of remote branch names.
- *
- * Hard-capped at 8 s of silent time via simple-git's block timeout so a
- * slow/unreachable origin can never stall callers (branch-health endpoint,
- * checkoutOrRecover). On timeout or any other failure, returns an empty set
- * — treating the branches as not-on-remote, which is the safe default.
- */
-export async function listRemoteBranches(
-  repoDir: string,
-  branches: string[],
-): Promise<Set<string>> {
-  if (branches.length === 0) return new Set();
-  try {
-    const git = simpleGit(repoDir, { timeout: { block: 8000 } });
-    const out = await git.raw(["ls-remote", "--heads", "origin", ...branches]);
-    const found = new Set<string>();
-    for (const line of out.split("\n")) {
-      const m = line.match(/refs\/heads\/(.+)$/);
-      if (m) found.add(m[1]);
-    }
-    return found;
-  } catch {
-    return new Set();
-  }
-}
-
-/**
- * Checkout a feature branch with transparent recovery from origin.
- *
- * 1. If the branch exists locally, reset submodules and force-checkout (same
- *    as forceCheckoutBranch — the happy path).
- * 2. If it's missing locally but present on origin, fetch it into a local
- *    ref and checkout. User never sees an error.
- * 3. If it's nowhere, throw BranchGoneError. Callers translate this into a
- *    409 response (or a typed stream error for NDJSON endpoints).
- *
- * Only use for feature branches. For `main` / default-branch checkouts, keep
- * using forceCheckoutBranch directly — a missing main is a catastrophic repo
- * state, not a recoverable user-facing condition.
- */
-export async function checkoutOrRecover(
-  repoDir: string,
-  repoKey: "web" | "mobile",
-  branch: string,
-): Promise<void> {
-  if (await branchExistsLocal(repoDir, branch)) {
-    await forceCheckoutBranch(repoDir, repoKey, branch);
-    return;
-  }
-  const git = simpleGit(repoDir);
-  // Probe the remote for just this one branch (fast — one ls-remote call).
-  const remote = await listRemoteBranches(repoDir, [branch]);
-  if (!remote.has(branch)) {
-    throw new BranchGoneError(branch, repoKey);
-  }
-  // Fetch into a local ref so subsequent checkout works the same as the
-  // local-branch case. The `:<dest>` ref-spec creates refs/heads/<branch>
-  // at the remote's tip.
-  try {
-    await git.raw(["fetch", "origin", `${branch}:refs/heads/${branch}`]);
-  } catch (err) {
-    throw new BranchGoneError(branch, repoKey);
-  }
-  await forceCheckoutBranch(repoDir, repoKey, branch);
 }

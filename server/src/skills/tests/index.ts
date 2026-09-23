@@ -14,7 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import simpleGit from "simple-git";
 import { PATCHES_DIR, REPOS } from "../../config.js";
-import { ask } from "../../llm.js";
+import { ask, extractBalancedJson } from "../../llm.js";
 import {
   validateGeneratedTests,
   type TestValidationIssue,
@@ -187,7 +187,6 @@ After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path from repo root>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
   const summaryRaw = await ask(prompt, {
-    slot: "skill.tests",
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
@@ -213,7 +212,7 @@ After writing the test file(s), output ONLY a JSON summary:
   // Parse generated file paths from agent summary for validation
   let generatedFiles: string[] = [];
   try {
-    const parsed = JSON.parse(summaryRaw.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    const parsed = JSON.parse(extractBalancedJson(summaryRaw) ?? "{}");
     generatedFiles = (parsed.files ?? []).map(
       (f: { path: string }) => f.path,
     );
@@ -258,7 +257,7 @@ After writing the test file(s), output ONLY a JSON summary:
   // Build summary with validation results included
   let summaryObj: Record<string, unknown> = { raw: summaryRaw.slice(0, 2000) };
   try {
-    summaryObj = JSON.parse(summaryRaw.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    summaryObj = JSON.parse(extractBalancedJson(summaryRaw) ?? "{}");
   } catch { /* keep raw */ }
 
   if (validationIssues.length > 0) {
@@ -403,7 +402,6 @@ After writing the test file(s), output ONLY a JSON summary:
 {"what": "<one-line description>", "files": [{"path": "<relative path from repo root>", "change": "<what the tests cover>"}], "notes": "<any caveats or assumptions made>"}`;
 
   const summaryRaw = await ask(prompt, {
-    slot: "skill.tests",
     model: "opus",
     timeoutMs: 600_000,
     cwd: repoDir,
@@ -425,7 +423,7 @@ After writing the test file(s), output ONLY a JSON summary:
   // Parse generated file paths for validation
   let generatedFiles: string[] = [];
   try {
-    const parsed = JSON.parse(summaryRaw.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    const parsed = JSON.parse(extractBalancedJson(summaryRaw) ?? "{}");
     generatedFiles = (parsed.files ?? []).map(
       (f: { path: string }) => f.path,
     );
@@ -469,7 +467,7 @@ After writing the test file(s), output ONLY a JSON summary:
 
   let summaryObj: Record<string, unknown> = { raw: summaryRaw.slice(0, 2000) };
   try {
-    summaryObj = JSON.parse(summaryRaw.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    summaryObj = JSON.parse(extractBalancedJson(summaryRaw) ?? "{}");
   } catch { /* keep raw */ }
 
   if (validationIssues.length > 0) {

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
+import fs from "node:fs";
 import { REPOS, type RepoKey } from "../config.js";
 import {
   startPreview,
@@ -11,18 +12,11 @@ import {
   forceRestartMetro,
   type PreviewKind,
 } from "../skills/previewManager.js";
-import { BranchGoneError } from "../skills/submoduleGit.js";
 import { ensureWsScrcpy, wsScrcpyInfo } from "../skills/wsScrcpyManager.js";
-import {
-  getCredentials,
-  getMockServerState,
-  setCredentials,
-  setPaymentIntentBody,
-  startMockServer,
-  stopMockServer,
-  tailMockServerLogs,
-  type Credentials,
-} from "../skills/embeddedMockServer.js";
+import { db, type GapRow, type PatchRow } from "../db.js";
+import { askStream, type StreamChunk } from "../llm.js";
+import { forceCheckoutBranch } from "../skills/submoduleGit.js";
+import { withRepoLock } from "../workspace/mutex.js";
 
 const ANDROID_HOME = process.env.ANDROID_HOME ?? "/home/sdk/android-sdk";
 
@@ -52,18 +46,6 @@ previewRouter.post("/preview/start", async (req, res) => {
     const state = await startPreview(repoKey, branch, kind);
     res.json(state);
   } catch (err) {
-    if (err instanceof BranchGoneError) {
-      // 409 Conflict — the client's understanding of the server state
-      // (patch row says this branch is valid) is stale. Dashboard reacts
-      // by marking the row and prompting regeneration.
-      return res.status(409).json({
-        error: "branch_gone",
-        code: "BRANCH_GONE",
-        branch: err.branch,
-        repo: err.repo,
-        message: err.message,
-      });
-    }
     console.error("[preview] start failed:", err);
     res.status(500).json({ error: (err as Error).message });
   }
@@ -74,73 +56,6 @@ previewRouter.post("/preview/stop", async (req, res) => {
   if (!repoKey) return res.status(400).json({ error: "invalid repoKey" });
   const state = await stopPreview(repoKey);
   res.json({ stopped: state !== null, state });
-});
-
-// ─── Mock merchant server lifecycle (embedded on port 5252) ───────────────────
-//
-// Registered BEFORE the generic `/preview/:repoKey` route so that
-// `/preview/mock-server` doesn't get parsed as a repoKey param.
-
-previewRouter.get("/preview/mock-server", (_req, res) => {
-  res.json(getMockServerState());
-});
-
-previewRouter.post("/preview/mock-server/start", async (_req, res) => {
-  try {
-    const state = await startMockServer();
-    res.json(state);
-  } catch (err) {
-    res.status(503).json({ error: (err as Error).message });
-  }
-});
-
-previewRouter.post("/preview/mock-server/stop", async (_req, res) => {
-  try {
-    const state = await stopMockServer();
-    res.json(state);
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
-});
-
-previewRouter.post("/preview/mock-server/config", (req, res) => {
-  const body = req.body?.paymentIntentBody;
-  if (body === null || typeof body !== "object" || Array.isArray(body)) {
-    return res.status(400).json({ error: "paymentIntentBody must be a JSON object" });
-  }
-  setPaymentIntentBody(body as Record<string, unknown>);
-  res.json(getMockServerState());
-});
-
-previewRouter.get("/preview/mock-server/logs", (req, res) => {
-  const since = Number(req.query.since ?? 0);
-  res.json(tailMockServerLogs(Number.isFinite(since) ? since : 0));
-});
-
-// Hyperswitch credentials (UI-overridable at runtime). Returns the resolved
-// values (UI override OR .env fallback) plus a flag per field so the UI
-// knows whether each came from an override vs. the environment.
-previewRouter.get("/preview/mock-server/credentials", (_req, res) => {
-  res.json(getCredentials());
-});
-
-previewRouter.post("/preview/mock-server/credentials", (req, res) => {
-  const allowed: Array<keyof Credentials> = [
-    "publishableKey",
-    "secretKey",
-    "profileId",
-    "netceteraApiKey",
-    "baseUrl",
-  ];
-  const patch: Partial<Credentials> = {};
-  for (const k of allowed) {
-    const v = req.body?.[k];
-    if (typeof v === "string") patch[k] = v;
-  }
-  if (Object.keys(patch).length === 0) {
-    return res.status(400).json({ error: "no valid credential fields in body" });
-  }
-  res.json(setCredentials(patch));
 });
 
 previewRouter.get("/preview/:repoKey", (req, res) => {
@@ -253,75 +168,73 @@ previewRouter.post("/preview/mobile/metro-reload", (_req, res) => {
  * Order matters: force-stop BEFORE killing Metro, so the user doesn't
  * see a red "unable to connect" flash mid-process.
  */
-previewRouter.post("/preview/mobile/recompile", (_req, res) => {
-  const repoDir = REPOS.mobile.dir;
+function runAdb(args: string[]): Promise<void> {
   const adb = path.join(ANDROID_HOME, "platform-tools", "adb");
-
-  const runAdb = (args: string[]): Promise<void> =>
-    new Promise((resolve, reject) => {
-      const p = spawn(adb, args, { stdio: ["ignore", "pipe", "pipe"] });
-      let stderr = "";
-      p.stderr.on("data", (b) => (stderr += b.toString()));
-      p.on("error", reject);
-      p.on("exit", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(stderr.trim() || `adb exited ${code}`));
-      });
+  return new Promise((resolve, reject) => {
+    const p = spawn(adb, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    p.stderr.on("data", (b) => (stderr += b.toString()));
+    p.on("error", reject);
+    p.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(stderr.trim() || `adb exited ${code}`));
     });
+  });
+}
 
-  const runReBuild = (): Promise<string> =>
-    new Promise((resolve, reject) => {
-      const proc = spawn("npm", ["run", "--silent", "re:build"], {
-        cwd: repoDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, FORCE_COLOR: "0" },
-      });
-      let log = "";
-      proc.stdout.on("data", (b) => (log += b.toString()));
-      proc.stderr.on("data", (b) => (log += b.toString()));
-      const timer = setTimeout(() => {
-        try { proc.kill("SIGKILL"); } catch { /* */ }
-        reject(new Error("re:build timed out"));
-      }, 240_000);
-      proc.on("exit", (code) => {
-        clearTimeout(timer);
-        if (code === 0) resolve(log);
-        else {
-          const err = new Error(`re:build exited with code ${code}`);
-          (err as Error & { log?: string }).log = log;
-          reject(err);
-        }
-      });
+function runReBuild(repoDir: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("npm", ["run", "--silent", "re:build"], {
+      cwd: repoDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, FORCE_COLOR: "0" },
     });
+    let log = "";
+    proc.stdout.on("data", (b) => (log += b.toString()));
+    proc.stderr.on("data", (b) => (log += b.toString()));
+    const timer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch { /* */ }
+      reject(new Error("re:build timed out"));
+    }, 240_000);
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(log);
+      else {
+        const err = new Error(`re:build exited with code ${code}`);
+        (err as Error & { log?: string }).log = log;
+        reject(err);
+      }
+    });
+  });
+}
 
+/**
+ * The bulletproof-apply sequence used by both the manual Recompile button and
+ * the "Test in demo app" flow. Throws with { phase } embedded in the message
+ * so the caller can surface which step failed.
+ *
+ * Order matters: force-stop BEFORE killing Metro so the user doesn't see a
+ * red "unable to connect" flash mid-process.
+ */
+async function recompileMobileDemo(): Promise<{ buildLog: string }> {
+  const repoDir = REPOS.mobile.dir;
+  const buildLog = await runReBuild(repoDir);
+  try { await runAdb(["shell", "am", "force-stop", "io.hyperswitch.demoapp"]); } catch { /* non-fatal */ }
+  await forceRestartMetro(repoDir);
+  await runAdb(["shell", "am", "start", "-n", "io.hyperswitch.demoapp/.MainActivity"]);
+  return { buildLog };
+}
+
+previewRouter.post("/preview/mobile/recompile", (_req, res) => {
   (async () => {
-    let phase = "re:build";
     try {
-      console.log("[recompile] phase 1/4: re:build");
-      const buildLog = await runReBuild();
-
-      phase = "force-stop";
-      console.log("[recompile] phase 2/4: force-stop app");
-      try { await runAdb(["shell", "am", "force-stop", "io.hyperswitch.demoapp"]); } catch { /* non-fatal */ }
-
-      phase = "metro restart";
-      console.log("[recompile] phase 3/4: restart Metro with --reset-cache");
-      await forceRestartMetro(repoDir);
-
-      phase = "relaunch";
-      console.log("[recompile] phase 4/4: launch app fresh");
-      await runAdb(["shell", "am", "start", "-n", "io.hyperswitch.demoapp/.MainActivity"]);
-
-      console.log("[recompile] done");
-      res.json({
-        ok: true,
-        log: buildLog.split("\n").slice(-10).join("\n"),
-      });
+      const { buildLog } = await recompileMobileDemo();
+      res.json({ ok: true, log: buildLog.split("\n").slice(-10).join("\n") });
     } catch (err) {
       const e = err as Error & { log?: string };
       if (res.headersSent) return;
-      res.status(phase === "re:build" ? 422 : 500).json({
-        error: `${phase} failed: ${e.message}`,
+      res.status(e.log ? 422 : 500).json({
+        error: e.message,
         log: e.log ? e.log.split("\n").slice(-40).join("\n") : undefined,
       });
     }
@@ -429,4 +342,147 @@ previewRouter.get("/preview/mobile/screenshot", (_req, res) => {
       res.status(503).json({ error: stderr.trim() || `adb exited ${code}` });
     }
   });
+});
+
+/**
+ * "Test in demo app" — streaming NDJSON endpoint.
+ *
+ * Called when the user in the preview chat asks to try the patched feature
+ * visually. Checks out the patch branch, then runs an agent that edits
+ * android/demo-app/.../MainActivity.kt `getCustomisations()` (and the iOS
+ * ViewController if applicable) to exercise the new prop with a demonstrative
+ * value. After the agent returns, the server runs the same 4-step rebuild as
+ * /preview/mobile/recompile so the running emulator reflects the change.
+ *
+ * Does NOT commit or push — pure local edits on the patch branch. The patch
+ * agent's "commit your changes" requirement (from chat.ts) means the demo-app
+ * edits also get committed when the preview chat continues after this.
+ */
+previewRouter.post("/preview/test-feature/:patchId", async (req, res) => {
+  const patchId = Number(req.params.patchId);
+  if (!Number.isFinite(patchId)) {
+    return res.status(400).json({ error: "bad patchId" });
+  }
+
+  const patch = db.prepare("SELECT * FROM patches WHERE id = ?").get(patchId) as PatchRow | undefined;
+  if (!patch) return res.status(404).json({ error: "patch not found" });
+  if (patch.repo !== "mobile") {
+    return res.status(400).json({ error: "test-feature is only supported for mobile patches" });
+  }
+  const gap = db.prepare("SELECT * FROM gaps WHERE id = ?").get(patch.gap_id) as GapRow | undefined;
+  if (!gap) return res.status(404).json({ error: "gap not found" });
+
+  const targetRepo: RepoKey = "mobile";
+  const targetDir = REPOS[targetRepo].dir;
+
+  let diffText = "";
+  try { diffText = fs.readFileSync(patch.diff_path, "utf8"); } catch { /* */ }
+
+  res.setHeader("Content-Type", "application/x-ndjson");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  let clientClosed = false;
+  const abortController = new AbortController();
+  res.on("close", () => {
+    clientClosed = true;
+    abortController.abort();
+  });
+
+  const writeLine = (obj: unknown) => {
+    if (clientClosed || res.writableEnded) return;
+    try { res.write(JSON.stringify(obj) + "\n"); } catch { /* */ }
+  };
+
+  const truncatedDiff = diffText.length > 6000
+    ? diffText.slice(0, 3000) + "\n\n… [truncated — use Read/Grep for full context] …\n\n" + diffText.slice(-3000)
+    : diffText;
+
+  try {
+    await withRepoLock(targetRepo, async () => {
+      writeLine({ type: "phase_marker", phase: "checkout" });
+      await forceCheckoutBranch(targetDir, targetRepo, patch.branch);
+
+      writeLine({ type: "phase_marker", phase: "editing_demo_app" });
+
+      const prompt = `You are exercising a just-patched SDK feature in the hyperswitch-client-core demo app so the developer can visually verify it on the running Android emulator.
+
+## What was patched (branch: ${patch.branch})
+
+Gap: ${gap.canonical_name} (category: ${gap.category})
+
+Diff:
+\`\`\`
+${truncatedDiff || "(diff file missing — Read the branch to find the new field)"}
+\`\`\`
+
+## Your job
+
+1. Read the diff above to identify:
+   - The new field added to a record in \`src/types/SdkTypes.res\` (if any).
+   - The matching Kotlin field added to \`android/hyperswitch-sdk-android-api/.../PaymentSheet.kt\` Configuration.Builder (if any).
+   - The matching Swift property added to the iOS Configuration (if any).
+
+2. Edit \`android/demo-app/src/main/kotlin/io/hyperswitch/demoapp/MainActivity.kt\` — find \`getCustomisations()\` (or equivalent function that constructs \`PaymentSheet.Configuration\`) and add a call to the new Builder method with a concrete demonstrative value. Pick a value that will be visually obvious in the payment sheet so the developer can confirm the feature works.
+
+3. If an iOS demo file exists at \`ios/.../ViewController.swift\` AND the Swift wrapper was updated, mirror the change there on \`configuration\`.
+
+4. Run \`npm run --silent re:build\` via Bash (timeout: 240000). Must exit 0.
+
+5. Do NOT commit. Do NOT touch any ReScript or wrapper files — only the demo-app entry points.
+
+## ⛔ REQUIRED: Report the expected visual behaviour
+
+After the build passes, your final text output MUST explain, in plain language, exactly what the developer should see on the running emulator because of the demo-app values you chose. Be concrete and per-setting — the developer can't infer it from the diff. Example shape:
+
+  "I set \`paymentMethodOrder = [\"card\", \"upi\", \"wallet\"]\` — card will now appear FIRST in the payment sheet, then UPI, then the wallet group. Previously the default ordering put UPI above card."
+  "I set \`displaySavedPaymentMethods = true\` — the 'Saved payment methods' section should now render above the 'Add new' card form. If displaySavedPaymentMethodsCheckbox is also true, a 'Save for future payments' checkbox appears under the card form."
+  "I set \`primaryButtonLabel = \"Pay now\"\` — the bottom CTA that normally reads \"Pay $X\" should now read \"Pay now\" instead."
+
+For every prop you touched:
+  - Say WHAT you set it to.
+  - Say WHAT should visibly change on screen (position, label text, visibility, order, colour — whatever is observable).
+  - If the feature has branching behaviour (e.g. different values produce different UIs), describe all relevant branches you exercised.
+  - If the behaviour is timing-dependent (e.g. only visible on a returning-customer intent), call that out so the developer knows where to look.
+
+Do NOT just say "wired up the new prop" or "added the field" — the developer already knows you edited MainActivity.kt. They need to know what the emulator screen will now show that it didn't before.
+
+Do NOT run adb, do NOT restart Metro — the server handles that after you exit.`;
+
+      await askStream(
+        prompt,
+        {
+          model: "opus",
+          cwd: targetDir,
+          allowedTools: ["Read", "Edit", "Glob", "Grep", "Bash"],
+          timeoutMs: 900_000,
+          signal: abortController.signal,
+        },
+        (chunk: StreamChunk) => writeLine(chunk),
+      );
+
+      if (clientClosed) return;
+
+      writeLine({ type: "phase_marker", phase: "recompile" });
+      try {
+        const { buildLog } = await recompileMobileDemo();
+        writeLine({ type: "recompile_done", buildLogTail: buildLog.split("\n").slice(-10).join("\n") });
+      } catch (err) {
+        const e = err as Error & { log?: string };
+        writeLine({
+          type: "error",
+          error: `Recompile failed: ${e.message}`,
+          buildLogTail: e.log ? e.log.split("\n").slice(-40).join("\n") : undefined,
+        });
+      }
+    });
+  } catch (err) {
+    writeLine({ type: "error", error: (err as Error).message });
+  } finally {
+    if (!clientClosed) {
+      writeLine({ type: "done" });
+      res.end();
+    }
+  }
 });

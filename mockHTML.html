@@ -1,0 +1,1282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Control Center</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0c0c0e;
+  --bg2: #111114;
+  --bg3: #17171b;
+  --bg4: #1e1e24;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --text: #e8e8f0;
+  --text2: #9090a8;
+  --text3: #55556a;
+  --accent: #7c6af7;
+  --accent2: #5b4ae8;
+  --accent-dim: rgba(124,106,247,0.12);
+  --accent-dim2: rgba(124,106,247,0.2);
+  --green: #3ecf8e;
+  --green-dim: rgba(62,207,142,0.12);
+  --amber: #f59e0b;
+  --amber-dim: rgba(245,158,11,0.12);
+  --red: #f87171;
+  --red-dim: rgba(248,113,113,0.1);
+  --blue: #60a5fa;
+  --blue-dim: rgba(96,165,250,0.12);
+  --radius: 8px;
+  --radius-lg: 12px;
+  --mono: 'IBM Plex Mono', monospace;
+  --sans: 'Geist', system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+/* ── Shell ── */
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Top bar ── */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  height: 52px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
+.topbar-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--accent2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  flex-shrink: 0;
+}
+
+.topbar-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.topbar-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.topbar-sub {
+  font-size: 11px;
+  color: var(--text3);
+  font-family: var(--mono);
+}
+
+.topbar-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+}
+
+.tool-breadcrumb {
+  font-size: 12px;
+  color: var(--text2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tool-breadcrumb .active-tool {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.topbar-sp { flex: 1; }
+
+.status-dot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text2);
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+}
+
+.status-dot .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.run-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: var(--accent2);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: var(--sans);
+  transition: all .15s;
+}
+
+.run-btn:hover { background: var(--accent); transform: translateY(-1px); }
+.run-btn:active { transform: translateY(0); }
+.run-btn.running { background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+.run-btn svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; }
+
+.drawer-toggle {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  transition: all .15s;
+  position: relative;
+}
+
+.drawer-toggle:hover { background: var(--bg3); border-color: var(--border2); }
+.drawer-toggle.open { background: var(--accent-dim); border-color: var(--accent); }
+.drawer-toggle svg { width: 14px; height: 14px; stroke: var(--text2); fill: none; stroke-width: 1.5; stroke-linecap: round; }
+.drawer-toggle.open svg { stroke: var(--accent); }
+
+/* ── Action bar ── */
+.action-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 16px;
+  height: 44px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+.filter-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text2);
+  cursor: pointer;
+  background: transparent;
+  font-family: var(--sans);
+  transition: all .12s;
+}
+
+.filter-chip:hover { border-color: var(--border2); color: var(--text); background: var(--bg3); }
+
+.filter-chip.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.filter-chip .count {
+  font-family: var(--mono);
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.action-sp { flex: 1; }
+
+.sort-select {
+  font-size: 11px;
+  color: var(--text2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  font-family: var(--sans);
+  cursor: pointer;
+  outline: none;
+}
+
+.sort-select option { background: #1e1e24; }
+
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: transparent;
+  transition: all .12s;
+}
+
+.icon-btn:hover { background: var(--bg3); border-color: var(--border); }
+.icon-btn svg { width: 13px; height: 13px; stroke: var(--text3); fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.icon-btn:hover svg { stroke: var(--text2); }
+.icon-btn.active svg { stroke: var(--accent); }
+
+/* ── Main layout ── */
+.main-layout {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── Content ── */
+.content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.content-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.content-scroll::-webkit-scrollbar { width: 4px; }
+.content-scroll::-webkit-scrollbar-track { background: transparent; }
+.content-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+/* ── Metrics ── */
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.metric-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  transition: border-color .15s;
+}
+
+.metric-card:hover { border-color: var(--border2); }
+
+.metric-card .m-label {
+  font-size: 10px;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+.metric-card .m-val {
+  font-size: 26px;
+  font-weight: 300;
+  color: var(--text);
+  font-family: var(--mono);
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+
+.metric-card .m-sub {
+  font-size: 10px;
+  color: var(--text3);
+  margin-top: 4px;
+}
+
+.metric-card.accent { border-color: var(--accent-dim2); }
+.metric-card.accent .m-val { color: var(--accent); }
+.metric-card.green { border-color: var(--green-dim); }
+.metric-card.green .m-val { color: var(--green); }
+.metric-card.amber { border-color: var(--amber-dim); }
+.metric-card.amber .m-val { color: var(--amber); }
+
+/* ── Progress bars ── */
+.progress-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.prog-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.prog-label { font-size: 11px; color: var(--text2); }
+.prog-count { font-size: 13px; font-weight: 500; font-family: var(--mono); margin-left: auto; }
+.prog-bar-wrap { flex: 1; height: 3px; background: var(--bg4); border-radius: 2px; min-width: 40px; }
+.prog-bar { height: 100%; border-radius: 2px; transition: width .6s cubic-bezier(.22,1,.36,1); }
+
+/* ── Table ── */
+.table-wrap {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.table-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.table-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text2);
+}
+
+.table-count {
+  font-size: 11px;
+  color: var(--text3);
+  font-family: var(--mono);
+}
+
+.search-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  width: 180px;
+  transition: border-color .15s;
+}
+
+.search-input-wrap:focus-within { border-color: var(--accent); }
+.search-input-wrap svg { width: 12px; height: 12px; stroke: var(--text3); fill: none; stroke-width: 2; stroke-linecap: round; flex-shrink: 0; }
+
+.search-input {
+  background: none;
+  border: none;
+  outline: none;
+  font-size: 11px;
+  color: var(--text);
+  font-family: var(--sans);
+  width: 100%;
+}
+
+.search-input::placeholder { color: var(--text3); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+thead th {
+  padding: 9px 14px;
+  text-align: left;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  background: var(--bg3);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+
+thead th:hover { color: var(--text2); }
+thead th .sort-icon { opacity: 0.4; margin-left: 4px; }
+thead th.sorted .sort-icon { opacity: 1; color: var(--accent); }
+
+tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background .1s;
+  cursor: pointer;
+}
+
+tbody tr:last-child { border-bottom: none; }
+tbody tr:hover { background: var(--bg3); }
+tbody tr.selected { background: var(--accent-dim); }
+
+tbody td {
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+tbody td:nth-child(2) {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+/* column widths */
+th:nth-child(1), td:nth-child(1) { width: 100px; }
+th:nth-child(2), td:nth-child(2) { width: auto; }
+th:nth-child(3), td:nth-child(3) { width: 90px; }
+th:nth-child(4), td:nth-child(4) { width: 160px; font-family: var(--mono); font-size: 10px; }
+th:nth-child(5), td:nth-child(5) { width: 110px; }
+
+/* ── Badges ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 20px;
+  font-family: var(--mono);
+  letter-spacing: .02em;
+}
+
+.badge-mobile { background: rgba(124,106,247,.15); color: #a89cf7; border: 1px solid rgba(124,106,247,.25); }
+.badge-web { background: rgba(62,207,142,.12); color: var(--green); border: 1px solid rgba(62,207,142,.2); }
+.badge-verified { background: rgba(62,207,142,.12); color: var(--green); border: 1px solid rgba(62,207,142,.2); }
+.badge-platform { background: rgba(245,158,11,.1); color: var(--amber); border: 1px solid rgba(245,158,11,.2); }
+.badge-unverified { background: rgba(248,113,113,.1); color: var(--red); border: 1px solid rgba(248,113,113,.15); }
+.badge-patched { background: rgba(96,165,250,.1); color: var(--blue); border: 1px solid rgba(96,165,250,.15); }
+.badge-component { background: var(--bg4); color: var(--text3); border: 1px solid var(--border); }
+.badge-config { background: rgba(96,165,250,.08); color: #7dd3fc; border: 1px solid rgba(96,165,250,.15); }
+.badge-flow { background: rgba(251,191,36,.08); color: #fde68a; border: 1px solid rgba(251,191,36,.12); }
+
+/* ── Right Drawer ── */
+.right-drawer {
+  width: 0;
+  border-left: 1px solid transparent;
+  background: var(--bg2);
+  overflow: hidden;
+  transition: width .22s cubic-bezier(.22,1,.36,1), border-color .22s;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.right-drawer.open {
+  width: 240px;
+  border-left-color: var(--border);
+}
+
+.drawer-inner { width: 240px; display: flex; flex-direction: column; height: 100%; }
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.drawer-head-title {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+.close-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: var(--text3);
+  font-size: 14px;
+  line-height: 1;
+  transition: all .12s;
+}
+
+.close-btn:hover { background: var(--bg3); color: var(--text); }
+
+.drawer-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 8px 12px;
+}
+
+.drawer-scroll::-webkit-scrollbar { width: 3px; }
+.drawer-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.drawer-section-label {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  padding: 10px 8px 4px;
+}
+
+.tool-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all .12s;
+  border: 1px solid transparent;
+  margin-bottom: 2px;
+}
+
+.tool-item:hover { background: var(--bg3); }
+.tool-item.active { background: var(--accent-dim); border-color: var(--accent-dim2); }
+
+.tool-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--bg4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background .12s;
+}
+
+.tool-item.active .tool-icon { background: var(--accent-dim2); }
+.tool-item:hover .tool-icon { background: var(--bg4); }
+
+.tool-icon svg {
+  width: 13px;
+  height: 13px;
+  stroke: var(--text3);
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tool-item.active .tool-icon svg { stroke: var(--accent); }
+
+.tool-info { flex: 1; min-width: 0; }
+.tool-name { font-size: 12px; color: var(--text2); font-weight: 400; }
+.tool-item.active .tool-name { color: var(--text); font-weight: 500; }
+.tool-desc { font-size: 10px; color: var(--text3); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.tool-badge {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 20px;
+  font-family: var(--mono);
+  flex-shrink: 0;
+}
+
+.tool-badge-count { background: var(--bg4); color: var(--text3); border: 1px solid var(--border); }
+.tool-badge-soon { background: var(--bg3); color: var(--text3); border: 1px solid var(--border); font-style: italic; }
+.tool-badge-new { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent-dim2); }
+
+.drawer-divider { height: 1px; background: var(--border); margin: 8px 0; }
+
+/* ── Row detail panel ── */
+.detail-panel {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  transform: translateY(100%);
+  transition: transform .2s cubic-bezier(.22,1,.36,1);
+  z-index: 10;
+  padding: 14px 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.detail-panel.open { transform: translateY(0); }
+.detail-panel-close { margin-left: auto; cursor: pointer; color: var(--text3); font-size: 16px; background: none; border: none; }
+.detail-panel-close:hover { color: var(--text); }
+
+.detail-field { display: flex; flex-direction: column; gap: 3px; min-width: 120px; }
+.detail-field label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: .06em; }
+.detail-field span { font-size: 12px; color: var(--text); font-family: var(--mono); }
+
+/* ── Empty state ── */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 48px 24px;
+  color: var(--text3);
+}
+
+.empty-state svg { width: 28px; height: 28px; stroke: var(--text3); fill: none; stroke-width: 1.5; opacity: .4; }
+.empty-state .empty-title { font-size: 13px; color: var(--text2); }
+.empty-state .empty-sub { font-size: 11px; }
+
+/* ── Running animation ── */
+@keyframes shimmer {
+  0% { opacity: .4; }
+  50% { opacity: 1; }
+  100% { opacity: .4; }
+}
+
+.running-row td { animation: shimmer 1.5s infinite; }
+
+/* ── Notification toast ── */
+.toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%) translateY(60px);
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-lg);
+  padding: 10px 16px;
+  font-size: 12px;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: transform .25s cubic-bezier(.22,1,.36,1);
+  z-index: 100;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.toast.show { transform: translateX(-50%) translateY(0); }
+.toast svg { width: 14px; height: 14px; stroke: var(--green); fill: none; stroke-width: 2; stroke-linecap: round; }
+
+/* ── Tool-specific empty states ── */
+.tool-view {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 12px;
+  color: var(--text3);
+  padding: 40px;
+}
+
+.tool-view-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tool-view-icon svg { width: 18px; height: 18px; stroke: var(--text3); fill: none; stroke-width: 1.5; stroke-linecap: round; }
+.tool-view-title { font-size: 14px; font-weight: 500; color: var(--text2); }
+.tool-view-sub { font-size: 12px; text-align: center; max-width: 260px; line-height: 1.6; }
+
+.tool-cta {
+  padding: 7px 16px;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text2);
+  cursor: pointer;
+  background: var(--bg3);
+  font-family: var(--sans);
+  margin-top: 4px;
+  transition: all .15s;
+}
+
+.tool-cta:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── Top bar ── -->
+  <div class="topbar">
+    <div class="topbar-logo">AC</div>
+    <div class="topbar-titles">
+      <div class="topbar-title">Agent orchestrator</div>
+      <div class="topbar-sub">hyperswitch-web ↔ hyperswitch-client-core</div>
+    </div>
+    <div class="topbar-sep"></div>
+    <div class="tool-breadcrumb">
+      <svg style="width:12px;height:12px;stroke:var(--text3);fill:none;stroke-width:1.5;stroke-linecap:round" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <span class="active-tool" id="breadcrumb-tool">Gap analysis</span>
+    </div>
+    <div class="topbar-sp"></div>
+    <div class="status-dot">
+      <div class="dot"></div>
+      <span id="status-label">done · web seed · mobile seed</span>
+    </div>
+    <button class="run-btn" id="run-btn" onclick="runAnalysis()">
+      <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Run gap analysis
+    </button>
+    <div class="drawer-toggle" id="drawer-toggle" onclick="toggleDrawer()" title="Tools panel">
+      <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </div>
+  </div>
+
+  <!-- ── Action bar (gap analysis specific) ── -->
+  <div class="action-bar" id="action-bar">
+    <button class="filter-chip active" data-filter="all" onclick="setFilter('all', this)">All <span class="count">23</span></button>
+    <button class="filter-chip" data-filter="mobile" onclick="setFilter('mobile', this)">Missing in mobile <span class="count">15</span></button>
+    <button class="filter-chip" data-filter="web" onclick="setFilter('web', this)">Missing in web <span class="count">8</span></button>
+    <button class="filter-chip" data-filter="verified" onclick="setFilter('verified', this)">Verified <span class="count">23</span></button>
+    <button class="filter-chip" data-filter="platform" onclick="setFilter('platform', this)">Platform-specific <span class="count">10</span></button>
+    <div class="action-sp"></div>
+    <div class="search-input-wrap" style="width:160px">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input class="search-input" type="text" placeholder="Search features..." id="search-input" oninput="renderTable()">
+    </div>
+    <select class="sort-select" id="sort-select" onchange="renderTable()">
+      <option value="category">Sort: Category</option>
+      <option value="feature">Sort: Feature</option>
+      <option value="status">Sort: Status</option>
+      <option value="platform">Sort: Platform</option>
+    </select>
+    <div class="icon-btn" onclick="toggleVerifyAll()" title="Verify all" id="verify-btn">
+      <svg viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+    </div>
+    <div class="icon-btn" title="Export CSV" onclick="exportCSV()">
+      <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    </div>
+  </div>
+
+  <!-- ── Main layout ── -->
+  <div class="main-layout">
+
+    <!-- ── Content ── -->
+    <div class="content-area">
+      <div class="content-scroll" id="content-scroll">
+
+        <!-- metrics -->
+        <div class="metrics-grid">
+          <div class="metric-card accent">
+            <div class="m-label">Total gaps</div>
+            <div class="m-val" id="m-total">23</div>
+            <div class="m-sub">across both platforms</div>
+          </div>
+          <div class="metric-card">
+            <div class="m-label">Missing in mobile</div>
+            <div class="m-val" id="m-mobile">15</div>
+            <div class="m-sub">65% of total</div>
+          </div>
+          <div class="metric-card">
+            <div class="m-label">Missing in web</div>
+            <div class="m-val" id="m-web">8</div>
+            <div class="m-sub">35% of total</div>
+          </div>
+          <div class="metric-card green">
+            <div class="m-label">Verified</div>
+            <div class="m-val" id="m-verified">23</div>
+            <div class="m-sub">100% verification rate</div>
+          </div>
+        </div>
+
+        <!-- progress breakdown -->
+        <div class="progress-row">
+          <div class="prog-card">
+            <span class="prog-label">Verified</span>
+            <div class="prog-bar-wrap"><div class="prog-bar" id="pb-verified" style="width:100%;background:var(--green)"></div></div>
+            <span class="prog-count" style="color:var(--green)">23</span>
+          </div>
+          <div class="prog-card">
+            <span class="prog-label">Unverified</span>
+            <div class="prog-bar-wrap"><div class="prog-bar" id="pb-unverified" style="width:0%;background:var(--red)"></div></div>
+            <span class="prog-count" style="color:var(--text3)">0</span>
+          </div>
+          <div class="prog-card">
+            <span class="prog-label">Platform-specific</span>
+            <div class="prog-bar-wrap"><div class="prog-bar" id="pb-platform" style="width:43%;background:var(--amber)"></div></div>
+            <span class="prog-count" style="color:var(--amber)">10</span>
+          </div>
+          <div class="prog-card">
+            <span class="prog-label">Patched</span>
+            <div class="prog-bar-wrap"><div class="prog-bar" id="pb-patched" style="width:0%;background:var(--blue)"></div></div>
+            <span class="prog-count" style="color:var(--text3)">0</span>
+          </div>
+        </div>
+
+        <!-- table -->
+        <div class="table-wrap" style="position:relative">
+          <div class="table-header-row">
+            <span class="table-title">Feature gaps</span>
+            <span class="table-count" id="table-count">23 items</span>
+          </div>
+          <div style="overflow-x:auto">
+            <table>
+              <thead>
+                <tr>
+                  <th onclick="sortBy('category')">Category <span class="sort-icon" id="sort-category">↕</span></th>
+                  <th onclick="sortBy('feature')">Feature <span class="sort-icon" id="sort-feature">↕</span></th>
+                  <th onclick="sortBy('platform')">Missing in <span class="sort-icon" id="sort-platform">↕</span></th>
+                  <th>Evidence</th>
+                  <th onclick="sortBy('status')">Status <span class="sort-icon" id="sort-status">↕</span></th>
+                </tr>
+              </thead>
+              <tbody id="table-body"></tbody>
+            </table>
+          </div>
+          <div id="empty-state" class="empty-state" style="display:none">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <span class="empty-title">No results</span>
+            <span class="empty-sub">Try a different filter or search term</span>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- tool content placeholder -->
+      <div class="tool-view" id="tool-view" style="display:none"></div>
+    </div>
+
+    <!-- ── Right Drawer ── -->
+    <div class="right-drawer" id="right-drawer">
+      <div class="drawer-inner">
+        <div class="drawer-head">
+          <span class="drawer-head-title">Tools</span>
+          <button class="close-btn" onclick="toggleDrawer()">✕</button>
+        </div>
+        <div class="drawer-scroll">
+
+          <div class="drawer-section-label">Analysis</div>
+          <div class="tool-item active" onclick="selectTool('gap')" data-tool="gap">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Gap analysis</div>
+              <div class="tool-desc">Platform feature diff</div>
+            </div>
+            <span class="tool-badge tool-badge-count">23</span>
+          </div>
+          <div class="tool-item" onclick="selectTool('prop')" data-tool="prop">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Add prop</div>
+              <div class="tool-desc">Annotate component props</div>
+            </div>
+          </div>
+          <div class="tool-item" onclick="selectTool('test')" data-tool="test">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Test writer</div>
+              <div class="tool-desc">Generate test suites</div>
+            </div>
+          </div>
+          <div class="tool-item" onclick="selectTool('translate')" data-tool="translate">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Translator</div>
+              <div class="tool-desc">i18n key extraction</div>
+            </div>
+          </div>
+          <div class="tool-item" onclick="selectTool('pr')" data-tool="pr">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 012 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">PR review</div>
+              <div class="tool-desc">Review diff & suggest</div>
+            </div>
+            <span class="tool-badge tool-badge-new">new</span>
+          </div>
+
+          <div class="drawer-section-label">History</div>
+          <div class="tool-item" onclick="selectTool('review-history')" data-tool="review-history">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><polyline points="12 8 12 12 14 14"/><path d="M3.05 11a9 9 0 1 0 .5-4H1"/><polyline points="1 3 1 7 5 7"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Review history</div>
+              <div class="tool-desc">Past analysis runs</div>
+            </div>
+          </div>
+          <div class="tool-item" onclick="selectTool('skill-history')" data-tool="skill-history">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Skill history</div>
+              <div class="tool-desc">Agent skill log</div>
+            </div>
+          </div>
+
+          <div class="drawer-divider"></div>
+          <div class="drawer-section-label">Upcoming</div>
+
+          <div class="tool-item" style="opacity:.4;pointer-events:none" data-tool="workflows">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Workflows</div>
+              <div class="tool-desc">Chain agents together</div>
+            </div>
+            <span class="tool-badge tool-badge-soon">soon</span>
+          </div>
+          <div class="tool-item" style="opacity:.4;pointer-events:none" data-tool="triggers">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Triggers</div>
+              <div class="tool-desc">Auto-run on events</div>
+            </div>
+            <span class="tool-badge tool-badge-soon">soon</span>
+          </div>
+          <div class="tool-item" style="opacity:.4;pointer-events:none" data-tool="integrations">
+            <div class="tool-icon">
+              <svg viewBox="0 0 24 24"><rect x="2" y="3" width="4" height="4"/><rect x="10" y="3" width="4" height="4"/><rect x="18" y="3" width="4" height="4"/><rect x="2" y="10" width="4" height="4"/><rect x="10" y="10" width="4" height="4"/><rect x="18" y="10" width="4" height="4"/><rect x="2" y="17" width="4" height="4"/><rect x="10" y="17" width="4" height="4"/><rect x="18" y="17" width="4" height="4"/></svg>
+            </div>
+            <div class="tool-info">
+              <div class="tool-name">Integrations</div>
+              <div class="tool-desc">External services</div>
+            </div>
+            <span class="tool-badge tool-badge-soon">soon</span>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- toast -->
+<div class="toast" id="toast">
+  <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+  <span id="toast-msg">Done</span>
+</div>
+
+<script>
+const ALL_DATA = [
+  { id:1,  category:'Component', feature:'click_to_pay',                  platform:'mobile', evidence:'src/Components/ClickToPayUiComponents.res',   status:'platform-specific' },
+  { id:2,  category:'Component', feature:'form_view_journey',              platform:'mobile', evidence:'src/FormViewJourney.res',                     status:'platform-specific' },
+  { id:3,  category:'Component', feature:'info_element',                   platform:'mobile', evidence:'src/Components/InfoElement.res',               status:'platform-specific' },
+  { id:4,  category:'Component', feature:'installment_options',            platform:'mobile', evidence:'src/Components/InstallmentOptions.res',        status:'verified' },
+  { id:5,  category:'Component', feature:'custom_widget',                  platform:'web',    evidence:'src/pages/widgets/CustomWidget.res',           status:'verified' },
+  { id:6,  category:'Component', feature:'scan_card_button',               platform:'web',    evidence:'src/components/elements/ScanCardButton.res',   status:'platform-specific' },
+  { id:7,  category:'Config',    feature:'custom_message_for_card_terms',  platform:'mobile', evidence:'src/Types/PaymentType.res',                    status:'verified' },
+  { id:8,  category:'Component', feature:'payment_method_collect_flow',    platform:'mobile', evidence:'src/Types/PaymentMethodCollectTypes.res',      status:'platform-specific' },
+  { id:9,  category:'Flow',      feature:'3ds_challenge_view',             platform:'web',    evidence:'src/ThreeDSChallengeView.res',                  status:'verified' },
+  { id:10, category:'Component', feature:'saved_payment_screen',           platform:'mobile', evidence:'src/SavedPaymentScreen.res',                   status:'verified' },
+  { id:11, category:'Config',    feature:'apple_pay_button_type',          platform:'web',    evidence:'src/Types/PaymentType.res',                    status:'platform-specific' },
+  { id:12, category:'Component', feature:'card_form',                      platform:'mobile', evidence:'src/Components/CardForm.res',                  status:'verified' },
+  { id:13, category:'Flow',      feature:'fullscreen_3ds',                 platform:'mobile', evidence:'src/ThreeDSScreen.res',                        status:'verified' },
+  { id:14, category:'Component', feature:'bank_transfer_info',             platform:'web',    evidence:'src/Components/BankTransferInfo.res',          status:'platform-specific' },
+  { id:15, category:'Config',    feature:'show_card_form_by_default',      platform:'mobile', evidence:'src/Types/PaymentType.res',                    status:'verified' },
+  { id:16, category:'Component', feature:'ach_bank_debit',                 platform:'mobile', evidence:'src/Components/PaymentMethodsRecord.res',      status:'verified' },
+  { id:17, category:'Component', feature:'sepa_debit',                     platform:'mobile', evidence:'src/Components/PaymentMethodsRecord.res',      status:'verified' },
+  { id:18, category:'Flow',      feature:'payment_confirmation_screen',    platform:'web',    evidence:'src/PaymentConfirmation.res',                  status:'verified' },
+  { id:19, category:'Component', feature:'sdk_button',                     platform:'web',    evidence:'src/Components/SDKButton.res',                 status:'platform-specific' },
+  { id:20, category:'Config',    feature:'display_saved_payment_methods',  platform:'mobile', evidence:'src/Types/PaymentType.res',                    status:'verified' },
+  { id:21, category:'Component', feature:'loader_screen',                  platform:'mobile', evidence:'src/LoaderScreen.res',                         status:'verified' },
+  { id:22, category:'Config',    feature:'payment_sheet_appearance',       platform:'mobile', evidence:'src/Types/PaymentType.res',                    status:'platform-specific' },
+  { id:23, category:'Flow',      feature:'mandate_acceptance_flow',        platform:'web',    evidence:'src/MandateAcceptance.res',                    status:'verified' },
+];
+
+let currentFilter = 'all';
+let currentSort = 'category';
+let sortAsc = true;
+let selectedRow = null;
+let drawerOpen = false;
+
+function getFiltered() {
+  const q = document.getElementById('search-input').value.toLowerCase();
+  return ALL_DATA.filter(r => {
+    const matchFilter =
+      currentFilter === 'all' ||
+      (currentFilter === 'mobile' && r.platform === 'mobile') ||
+      (currentFilter === 'web' && r.platform === 'web') ||
+      (currentFilter === 'verified' && r.status === 'verified') ||
+      (currentFilter === 'platform' && r.status === 'platform-specific');
+    const matchSearch = !q || r.feature.includes(q) || r.category.toLowerCase().includes(q) || r.evidence.toLowerCase().includes(q);
+    return matchFilter && matchSearch;
+  });
+}
+
+function getSorted(data) {
+  const s = document.getElementById('sort-select').value || currentSort;
+  return [...data].sort((a, b) => {
+    let av = a[s === 'platform' ? 'platform' : s] || '';
+    let bv = b[s === 'platform' ? 'platform' : s] || '';
+    return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+  });
+}
+
+function statusBadge(s) {
+  const map = {
+    'verified': 'badge-verified',
+    'platform-specific': 'badge-platform',
+    'unverified': 'badge-unverified',
+    'patched': 'badge-patched',
+  };
+  return `<span class="badge ${map[s] || 'badge-unverified'}">${s}</span>`;
+}
+
+function platformBadge(p) {
+  return p === 'mobile'
+    ? '<span class="badge badge-mobile">mobile</span>'
+    : '<span class="badge badge-web">web</span>';
+}
+
+function categoryBadge(c) {
+  const map = { 'Component': 'badge-component', 'Config': 'badge-config', 'Flow': 'badge-flow' };
+  return `<span class="badge ${map[c] || 'badge-component'}">${c}</span>`;
+}
+
+function renderTable() {
+  const data = getSorted(getFiltered());
+  const tbody = document.getElementById('table-body');
+  const empty = document.getElementById('empty-state');
+  document.getElementById('table-count').textContent = data.length + ' item' + (data.length !== 1 ? 's' : '');
+
+  if (!data.length) {
+    tbody.innerHTML = '';
+    empty.style.display = 'flex';
+    return;
+  }
+  empty.style.display = 'none';
+
+  tbody.innerHTML = data.map(r => `
+    <tr onclick="selectRow(${r.id})" class="${selectedRow === r.id ? 'selected' : ''}">
+      <td>${categoryBadge(r.category)}</td>
+      <td>${r.feature}</td>
+      <td>${platformBadge(r.platform)}</td>
+      <td style="color:var(--text3);font-size:10px">${r.evidence.split('/').pop()}</td>
+      <td>${statusBadge(r.status)}</td>
+    </tr>`).join('');
+}
+
+function selectRow(id) {
+  selectedRow = selectedRow === id ? null : id;
+  renderTable();
+}
+
+function setFilter(f, el) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  renderTable();
+}
+
+function sortBy(col) {
+  if (currentSort === col) { sortAsc = !sortAsc; }
+  else { currentSort = col; sortAsc = true; }
+  document.querySelectorAll('.sort-icon').forEach(i => { i.textContent = '↕'; i.parentElement.classList.remove('sorted'); });
+  const icon = document.getElementById('sort-' + col);
+  if (icon) { icon.textContent = sortAsc ? '↑' : '↓'; icon.parentElement.classList.add('sorted'); }
+  renderTable();
+}
+
+function toggleDrawer() {
+  drawerOpen = !drawerOpen;
+  document.getElementById('right-drawer').classList.toggle('open', drawerOpen);
+  document.getElementById('drawer-toggle').classList.toggle('open', drawerOpen);
+}
+
+const TOOL_META = {
+  gap:            { label: 'Gap analysis',   icon: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>', desc: 'Runs a cross-platform feature diff between hyperswitch-web and hyperswitch-client-core.' },
+  prop:           { label: 'Add prop',        icon: '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/>', desc: 'Annotate and document component props across the SDK.' },
+  test:           { label: 'Test writer',     icon: '<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>', desc: 'Generate unit and integration test suites from component signatures.' },
+  translate:      { label: 'Translator',      icon: '<path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/>', desc: 'Extract and manage i18n keys from ReScript source files.' },
+  pr:             { label: 'PR review',       icon: '<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 012 2v7"/><line x1="6" y1="9" x2="6" y2="21"/>', desc: 'Automatically review pull request diffs and suggest improvements.' },
+  'review-history': { label: 'Review history', icon: '<polyline points="12 8 12 12 14 14"/><path d="M3.05 11a9 9 0 1 0 .5-4H1"/><polyline points="1 3 1 7 5 7"/>', desc: 'Browse past gap analysis runs and compare results over time.' },
+  'skill-history':  { label: 'Skill history',  icon: '<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>', desc: 'Inspect which agent skills were activated and their outputs.' },
+};
+
+let currentTool = 'gap';
+
+function selectTool(tool) {
+  currentTool = tool;
+  document.querySelectorAll('.tool-item').forEach(el => el.classList.toggle('active', el.dataset.tool === tool));
+
+  const meta = TOOL_META[tool] || { label: tool, icon: '', desc: '' };
+  document.getElementById('breadcrumb-tool').textContent = meta.label;
+
+  const contentScroll = document.getElementById('content-scroll');
+  const toolView = document.getElementById('tool-view');
+  const actionBar = document.getElementById('action-bar');
+
+  if (tool === 'gap') {
+    contentScroll.style.display = 'block';
+    toolView.style.display = 'none';
+    actionBar.style.display = 'flex';
+    document.getElementById('run-btn').innerHTML = `<svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run gap analysis`;
+  } else {
+    contentScroll.style.display = 'none';
+    actionBar.style.display = 'none';
+    toolView.style.display = 'flex';
+    document.getElementById('run-btn').innerHTML = `<svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run ${meta.label.toLowerCase()}`;
+    toolView.innerHTML = `
+      <div class="tool-view-icon">
+        <svg viewBox="0 0 24 24">${meta.icon}</svg>
+      </div>
+      <div class="tool-view-title">${meta.label}</div>
+      <div class="tool-view-sub">${meta.desc}</div>
+      <button class="tool-cta" onclick="showToast('${meta.label} launched — results will appear here')">Launch ${meta.label}</button>
+    `;
+  }
+}
+
+function runAnalysis() {
+  const btn = document.getElementById('run-btn');
+  btn.classList.add('running');
+  btn.innerHTML = `<svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;animation:spin 1s linear infinite" class="spin"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg> Running...`;
+  document.getElementById('status-label').textContent = 'running analysis...';
+
+  const style = document.createElement('style');
+  style.textContent = '@keyframes spin { to { transform: rotate(360deg); } } .spin { transform-origin: center; }';
+  document.head.appendChild(style);
+
+  setTimeout(() => {
+    btn.classList.remove('running');
+    btn.innerHTML = `<svg viewBox="0 0 24 24" style="width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run gap analysis`;
+    document.getElementById('status-label').textContent = 'done · web seed · mobile seed';
+    showToast('Gap analysis complete — 23 gaps found');
+    style.remove();
+  }, 2800);
+}
+
+function toggleVerifyAll() {
+  showToast('All 0 unverified gaps marked as verified');
+}
+
+function exportCSV() {
+  const data = getSorted(getFiltered());
+  const rows = [['Category','Feature','Platform','Evidence','Status'], ...data.map(r => [r.category, r.feature, r.platform, r.evidence, r.status])];
+  const csv = rows.map(r => r.join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'gap-analysis.csv';
+  a.click();
+  showToast('CSV exported — ' + data.length + ' rows');
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  document.getElementById('toast-msg').textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2800);
+}
+
+// init
+toggleDrawer();
+renderTable();
+</script>
+</body>
+</html>
+
+
+
+<!-- what was done 
+ Build an Agent Control Center dashboard as a single self-contained HTML file.
+Design system:
+
+Dark theme only. Background layers: #0c0c0e → #111114 → #17171b → #1e1e24
+Fonts: IBM Plex Mono (data/badges/evidence), Geist (UI text). Load both from Google Fonts.
+Accent: #5b4ae8 / #7c6af7. Semantic: green #3ecf8e, amber #f59e0b, red #f87171, blue #60a5fa
+Borders: rgba(255,255,255,0.07) default, 0.12 hover
+No gradients, no shadows. Flat dark surfaces only.
+
+Layout — 3 zones stacked vertically:
+
+Top bar (52px): Logo pill "AC" in #5b4ae8, title "Agent orchestrator", monospace subtitle "hyperswitch-web ↔ hyperswitch-client-core", pulsing green status dot with label "done · web seed · mobile seed", purple "Run gap analysis" button with play icon, hamburger icon button that toggles the right drawer.
+Action bar (44px): Filter chips — All (23), Missing in mobile (15), Missing in web (8), Verified (23), Platform-specific (10). Right side: search input, sort dropdown, verify-all icon button, export CSV icon button.
+Main content + right drawer side by side:
+
+Content area: 4 metric cards in a grid (Total gaps 23 accent purple, Missing in mobile 15, Missing in web 8, Verified 23 green), then 4 progress bar pills (Verified 100% green, Unverified 0% red, Platform-specific 43% amber, Patched 0% blue), then the gap analysis table.
+Right drawer (240px, slides in/out with CSS transition width 0.22s): sections "Analysis", "History", "Upcoming". Each tool has a 28px icon tile, name, description, and optional badge.
+
+
+
+Right drawer tools:
+
+Analysis: Gap analysis (active, badge "23"), Add prop, Test writer, Translator, PR review (badge "new")
+History: Review history, Skill history
+Upcoming (opacity 0.4, pointer-events none): Workflows, Triggers, Integrations — all badge "soon"
+
+Gap analysis table — 23 rows of real data:
+CategoryFeaturePlatformEvidenceStatusComponentclick_to_paymobilesrc/Components/ClickToPayUiComponents.resplatform-specificComponentform_view_journeymobilesrc/FormViewJourney.resplatform-specificComponentinfo_elementmobilesrc/Components/InfoElement.resplatform-specificComponentinstallment_optionsmobilesrc/Components/InstallmentOptions.resverifiedComponentcustom_widgetwebsrc/pages/widgets/CustomWidget.resverifiedComponentscan_card_buttonwebsrc/components/elements/ScanCardButton.resplatform-specificConfigcustom_message_for_card_termsmobilesrc/Types/PaymentType.resverifiedComponentpayment_method_collect_flowmobilesrc/Types/PaymentMethodCollectTypes.resplatform-specificFlow3ds_challenge_viewwebsrc/ThreeDSChallengeView.resverifiedComponentsaved_payment_screenmobilesrc/SavedPaymentScreen.resverifiedConfigapple_pay_button_typewebsrc/Types/PaymentType.resplatform-specificComponentcard_formmobilesrc/Components/CardForm.resverifiedFlowfullscreen_3dsmobilesrc/ThreeDSScreen.resverifiedComponentbank_transfer_infowebsrc/Components/BankTransferInfo.resplatform-specificConfigshow_card_form_by_defaultmobilesrc/Types/PaymentType.resverifiedComponentach_bank_debitmobilesrc/Components/PaymentMethodsRecord.resverifiedComponentsepa_debitmobilesrc/Components/PaymentMethodsRecord.resverifiedFlowpayment_confirmation_screenwebsrc/PaymentConfirmation.resverifiedComponentsdk_buttonwebsrc/Components/SDKButton.resplatform-specificConfigdisplay_saved_payment_methodsmobilesrc/Types/PaymentType.resverifiedComponentloader_screenmobilesrc/LoaderScreen.resverifiedConfigpayment_sheet_appearancemobilesrc/Types/PaymentType.resplatform-specificFlowmandate_acceptance_flowwebsrc/MandateAcceptance.resverified
+Badge styles (pill shaped, monospace font):
+
+mobile: purple bg rgba(124,106,247,.15), text #a89cf7, border rgba(124,106,247,.25)
+web: green bg rgba(62,207,142,.12), text #3ecf8e
+verified: same as web badge
+platform-specific: amber bg rgba(245,158,11,.1), text #f59e0b
+Component/Config/Flow: dark category badges
+
+Interactions — all must work:
+
+Filter chips: clicking one filters the table, highlights chip in accent purple, updates row count
+Search input: live filters feature names, category, evidence as you type
+Sort dropdown + clickable column headers with ↑↓ arrows
+Row click: toggles selected state (accent-dim background)
+Drawer toggle: slides right drawer open/closed, button glows accent when open
+Run button: shows spinner animation for ~3 seconds, then resolves with a toast notification at bottom center
+Tool switching in drawer: swaps content area — gap analysis shows full table/metrics, other tools show a placeholder with icon + description + launch button
+Export CSV button: downloads currently filtered rows as a real .csv file
+Toast notifications: slide up from bottom, auto-dismiss after 2.8s
+
+-->

@@ -3,20 +3,16 @@ import { api, type Gap, type GapPrRow, type PatchDoneChunk, type PatchResponse, 
 import { AgentPanel } from "./components/AgentPanel";
 import { DiffViewer } from "./components/DiffViewer";
 import { GapTable } from "./components/GapTable";
-import { PreviewPanel } from "./components/PreviewPanel";
-import { usePreviewPanel } from "./state/previewPanel";
+import { PreviewDrawer } from "./components/PreviewDrawer";
 import { SourceViewer } from "./components/SourceViewer";
 import { SKILLS_REGISTRY, type SkillEnvelopeClient } from "./skills/registry";
 import { ReviewHistory } from "./skills/review/History";
 import { SkillHistory } from "./skills/shared/SkillHistory";
 import { AchievementsPage } from "./skills/achievements/AchievementsPage";
 import { DocsPage } from "./skills/docs/DocsPage";
-import SettingsPage from "./settings/SettingsPage";
-import { ErrorBoundary } from "./components/ErrorBoundary";
 import { FeatureAgent } from "./skills/feature/FeatureAgent";
 import { PropsResults } from "./skills/props/Results";
 import { TestsResults } from "./skills/tests/Results";
-import { PrPortResults } from "./skills/pr-port/Results";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,7 +35,6 @@ const SKILL_HISTORY_CONFIG: Record<
 > = {
   props: { name: "Add Prop", formatLabel: (i) => `Prop: ${i.propName ?? "?"}`, ResultsComponent: PropsResults },
   tests: { name: "Test Writer", formatLabel: (i) => `Tests for ${i.branch ?? "?"}`, ResultsComponent: TestsResults },
-  "pr-port": { name: "PR Port", formatLabel: (i) => `Port: ${i.prUrl ?? "?"}`, ResultsComponent: PrPortResults },
 };
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
@@ -153,15 +148,6 @@ function IconGrid4() {
   );
 }
 
-function IconGear() {
-  return (
-    <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="7" cy="7" r="2.2"/>
-      <path d="M7 1.2v1.6M7 11.2v1.6M12.8 7h-1.6M2.8 7H1.2M11.1 2.9l-1.1 1.1M4 10l-1.1 1.1M11.1 11.1L10 10M4 4L2.9 2.9"/>
-    </svg>
-  );
-}
-
 function IconDoc() {
   return (
     <svg className="sidebar-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
@@ -189,7 +175,6 @@ function skillIcon(id: string) {
   if (id === "translations") return <IconGlobe />;
   if (id === "review")       return <IconPR />;
   if (id === "integration")  return <IconPlug />;
-  if (id === "pr-port")      return <IconFlow />;
   return <IconGrid />;
 }
 
@@ -207,16 +192,17 @@ export default function App() {
   const [patchedGaps, setPatchedGaps] = useState<Set<number>>(new Set());
   const [patchBuildStatus, setPatchBuildStatus] = useState<Map<number, "pass" | "fail" | "skipped">>(new Map());
   const [patchData, setPatchData] = useState<Map<number, PatchResponse>>(new Map());
-  // Gaps whose patch branch no longer exists in the local clone AND can't
-  // be recovered from origin. Populated from GET /patches/branch-health on
-  // every refresh, and opportunistically from any 409/BRANCH_GONE response.
-  // Stale rows still render (so the user sees "there was a patch here") but
-  // the action buttons switch to "Regenerate" instead of Chat/Preview.
-  const [stalePatchedGaps, setStalePatchedGaps] = useState<Set<number>>(new Set());
   const [activePatch, setActivePatch] = useState<{ patch: PatchResponse; gapName: string } | null>(null);
   const [activeAgent, setActiveAgent] = useState<ActiveAgent>(null);
   const [activeSourceGap, setActiveSourceGap] = useState<Gap | null>(null);
-  const previewPanel = usePreviewPanel();
+  const [activePreview, setActivePreview] = useState<{
+    repoKey: "web" | "mobile";
+    branch: string;
+    prUrl?: string | null;
+    prWarning?: string | null;
+    patchId?: number | null;
+    gapName?: string;
+  } | null>(null);
   const [verifyAllProgress, setVerifyAllProgress] = useState<{
     current: number;
     total: number;
@@ -236,16 +222,10 @@ export default function App() {
       const latest = await api.latestReport();
       setReport(latest);
       if (latest && latest.status === "done") {
-        // Branch-health is fetched alongside the patch list so every row
-        // the UI renders can be cross-checked against actual git state. If
-        // the endpoint is unavailable (old server, transient error) we fall
-        // back to treating everything as fresh — the per-action 409 path
-        // still recovers correctly.
-        const [list, patches, prRows, branchHealth] = await Promise.all([
+        const [list, patches, prRows] = await Promise.all([
           api.gaps(latest.id),
           api.listPatches(),
           api.listGapPrs(),
-          api.patchBranchHealth().catch(() => ({} as Awaited<ReturnType<typeof api.patchBranchHealth>>)),
         ]);
 
         const prMap = new Map<string, GapPrRow[]>();
@@ -259,7 +239,6 @@ export default function App() {
         setGaps(list);
 
         const patchedIds = new Set<number>();
-        const staleIds = new Set<number>();
         const buildMap = new Map<number, "pass" | "fail" | "skipped">();
         const dataMap = new Map<number, PatchResponse>();
 
@@ -272,12 +251,9 @@ export default function App() {
             patchedIds.add(gapId);
             if (p.build_status) buildMap.set(gapId, p.build_status as "pass" | "fail" | "skipped");
             dataMap.set(gapId, { ...patchRowToResponse(p), _patchId: p.id } as PatchResponse & { _patchId: number });
-            const health = branchHealth[p.id];
-            if (health && !health.recoverable) staleIds.add(gapId);
           }
         }
         setPatchedGaps(patchedIds);
-        setStalePatchedGaps(staleIds);
         setPatchBuildStatus(buildMap);
         setPatchData(dataMap);
       }
@@ -330,10 +306,7 @@ export default function App() {
   const onPatchGap = (id: number) => {
     const gap = gaps.find((g) => g.id === id);
     if (!gap) return;
-    // A stale patch (branch deleted, not recoverable) should fall through to
-    // the regenerate-from-scratch flow — the old patch branch doesn't exist,
-    // so there's nothing for the chat agent to edit against.
-    if (patchedGaps.has(id) && !stalePatchedGaps.has(id)) {
+    if (patchedGaps.has(id)) {
       const existing = patchData.get(id);
       const patchId = (existing as (PatchResponse & { _patchId?: number }) | undefined)?._patchId;
       setActiveAgent({ gapId: id, gapName: gap.canonical_name, mode: "chat", existingPatchId: patchId });
@@ -385,24 +358,6 @@ export default function App() {
       return next;
     });
   };
-
-  /**
-   * Mark a patch row as stale (branch was deleted and isn't recoverable).
-   * Called on 409 BRANCH_GONE from any patch-scoped action and on the
-   * typed-error stream chunk from the chat route. Updates the UI
-   * immediately (optimistic) then reconciles via refresh().
-   */
-  const onBranchGone = useCallback((gapId: number) => {
-    setStalePatchedGaps((prev) => {
-      if (prev.has(gapId)) return prev;
-      const s = new Set(prev);
-      s.add(gapId);
-      return s;
-    });
-    // Confirm against the server so we don't keep a row marked stale past
-    // a regeneration in another tab.
-    void refresh();
-  }, [refresh]);
 
   // ─── Derived state ─────────────────────────────────────────────────────────
 
@@ -459,18 +414,6 @@ export default function App() {
           {status === "running" && <span className="topbar-sha">Running…</span>}
         </div>
         <div className="topbar-actions">
-          <button
-            className="btn btn-sm"
-            onClick={() => (previewPanel.state.open ? previewPanel.close() : previewPanel.open())}
-            title="Open the live emulator + mock server panel"
-            style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
-          >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <rect x="3" y="1" width="8" height="12" rx="1.5"/>
-              <line x1="6" y1="11" x2="8" y2="11"/>
-            </svg>
-            {previewPanel.state.open ? "Hide Preview" : "Preview"}
-          </button>
           {status === "running" && (
             <button className="btn btn-red btn-sm" onClick={async () => { await api.cancelAnalysis(); refresh(); }}>
               Cancel
@@ -561,15 +504,6 @@ export default function App() {
           >
             <IconGrid4 />
             <span className="sidebar-item-label">Achievements</span>
-          </div>
-
-          <div className="sidebar-section-label">System</div>
-          <div
-            className={`sidebar-item ${activeTab === "settings" ? "active" : ""}`}
-            onClick={() => setActiveTab("settings")}
-          >
-            <IconGear />
-            <span className="sidebar-item-label">Settings</span>
           </div>
 
           <div className="sidebar-section-label">Coming soon</div>
@@ -734,20 +668,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Page header — Settings */}
-          {activeTab === "settings" && (
-            <div className="page-header">
-              <div className="page-header-row" style={{ marginBottom: 16 }}>
-                <div>
-                  <div className="page-title">Settings</div>
-                  <div className="page-subtitle">
-                    Choose which runtime and model runs each stage of the pipeline.
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
           {/* Page header — Achievements */}
           {activeTab === "achievements" && (
             <div className="page-header">
@@ -761,10 +681,6 @@ export default function App() {
           )}
 
           {/* ── Page body ─────────────────────────────────────────────── */}
-          {/* Keyed on activeTab so navigating away clears a crashed page.
-              Scoped to the body, not the shell, so the sidebar always survives
-              and there is somewhere to navigate to. */}
-          <ErrorBoundary resetKey={activeTab} label={`The "${activeTab}" view`}>
           <div className="page-body">
 
             {/* Skill views */}
@@ -818,8 +734,6 @@ export default function App() {
 
             {/* Achievements */}
             {activeTab === "achievements" && <AchievementsPage />}
-
-            {activeTab === "settings" && <SettingsPage />}
 
             {/* ── Gaps view ─────────────────────────────────────────── */}
             {activeTab === "gaps" && (
@@ -883,34 +797,38 @@ export default function App() {
                         verifying={verifying}
                         patching={patching}
                         patchedGaps={patchedGaps}
-                        stalePatchedGaps={stalePatchedGaps}
                         patchBuildStatus={patchBuildStatus}
                         patchBranches={new Map(Array.from(patchData.entries()).map(([id, p]) => [id, p.branch]))}
                         gapPrs={gapPrs}
                         onVerify={onVerifyGap}
                         onPatch={onPatchGap}
                         onViewSource={(g) => setActiveSourceGap(g)}
+                        onViewDiff={async (gapId) => {
+                          const cached = patchData.get(gapId) as (PatchResponse & { _patchId?: number }) | undefined;
+                          const gap = gaps.find((g) => g.id === gapId);
+                          const patchId = cached?._patchId ?? cached?.patchId;
+                          if (!patchId) return;
+                          try {
+                            const full = await api.getPatch(patchId);
+                            setActivePatch({
+                              patch: patchRowToResponse(full),
+                              gapName: gap?.canonical_name ?? "",
+                            });
+                          } catch {
+                            if (cached) setActivePatch({ patch: cached, gapName: gap?.canonical_name ?? "" });
+                          }
+                        }}
                         onAddPr={onAddPr}
                         onRemovePr={onRemovePr}
                         onOpenPreview={(repoKey, branch, gapId) => {
-                          // If a concurrent refresh already flagged this gap
-                          // stale, short-circuit — no point mounting the
-                          // emulator view just to surface the same error.
-                          if (gapId != null && stalePatchedGaps.has(gapId)) {
-                            setError(`Patch branch '${branch}' no longer exists. Regenerate the patch.`);
-                            return;
-                          }
                           const p = gapId != null ? patchData.get(gapId) : undefined;
                           const gap = gaps.find((g) => g.id === gapId);
-                          previewPanel.open({
-                            repoKey,
-                            branch,
-                            initialTab: "emulator",
+                          setActivePreview({
+                            repoKey, branch,
                             prUrl: p?.prUrl ?? null,
                             prWarning: p?.prWarning ?? null,
                             patchId: p?.patchId ?? null,
                             gapName: gap?.canonical_name,
-                            onBranchGone: gapId != null ? () => onBranchGone(gapId) : undefined,
                           });
                         }}
                       />
@@ -939,7 +857,6 @@ export default function App() {
             )}
 
           </div>{/* end page-body */}
-          </ErrorBoundary>
         </div>{/* end main */}
       </div>{/* end workspace */}
 
@@ -981,26 +898,26 @@ export default function App() {
               prWarning: patch.prWarning ?? null,
             };
             setPatchedGaps((prev) => { const s = new Set(prev); s.add(id); return s; });
-            // Regeneration produced a fresh branch — clear any stale flag so
-            // the Chat/Preview affordances come back immediately, without
-            // waiting for the refresh() round-trip below.
-            setStalePatchedGaps((prev) => {
-              if (!prev.has(id)) return prev;
-              const s = new Set(prev);
-              s.delete(id);
-              return s;
-            });
             setPatchBuildStatus((prev) => { const m = new Map(prev); m.set(id, "pass"); return m; });
             setPatchData((prev) => { const m = new Map(prev); m.set(id, patchResp); return m; });
             setPatching((prev) => { const s = new Set(prev); s.delete(id); return s; });
             setActiveAgent((prev) => prev ? { ...prev, mode: "chat", existingPatchId: patch.patchId } : null);
             refresh();
           }}
-          onBranchGone={() => onBranchGone(activeAgent.gapId)}
         />
       )}
 
-      <PreviewPanel />
+      {activePreview && (
+        <PreviewDrawer
+          repoKey={activePreview.repoKey}
+          branch={activePreview.branch}
+          prUrl={activePreview.prUrl}
+          prWarning={activePreview.prWarning}
+          patchId={activePreview.patchId}
+          gapName={activePreview.gapName}
+          onClose={() => setActivePreview(null)}
+        />
+      )}
 
       {activeSourceGap && (
         <SourceViewer

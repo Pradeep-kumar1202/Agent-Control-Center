@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type ChatMessageRow, type ChatStreamChunk, type PatchBuildFailedChunk, type PatchDoneChunk, type PatchStreamChunk, type PhaseMarkerChunk } from "../api";
+import { api, type ChatMessageRow, type ChatStreamChunk, type NativeGateWarningChunk, type PatchBuildFailedChunk, type PatchDoneChunk, type PatchStreamChunk, type PhaseMarkerChunk } from "../api";
 import { readNdjson } from "./ndjson";
 
 // ─── props ───────────────────────────────────────────────────────────────────
@@ -14,13 +14,6 @@ interface Props {
   onClose: () => void;
   /** Called on successful patch generation with the patch metadata */
   onPatchSuccess: (patch: PatchDoneChunk) => void;
-  /**
-   * Called when the chat route reports that the patch's branch was deleted
-   * and can't be recovered — either via a 409 on send or a typed error
-   * chunk mid-stream. Lets App.tsx flip the gap row into the stale state
-   * so the user can regenerate instead of staring at a failing chat.
-   */
-  onBranchGone?: () => void;
 }
 
 // ─── state types ─────────────────────────────────────────────────────────────
@@ -29,6 +22,8 @@ type PanelStage =
   | "patching"      // streaming patch generation
   | "patch-done"    // generation done, chat input visible
   | "build-failed"  // build check failed — chat to fix
+  | "gate-warn"     // mobile native-wrapper gate tripped — user can force through
+  | "forcing-pr"    // user clicked "Raise PR anyway", push + PRs in progress
   | "chat-only"     // mode="chat", no generation
   | "error";        // terminal non-recoverable error
 
@@ -55,7 +50,6 @@ export function AgentPanel({
   existingPatchId,
   onClose,
   onPatchSuccess,
-  onBranchGone,
 }: Props) {
   const [stage, setStage] = useState<PanelStage>(mode === "patch" ? "patching" : "chat-only");
   const [phase, setPhase] = useState<AgentPhase | null>(null);
@@ -63,6 +57,7 @@ export function AgentPanel({
   const [stream, setStream] = useState<StreamState>({ text: "", tools: [], error: null });
   const [patch, setPatch] = useState<PatchDoneChunk | null>(null);
   const [buildFailed, setBuildFailed] = useState<PatchBuildFailedChunk | null>(null);
+  const [gateWarn, setGateWarn] = useState<NativeGateWarningChunk | null>(null);
   const [patchId, setPatchId] = useState<number | undefined>(existingPatchId);
   const [diffOpen, setDiffOpen] = useState(false);
   const [buildLogOpen, setBuildLogOpen] = useState(true);
@@ -148,6 +143,11 @@ export function AgentPanel({
               ? `${note}\n\nAlso — the build failed with these errors:\n\n${failed.buildLog.slice(-2000)}\n\nPlease fix all the errors and re-run the build until it passes.`
               : `The build failed. Please fix these errors and re-run until it passes:\n\n${failed.buildLog.slice(-2000)}`;
             setChatInput(seedMsg);
+          } else if (chunk.type === "native_gate_warning") {
+            const warn = chunk as NativeGateWarningChunk;
+            setGateWarn(warn);
+            setPatchId(warn.patchId);
+            setStage("gate-warn");
           } else if (chunk.type === "patch_done") {
             const done = chunk as PatchDoneChunk;
             setPatch(done);
@@ -173,6 +173,40 @@ export function AgentPanel({
     return () => { ctrl.abort(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gapId, mode]);
+
+  // ── Force PR (bypass native gate) ──────────────────────────────────────────
+  const forcePr = async () => {
+    if (!patchId || stage !== "gate-warn") return;
+    const ctrl = new AbortController();
+    patchAbortRef.current = ctrl;
+    setStage("forcing-pr");
+    setStreaming(true);
+    try {
+      const r = await api.forcePatchPr(patchId, ctrl.signal);
+      if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+      for await (const chunk of readNdjson<PatchStreamChunk>(r.body)) {
+        if (chunk.type === "text" && chunk.text) {
+          const text = chunk.text;
+          setStream((prev) => ({ ...prev, text: prev.text + text }));
+        } else if (chunk.type === "error" && chunk.error) {
+          setStream((prev) => ({ ...prev, error: chunk.error ?? "unknown error" }));
+          setStage("error");
+        } else if (chunk.type === "patch_done") {
+          const done = chunk as PatchDoneChunk;
+          setPatch(done);
+          setStage("patch-done");
+          onPatchSuccess(done);
+        }
+      }
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") {
+        setStream((prev) => ({ ...prev, error: (e as Error).message }));
+        setStage("error");
+      }
+    } finally {
+      setStreaming(false);
+    }
+  };
 
   // ── Chat send ──────────────────────────────────────────────────────────────
   const sendChat = async () => {
@@ -204,19 +238,6 @@ export function AgentPanel({
         signal: ctrl.signal,
       });
       if (!r.ok || !r.body) {
-        // Pre-flight branch-gone: the server rejected before flushing any
-        // NDJSON, so there's a parseable JSON body. Translate it into the
-        // same recovery path as the mid-stream BRANCH_GONE chunk below.
-        if (r.status === 409) {
-          try {
-            const body = await r.json();
-            if (body?.code === "BRANCH_GONE") {
-              setLiveTurn((prev) => prev ? { ...prev, error: "Patch branch was deleted — regenerate from the gap row." } : prev);
-              onBranchGone?.();
-              return;
-            }
-          } catch { /* fall through to generic error */ }
-        }
         throw new Error(`chat stream failed: HTTP ${r.status}`);
       }
       for await (const chunk of readNdjson<ChatStreamChunk>(r.body)) {
@@ -225,13 +246,6 @@ export function AgentPanel({
         } else if (chunk.type === "tool_use" && chunk.tool) {
           setLiveTurn((prev) => prev ? { ...prev, toolUses: [...prev.toolUses, chunk.tool!] } : prev);
         } else if (chunk.type === "error" && chunk.error) {
-          if (chunk.code === "BRANCH_GONE") {
-            // Race: pre-flight passed but the branch vanished before the
-            // lock was acquired. Recover the same way as the 409 path.
-            setLiveTurn((prev) => prev ? { ...prev, error: "Patch branch was deleted — regenerate from the gap row." } : prev);
-            onBranchGone?.();
-            return;
-          }
           setLiveTurn((prev) => prev ? { ...prev, error: chunk.error ?? "error" } : prev);
         } else if (chunk.type === "done") {
           break;
@@ -269,6 +283,8 @@ export function AgentPanel({
     patching: phase ? phaseLabels[phase] : "Starting…",
     "patch-done": "Done ✓",
     "build-failed": "Build failed — fix in chat",
+    "gate-warn": "Native wrappers skipped",
+    "forcing-pr": "Opening PRs…",
     "chat-only": "Chat",
     error: "Failed",
   };
@@ -276,6 +292,8 @@ export function AgentPanel({
     patching: phase ? phaseColors[phase] : "var(--text3)",
     "patch-done": "var(--green)",
     "build-failed": "var(--amber)",
+    "gate-warn": "var(--amber)",
+    "forcing-pr": "var(--accent)",
     "chat-only": "var(--text2)",
     error: "var(--red)",
   };
@@ -398,6 +416,63 @@ export function AgentPanel({
             </div>
           )}
 
+          {/* ── Native-wrapper gate warning ── */}
+          {gateWarn && (stage === "gate-warn" || stage === "forcing-pr") && (
+            <div style={{ marginTop: 8, border: "1px solid rgba(245,158,11,.3)", background: "rgba(245,158,11,.05)", borderRadius: 8, padding: "12px 14px" }}>
+              <div style={{ color: "var(--amber)", fontWeight: 600, fontSize: 12, marginBottom: 6 }}>
+                Native wrappers skipped — patch saved on branch <code style={{ fontFamily: "var(--mono)", color: "var(--accent)" }}>{gateWarn.branch}</code>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text2)", marginBottom: 8, lineHeight: 1.5 }}>
+                You edited <code style={{ fontFamily: "var(--mono)", color: "var(--accent)" }}>src/types/SdkTypes.res</code> but didn't update:
+                <ul style={{ margin: "6px 0 0 16px", padding: 0, color: "var(--amber)" }}>
+                  {gateWarn.missing.map((m, i) => (
+                    <li key={i} style={{ fontSize: 11, marginBottom: 2 }}>{m}</li>
+                  ))}
+                </ul>
+                <div style={{ marginTop: 8, fontSize: 10, color: "var(--text3)" }}>
+                  Native merchants using Kotlin/Swift SDKs won't be able to use this prop until the wrappers are updated.
+                  You can regenerate the patch to try again, or raise the PR anyway and add the wrappers in a follow-up.
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                <button
+                  onClick={() => void forcePr()}
+                  disabled={stage === "forcing-pr"}
+                  className="btn btn-sm"
+                  style={{ fontSize: 11, background: "var(--amber)", color: "var(--bg)", borderColor: "var(--amber)", fontWeight: 600, opacity: stage === "forcing-pr" ? 0.6 : 1 }}
+                >
+                  {stage === "forcing-pr" ? "Opening PRs…" : "Raise PR anyway"}
+                </button>
+                <button
+                  onClick={onClose}
+                  className="btn btn-sm"
+                  style={{ fontSize: 11, color: "var(--text2)" }}
+                >
+                  Close (keep branch)
+                </button>
+              </div>
+              <div style={{ marginTop: 10 }}>
+                <button
+                  onClick={() => setDiffOpen((v) => !v)}
+                  className="btn btn-sm"
+                  style={{ fontSize: 10, color: "var(--text2)" }}
+                >
+                  {diffOpen ? "Hide diff ↑" : "Show diff ↓"} ({gateWarn.filesTouched} files)
+                </button>
+                {diffOpen && (
+                  <pre style={{
+                    fontFamily: "var(--mono)", fontSize: 10, background: "var(--bg4)",
+                    color: "var(--text2)", borderRadius: 6, padding: "8px 12px",
+                    overflowX: "auto", maxHeight: 220, overflowY: "auto", marginTop: 6,
+                    whiteSpace: "pre-wrap", wordBreak: "break-all",
+                  }}>
+                    {gateWarn.diff}
+                  </pre>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* ── Build failure block ── */}
           {buildFailed && stage === "build-failed" && (
             <div style={{ marginTop: 8, border: "1px solid rgba(245,158,11,.3)", background: "rgba(245,158,11,.05)", borderRadius: 8, padding: "12px 14px" }}>
@@ -457,6 +532,17 @@ export function AgentPanel({
                 <div>Branch: <code style={{ color: "var(--accent)", fontFamily: "var(--mono)" }}>{patch.branch}</code></div>
                 {patch.prUrl && (
                   <div>PR: <a href={patch.prUrl} target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue)", textDecoration: "underline" }}>{patch.prUrl}</a></div>
+                )}
+                {patch.submodulePrs && patch.submodulePrs.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 2 }}>
+                    <div style={{ fontSize: 10, color: "var(--text3)" }}>Submodule PRs</div>
+                    {patch.submodulePrs.map((sp) => (
+                      <div key={sp.prUrl} style={{ fontSize: 11 }}>
+                        <span style={{ color: "var(--text3)", fontFamily: "var(--mono)" }}>{sp.subDir} →</span>{" "}
+                        <a href={sp.prUrl} target="_blank" rel="noopener noreferrer" style={{ color: "var(--blue)", textDecoration: "underline" }}>{sp.prUrl}</a>
+                      </div>
+                    ))}
+                  </div>
                 )}
                 {patch.prWarning && <div style={{ color: "var(--amber)", fontSize: 10 }}>{patch.prWarning}</div>}
               </div>

@@ -2,20 +2,13 @@ import { Router } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../config.js";
-import { db, isPrState, listPrStates, nowIso, setPrState, type GapRow } from "../db.js";
-import { ask, askStream } from "../llm.js";
+import { db, nowIso, type GapRow } from "../db.js";
+import { ask, askStream, extractBalancedJson } from "../llm.js";
 import { generateDoc } from "../skills/docs/generator.js";
 import simpleGit from "simple-git";
-import {
-  commitWithSubmodules,
-  getDiffWithSubmodules,
-  resetSubmodules,
-  forceCheckoutBranch,
-  listLocalBranches,
-  listRemoteBranches,
-} from "../skills/submoduleGit.js";
+import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch, ensureSubmodulesClean, advanceSubmodulesToOriginMain } from "../skills/submoduleGit.js";
 import { runRescriptBuild } from "../skills/buildCheck.js";
-import { pushBranchToFork, createPullRequest, formatPrBody, pushSubmoduleToFork, rewriteGitmodulesToForks, commitsAheadOfForkMain } from "../skills/githubPr.js";
+import { pushBranchToFork, createPullRequest, createSubmodulePullRequest, formatPrBody, pushSubmoduleToFork, rewriteGitmodulesToForks, commitsAheadOfForkMain } from "../skills/githubPr.js";
 import { withRepoLock } from "../workspace/mutex.js";
 
 export const patchesRouter = Router();
@@ -244,26 +237,12 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
-  // Abort the whole run when the client goes away.
-  //
-  // Marking `clientClosed` only stopped us WRITING; the agents kept running.
-  // One was seen still editing the workspace 13 minutes after its stream
-  // closed — by then the route had checked `main` back out, so it was writing
-  // onto main, and its edits would have been swept into whatever ran next.
-  //
-  // `res.on("close")` rather than `req.on("close")`: on a streaming response
-  // the request ends as soon as the body is read, so `req` fires early on some
-  // clients. The response closing is the real disconnect signal, and the chat
-  // route already documented this.
-  const runAbort = new AbortController();
   let clientClosed = false;
-  const onClientGone = () => {
-    if (clientClosed) return;
+  const abortController = new AbortController();
+  req.on("close", () => {
     clientClosed = true;
-    runAbort.abort();
-  };
-  res.on("close", onClientGone);
-  req.on("aborted", onClientGone);
+    abortController.abort();
+  });
 
   const writeLine = (obj: unknown) => {
     if (!clientClosed && !res.writableEnded) {
@@ -294,8 +273,33 @@ patchesRouter.post("/gaps/:id/patch/stream", async (req, res) => {
 
       await resetSubmodules(targetDir, targetRepo);
       await forceCheckoutBranch(targetDir, targetRepo, "main");
+      try {
+        await ensureSubmodulesClean(targetDir, targetRepo);
+      } catch (err) {
+        writeLine({
+          type: "error",
+          error: `Refusing to start patch — workspace is in a dirty state from a prior run:\n${(err as Error).message}`,
+        });
+        res.end();
+        return;
+      }
       try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
       await git.checkoutLocalBranch(branchName);
+
+      // Pull every submodule up to its own origin/main BEFORE the agent runs.
+      // Parent main's declared submodule SHA can be weeks stale — if we leave
+      // them there, the agent reads outdated Kotlin/Swift files and the PR
+      // ships changes on top of old code. Any pointer bump is captured later
+      // by commitWithSubmodules.
+      let submodulesAdvanced: string[] = [];
+      try {
+        submodulesAdvanced = await advanceSubmodulesToOriginMain(targetDir, targetRepo);
+        if (submodulesAdvanced.length > 0) {
+          writeLine({ type: "text", text: `\n[submodules bumped to origin/main: ${submodulesAdvanced.join(", ")}]\n` });
+        }
+      } catch (err) {
+        writeLine({ type: "text", text: `\n[submodule advance warning: ${(err as Error).message}]\n` });
+      }
 
       const sourceEntryPath = sourceFile
         ? `${sourceDir}/${sourceFile}`
@@ -340,8 +344,40 @@ OUTPUT: Produce ONLY valid JSON in this exact shape (no fences, no prose):
   "implementationSteps": [
     "<ordered step 1: e.g. Add field X to record Y in file Z>",
     "<ordered step 2: ...>"
-  ]
+  ],
+  "nativeSurfaces": <see below; omit the key entirely if not applicable>
 }
+
+${targetRepo === "mobile" ? `## Native surfaces (MOBILE ONLY)
+
+The mobile repo at ${targetDir} has three native wrappers that expose the JS/ReScript
+config to native Kotlin and Swift merchants:
+  - android/hyperswitch-sdk-android-api/src/main/kotlin/.../PaymentSheet.kt
+    — \`Configuration\` data class + \`Configuration.Builder\` + \`toBundle()\`
+  - ios/.../Configuration.swift (or parallel file in the ios/ submodule)
+  - The submodule shared-code may also need updates if the prop surfaces there.
+
+If — and ONLY if — this feature adds or modifies a field in any record declared
+in \`src/types/SdkTypes.res\` (e.g. \`configurationType\`, \`paymentSheetAppearance\`),
+grep ${targetDir}/android and ${targetDir}/ios to find the matching Configuration
+class and populate \`nativeSurfaces\`:
+
+"nativeSurfaces": {
+  "android": {
+    "configClass": "<absolute path to Kotlin Configuration file>",
+    "builderMethod": "<camelCase Builder method name, e.g. paymentMethodOrder>",
+    "bundleKey": "<exact key for toBundle() — MUST equal configKey above>"
+  },
+  "ios": {
+    "configStruct": "<absolute path to Swift Configuration file>",
+    "propertyName": "<Swift property name matching configKey>"
+  }
+}
+
+If the feature does NOT touch SdkTypes.res (e.g. it only adds a new component
+or util), OMIT the nativeSurfaces key entirely.` : `## Native surfaces
+
+Target is the web repo — omit the \`nativeSurfaces\` key entirely.`}
 
 Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read there.`;
 
@@ -349,12 +385,11 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       await askStream(
         analystPrompt,
         {
-          slot: "patch.source-analyst",
-          signal: runAbort.signal,
           model: "opus",
           cwd: sourceDir,
           allowedTools: ["Read", "Glob", "Grep"],
           timeoutMs: 600_000,
+          signal: abortController.signal,
         },
         (chunk) => {
           writeLine(chunk);
@@ -365,8 +400,8 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       // Extract JSON spec from analyst output (may be surrounded by thinking text)
       let spec: SourceSpec | null = null;
       try {
-        const m = specText.match(/\{[\s\S]*\}/);
-        if (m) spec = JSON.parse(m[0]) as SourceSpec;
+        const j = extractBalancedJson(specText);
+        if (j) spec = JSON.parse(j) as SourceSpec;
       } catch {
         writeLine({ type: "text", text: "\n[Note: analyst output could not be parsed as JSON — using fallback prompt for implementer]\n" });
       }
@@ -385,12 +420,11 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       await askStream(
         implementerPrompt,
         {
-          slot: "patch.implementer",
-          signal: runAbort.signal,
           model: "opus",
           cwd: targetDir,
           allowedTools: ["Edit", "Write", "Read", "Glob", "Grep", "Bash"],
           timeoutMs: 1_200_000,
+          signal: abortController.signal,
         },
         (chunk) => {
           writeLine(chunk);
@@ -411,9 +445,76 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
         return;
       }
 
+      // ================================================================
+      // NATIVE-WRAPPER GATE (mobile only)
+      // If the diff touches src/types/SdkTypes.res, we DEMAND changes under
+      // android/ and ios/ too. A ReScript-only mobile patch is never the full
+      // fix — the Kotlin/Swift wrappers in android/ + ios/ are how native
+      // merchants pass the prop through the SDK.
+      // ================================================================
       const patchFileName = `${gapId}-${slug}.patch`;
       const patchPath = path.join(PATCHES_DIR, patchFileName);
       fs.writeFileSync(patchPath, diff);
+
+      // Soft gate: if the target is mobile and SdkTypes.res was changed but
+      // android/ or ios/ weren't, warn the user and let them decide. We stop
+      // the automatic PR flow here (the agent's edits aren't committed yet),
+      // save a patch row with status='gate_warn' so the work isn't lost,
+      // and emit a `native_gate_warning` chunk. The UI shows a "Raise PR
+      // anyway" button that calls POST /patches/:id/force-pr to pick up and
+      // finish the commit + push + PR sequence.
+      if (targetRepo === "mobile") {
+        const touchedSdkTypes = /^diff --git a\/src\/types\/SdkTypes\.res/m.test(diff);
+        const touchedAndroid = /^diff --git a\/android\//m.test(diff);
+        const touchedIos = /^diff --git a\/ios\//m.test(diff);
+        if (touchedSdkTypes && (!touchedAndroid || !touchedIos)) {
+          const missing: string[] = [];
+          if (!touchedAndroid) missing.push("android/ (Kotlin Configuration + Builder + toBundle)");
+          if (!touchedIos) missing.push("ios/ (Swift Configuration)");
+
+          // Commit the agent's edits NOW so they survive the lock release.
+          // Without this, another repo operation could checkout --force and
+          // wipe the working tree before the user hits "Raise PR anyway".
+          const gateCommitMsg = `feat: add ${gap.canonical_name} (native wrappers pending)\n\nGenerated by feature-gap-dashboard for gap #${gapId}.\nMissing wrappers: ${missing.join(", ")}`;
+          try {
+            await commitWithSubmodules(targetDir, targetRepo, gateCommitMsg);
+          } catch (err) {
+            console.error(`[patches/stream] gate-warn commit failed:`, err);
+          }
+
+          const warnPatchRow = db
+            .prepare(
+              `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
+               VALUES (?, ?, ?, ?, ?, ?, 'gate_warn', ?, 'skipped', ?, NULL, NULL, ?)`,
+            )
+            .run(
+              gapId,
+              targetRepo,
+              branchName,
+              patchPath,
+              agentText.slice(0, 2000),
+              fileCount,
+              nowIso(),
+              null,
+              `Missing native wrappers: ${missing.join(", ")}`,
+            );
+
+          await forceCheckoutBranch(targetDir, targetRepo, "main");
+
+          writeLine({
+            type: "native_gate_warning",
+            patchId: Number(warnPatchRow.lastInsertRowid),
+            branch: branchName,
+            repo: targetRepo,
+            missing,
+            diff,
+            filesTouched: fileCount,
+            summary: agentText.slice(0, 2000),
+          });
+          res.end();
+          return;
+        }
+      }
 
       writeLine({ type: "text", text: "\n---\nRunning server-side build verification…" });
       const build = runRescriptBuild(targetDir);
@@ -463,12 +564,11 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       await askStream(
         verifierPrompt,
         {
-          slot: "patch.verifier",
-          signal: runAbort.signal,
           model: "opus",
           cwd: targetDir,
           allowedTools: ["Read", "Grep", "Glob"],
           timeoutMs: 300_000,
+          signal: abortController.signal,
         },
         (chunk) => {
           writeLine(chunk);
@@ -480,9 +580,9 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       let verifyPassed = true;
       let verifyIssues: string[] = [];
       try {
-        const m = verifyText.match(/\{[\s\S]*\}/);
-        if (m) {
-          const parsed = JSON.parse(m[0]) as { pass?: boolean; issues?: string[] };
+        const j = extractBalancedJson(verifyText);
+        if (j) {
+          const parsed = JSON.parse(j) as { pass?: boolean; issues?: string[] };
           if (parsed.pass === false) {
             verifyPassed = false;
             verifyIssues = Array.isArray(parsed.issues) ? parsed.issues : ["unspecified issues"];
@@ -524,10 +624,23 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
       let prNumber: number | null = null;
       let prWarning: string | null = null;
       const submodulePushSummaries: string[] = [];
+      const submodulePrLinks: Array<{ subDir: string; prUrl: string; prNumber: number }> = [];
       try {
         for (const subDir of commitResult.submodulesChanged) {
           const result = await pushSubmoduleToFork({ parentDir: targetDir, subDir, branchName });
           submodulePushSummaries.push(`${subDir} → ${result.forkUrl} @ ${result.sha.slice(0, 8)}`);
+          // Open a PR on the submodule's own bot fork so native reviewers can
+          // land the Kotlin/Swift changes in that repo's own review flow.
+          const subPr = await createSubmodulePullRequest({
+            subDir,
+            branch: branchName,
+            title: `feat: add ${gap.canonical_name} (${subDir})`,
+            body: `## Summary\n\nPart of the \`${gap.canonical_name}\` feature. This PR contains the \`${subDir}\` changes; the parent-repo PR links all of them.\n\nGenerated by feature-gap-dashboard for gap #${gapId}.`,
+          });
+          if (subPr) {
+            submodulePrLinks.push({ subDir: subPr.subDir, prUrl: subPr.prUrl, prNumber: subPr.prNumber });
+            writeLine({ type: "text", text: `\nOpened ${subDir} PR: ${subPr.prUrl}` });
+          }
         }
         if (commitResult.submodulesChanged.length > 0) {
           const rewritten = rewriteGitmodulesToForks(targetDir, commitResult.submodulesChanged);
@@ -538,6 +651,9 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
           }
         }
         await pushBranchToFork(targetDir, targetRepo, branchName);
+        const relatedPrsSection = submodulePrLinks.length > 0
+          ? `\n\n## Linked submodule PRs\n\n${submodulePrLinks.map((p) => `- \`${p.subDir}\` → ${p.prUrl}`).join("\n")}\n`
+          : "";
         const body = formatPrBody({
           gapId,
           canonicalName: gap.canonical_name,
@@ -547,7 +663,7 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
           filesTouched: fileCount,
           buildLog: build.log,
           submodulePushes: submodulePushSummaries,
-        });
+        }) + relatedPrsSection;
         const created = await createPullRequest({
           repoKey: targetRepo,
           branch: branchName,
@@ -565,8 +681,8 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
 
       const patchRow = db
         .prepare(
-          `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning)
-           VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO patches (gap_id, repo, branch, diff_path, summary, files_touched, status, created_at, build_status, build_log, pr_url, pr_number, pr_warning, submodule_prs)
+           VALUES (?, ?, ?, ?, ?, ?, 'generated', ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           gapId,
@@ -581,9 +697,22 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
           prUrl,
           prNumber,
           prWarning,
+          submodulePrLinks.length > 0 ? JSON.stringify(submodulePrLinks) : null,
         );
 
       const patchId = Number(patchRow.lastInsertRowid);
+
+      // Surface every auto-opened PR in the dashboard's Linked-PRs column.
+      const insertGapPr = db.prepare(
+        `INSERT INTO gap_prs (canonical_name, category, missing_in, pr_url, added_at) VALUES (?, ?, ?, ?, ?)`,
+      );
+      const linkedAt = nowIso();
+      if (prUrl) {
+        try { insertGapPr.run(gap.canonical_name, gap.category, gap.missing_in, prUrl, linkedAt); } catch { /* duplicate */ }
+      }
+      for (const sp of submodulePrLinks) {
+        try { insertGapPr.run(gap.canonical_name, gap.category, gap.missing_in, sp.prUrl, linkedAt); } catch { /* duplicate */ }
+      }
 
       writeLine({
         type: "patch_done",
@@ -598,6 +727,7 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
         prUrl,
         prNumber,
         prWarning,
+        submodulePrs: submodulePrLinks,
       });
 
       // Fire-and-forget documentation generation
@@ -622,55 +752,174 @@ Do NOT write any code in the target repo. Your cwd is ${sourceDir} — only read
 });
 
 /**
- * GET /patches/branch-health
+ * Force through the commit+push+PR pipeline for a patch that tripped the
+ * mobile native-wrapper gate. The agent's edits are already committed on the
+ * patch branch (we committed them before emitting native_gate_warning) —
+ * this endpoint just pushes + opens the PRs and updates the row.
  *
- * For every row in patches, report whether its branch can actually be
- * checked out. The dashboard calls this alongside GET /patches on load so
- * it can mark "stale" rows (patch exists but branch was deleted locally
- * and isn't recoverable from origin) before the user clicks anything.
- *
- * One local `for-each-ref` per repo + at most one `ls-remote --heads` per
- * repo (only for branches missing locally). Typical cost: <200 ms.
- *
- * Registered BEFORE /patches/:id so Express doesn't parse "branch-health"
- * as a numeric id and reply with "patch not found".
+ * Streams NDJSON identical to /patch/stream so the UI can reuse its reader.
  */
-patchesRouter.get("/patches/branch-health", async (_req, res) => {
+patchesRouter.post("/patches/:id/force-pr", async (req, res) => {
+  const patchId = Number(req.params.id);
+  if (!Number.isFinite(patchId)) return res.status(400).json({ error: "bad id" });
+
+  const patch = db.prepare("SELECT * FROM patches WHERE id = ?").get(patchId) as
+    | { id: number; gap_id: number; repo: string; branch: string; diff_path: string; summary: string; files_touched: number; status: string }
+    | undefined;
+  if (!patch) return res.status(404).json({ error: "patch not found" });
+  if (patch.status !== "gate_warn") {
+    return res.status(400).json({ error: `patch is not gate_warn (status=${patch.status})` });
+  }
+
+  const gap = db.prepare("SELECT * FROM gaps WHERE id = ?").get(patch.gap_id) as GapRow | undefined;
+  if (!gap) return res.status(404).json({ error: "gap not found" });
+
+  const targetRepo = patch.repo as RepoKey;
+  const targetDir = REPOS[targetRepo].dir;
+  const branchName = patch.branch;
+
+  res.setHeader("Content-Type", "application/x-ndjson");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  let clientClosed = false;
+  res.on("close", () => { clientClosed = true; });
+  const writeLine = (obj: unknown) => {
+    if (!clientClosed && !res.writableEnded) {
+      try { res.write(JSON.stringify(obj) + "\n"); } catch { /* */ }
+    }
+  };
+
+  let diffText = "";
+  try { diffText = fs.readFileSync(patch.diff_path, "utf8"); } catch { /* */ }
+
   try {
-    const rows = db
-      .prepare("SELECT id, repo, branch FROM patches")
-      .all() as Array<{ id: number; repo: string; branch: string }>;
-    if (rows.length === 0) return res.json({});
+    await withRepoLock(targetRepo, async () => {
+      writeLine({ type: "text", text: `Checking out ${branchName} on ${targetRepo}…\n` });
+      const git = simpleGit(targetDir);
+      await git.raw(["checkout", "--force", branchName]);
 
-    const byRepo = new Map<RepoKey, typeof rows>();
-    for (const r of rows) {
-      const key = r.repo as RepoKey;
-      if (!(key in REPOS)) continue;
-      const bucket = byRepo.get(key) ?? [];
-      bucket.push(r);
-      byRepo.set(key, bucket);
-    }
+      writeLine({ type: "text", text: "Pushing to fork and opening PRs…\n" });
 
-    const result: Record<number, { exists: boolean; recoverable: boolean }> = {};
-    for (const [repoKey, bucket] of byRepo) {
-      const repoDir = REPOS[repoKey].dir;
-      const localSet = new Set(await listLocalBranches(repoDir));
-      const missing = bucket.filter((r) => !localSet.has(r.branch));
-      const remoteSet = missing.length > 0
-        ? await listRemoteBranches(repoDir, missing.map((r) => r.branch))
-        : new Set<string>();
-      for (const r of bucket) {
-        const exists = localSet.has(r.branch);
-        result[r.id] = {
-          exists,
-          recoverable: exists || remoteSet.has(r.branch),
-        };
+      let prUrl: string | null = null;
+      let prNumber: number | null = null;
+      let prWarning: string | null = null;
+      const submodulePushSummaries: string[] = [];
+      const submodulePrLinks: Array<{ subDir: string; prUrl: string; prNumber: number }> = [];
+
+      // Re-detect which submodules have commits on this branch vs main.
+      // We ask the PARENT git which submodule pointers advanced between main
+      // and HEAD — immune to the submodule being in detached HEAD state or
+      // having a stale origin/main ref, which broke the previous HEAD vs
+      // origin/main check and caused force-PR to silently skip all submodule
+      // PRs when the gate fired.
+      const parentGit = simpleGit(targetDir);
+      const submoduleDirs = targetRepo === "mobile" ? ["shared-code", "android", "ios"] : ["shared-code"];
+      const submodulesWithCommits: string[] = [];
+      for (const subDir of submoduleDirs) {
+        const subPath = path.join(targetDir, subDir);
+        if (!fs.existsSync(path.join(subPath, ".git"))) continue;
+        try {
+          const pointerDiff = await parentGit.raw(["diff", "main", "--", subDir]).catch(() => "");
+          if (pointerDiff.trim()) submodulesWithCommits.push(subDir);
+        } catch { /* */ }
       }
-    }
-    res.json(result);
+
+      try {
+        for (const subDir of submodulesWithCommits) {
+          const result = await pushSubmoduleToFork({ parentDir: targetDir, subDir, branchName });
+          submodulePushSummaries.push(`${subDir} → ${result.forkUrl} @ ${result.sha.slice(0, 8)}`);
+          const subPr = await createSubmodulePullRequest({
+            subDir,
+            branch: branchName,
+            title: `feat: add ${gap.canonical_name} (${subDir})`,
+            body: `## Summary\n\nPart of the \`${gap.canonical_name}\` feature. Forced through the native-wrapper gate — native wrappers may be incomplete.\n\nGenerated by feature-gap-dashboard for gap #${gap.id}.`,
+          });
+          if (subPr) {
+            submodulePrLinks.push({ subDir: subPr.subDir, prUrl: subPr.prUrl, prNumber: subPr.prNumber });
+            writeLine({ type: "text", text: `Opened ${subDir} PR: ${subPr.prUrl}\n` });
+          }
+        }
+        if (submodulesWithCommits.length > 0) {
+          const rewritten = rewriteGitmodulesToForks(targetDir, submodulesWithCommits);
+          if (rewritten.length > 0) {
+            await parentGit.add([".gitmodules"]);
+            try {
+              await parentGit.commit(`chore: point submodules at bot forks for build\n\nAutomated by feature-gap-dashboard.\nRewritten: ${rewritten.join(", ")}`);
+            } catch { /* nothing to commit — already done during gate-warn */ }
+          }
+        }
+        await pushBranchToFork(targetDir, targetRepo, branchName);
+        const relatedPrsSection = submodulePrLinks.length > 0
+          ? `\n\n## Linked submodule PRs\n\n${submodulePrLinks.map((p) => `- \`${p.subDir}\` → ${p.prUrl}`).join("\n")}\n`
+          : "";
+        const body = formatPrBody({
+          gapId: gap.id,
+          canonicalName: gap.canonical_name,
+          category: gap.category,
+          rationale: gap.rationale,
+          summaryJson: patch.summary,
+          filesTouched: patch.files_touched,
+          buildLog: null,
+          submodulePushes: submodulePushSummaries,
+        }) + `\n\n> ⚠️ This PR was forced through despite the mobile native-wrapper gate. Native wrappers may be incomplete — verify manually before merge.` + relatedPrsSection;
+        const created = await createPullRequest({
+          repoKey: targetRepo,
+          branch: branchName,
+          title: `feat: add ${gap.canonical_name}`,
+          body,
+        });
+        prUrl = created.prUrl;
+        prNumber = created.prNumber;
+      } catch (err) {
+        prWarning = `PR creation failed: ${(err as Error).message}`;
+        console.error(`[patches/force-pr] failed for patch ${patchId}:`, err);
+      }
+
+      await forceCheckoutBranch(targetDir, targetRepo, "main");
+
+      db.prepare(
+        `UPDATE patches SET status = 'generated', pr_url = ?, pr_number = ?, pr_warning = ?, submodule_prs = ? WHERE id = ?`,
+      ).run(
+        prUrl,
+        prNumber,
+        prWarning,
+        submodulePrLinks.length > 0 ? JSON.stringify(submodulePrLinks) : null,
+        patchId,
+      );
+
+      const insertGapPr = db.prepare(
+        `INSERT INTO gap_prs (canonical_name, category, missing_in, pr_url, added_at) VALUES (?, ?, ?, ?, ?)`,
+      );
+      const linkedAt = nowIso();
+      if (prUrl) {
+        try { insertGapPr.run(gap.canonical_name, gap.category, gap.missing_in, prUrl, linkedAt); } catch { /* duplicate */ }
+      }
+      for (const sp of submodulePrLinks) {
+        try { insertGapPr.run(gap.canonical_name, gap.category, gap.missing_in, sp.prUrl, linkedAt); } catch { /* duplicate */ }
+      }
+
+      writeLine({
+        type: "patch_done",
+        patchId,
+        branch: branchName,
+        repo: targetRepo,
+        filesTouched: patch.files_touched,
+        summary: patch.summary,
+        diff: diffText,
+        buildStatus: "pass",
+        buildLog: "",
+        prUrl,
+        prNumber,
+        prWarning,
+        submodulePrs: submodulePrLinks,
+      });
+    });
   } catch (err) {
-    console.error("[patches] branch-health failed:", err);
-    res.status(500).json({ error: (err as Error).message });
+    writeLine({ type: "error", error: (err as Error).message });
+  } finally {
+    if (!clientClosed) res.end();
   }
 });
 
@@ -706,40 +955,6 @@ patchesRouter.get("/patches", (_req, res) => {
   res.json(rows);
 });
 
-/**
- * GET /pr-states — return the full pr_url → state map. The payload is one
- * row per PR the user has set a status on, so it stays tiny (a few dozen rows
- * at most). Pages that render PR chips fetch this once on mount.
- */
-patchesRouter.get("/pr-states", (_req, res) => {
-  const rows = listPrStates();
-  const map: Record<string, { state: string; updated_at: string }> = {};
-  for (const r of rows) map[r.pr_url] = { state: r.state, updated_at: r.updated_at };
-  res.json(map);
-});
-
-/**
- * POST /pr-state — upsert or clear the manual PR status for a URL.
- * Body: { pr_url: string, state: PrState | null }
- * Single URL-keyed source of truth shared across skill result footers, the
- * patches list, and gap-linked PRs. Independent of patches.status /
- * patches.build_status.
- */
-patchesRouter.post("/pr-state", (req, res) => {
-  const body = (req.body ?? {}) as { pr_url?: unknown; state?: unknown };
-  const prUrl = body.pr_url;
-  if (typeof prUrl !== "string" || !prUrl.startsWith("http")) {
-    return res.status(400).json({ error: "pr_url must be a valid URL" });
-  }
-  const raw = body.state;
-  const state = raw === null || raw === undefined ? null : raw;
-  if (state !== null && !isPrState(state)) {
-    return res.status(400).json({ error: "invalid pr state" });
-  }
-  const row = setPrState(prUrl, state);
-  res.json({ pr_url: prUrl, state: row?.state ?? null, updated_at: row?.updated_at ?? null });
-});
-
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 interface SourceSpec {
@@ -751,6 +966,23 @@ interface SourceSpec {
   allRelatedFiles?: Array<{ path: string; role: string }>;
   reScriptGotchas?: string[];
   implementationSteps?: string[];
+  /**
+   * Populated only when the target is the mobile repo AND the feature adds a
+   * field to a record in src/types/SdkTypes.res. Tells the implementer which
+   * Android/iOS wrapper files must also be updated so native merchants can
+   * pass the new prop through the Kotlin/Swift SDKs.
+   */
+  nativeSurfaces?: {
+    android?: {
+      configClass?: string;
+      builderMethod?: string;
+      bundleKey?: string;
+    };
+    ios?: {
+      configStruct?: string;
+      propertyName?: string;
+    };
+  };
 }
 
 function buildSpecBasedImplementerPrompt(opts: {
@@ -763,6 +995,78 @@ function buildSpecBasedImplementerPrompt(opts: {
   sourceEntryPath: string;
 }): string {
   const { spec, gap, repoLabel, targetDir } = opts;
+  const isMobile = repoLabel.includes("mobile");
+  const ns = spec.nativeSurfaces;
+  const configKey = spec.configKey ?? gap.canonical_name;
+  // Unconditional for mobile: the analyst often fails to flag SdkTypes.res or
+  // populate nativeSurfaces, which previously let the implementer ship a
+  // ReScript-only patch. The agent now always gets the native-bridge checklist
+  // and decides whether it applies based on its own edits.
+  const nativeBridgeBlock = isMobile
+    ? `\n\n## ⛔ MOBILE NATIVE BRIDGE — MANDATORY WHEN YOU TOUCH SdkTypes.res
+
+If ANY of your edits add or modify a field on a record in \`src/types/SdkTypes.res\`
+(or any other shared ReScript type consumed by the wrappers), you MUST also
+update the Kotlin (Android) and Swift (iOS) wrapper files in this same pass.
+A ReScript-only mobile patch is INCOMPLETE — native merchants using the
+Kotlin/Swift SDKs cannot pass the new prop without these wrapper edits.
+
+If your edits do NOT touch any ReScript record shape (e.g. a pure internal
+refactor), skip this section.
+
+### Step A — Android Kotlin wrapper (REQUIRED when applicable)
+
+${ns?.android?.configClass
+    ? `File: ${ns.android.configClass}`
+    : `Discover the file — from ${targetDir} run:
+    Grep: "class Configuration" in android/hyperswitch-sdk-android-api/**/*.kt
+  Typical path: android/hyperswitch-sdk-android-api/src/main/kotlin/io/hyperswitch/paymentsheet/PaymentSheet.kt`}
+
+Three edits in that file:
+  1. Add the field to the \`Configuration\` data class (nullable, type matches the ReScript type).
+  2. Add a Builder method named \`${ns?.android?.builderMethod ?? configKey}\` (camelCase, same name as the JS/ReScript key).
+  3. Add a Bundle entry in \`toBundle()\`:
+       if (${ns?.android?.builderMethod ?? configKey} != null) bundle.putXxx("${ns?.android?.bundleKey ?? configKey}", ${ns?.android?.builderMethod ?? configKey})
+     The Bundle key string MUST equal "${ns?.android?.bundleKey ?? configKey}" exactly — that's what the ReScript parser reads.
+
+Mirror the pattern used by existing fields like \`displaySavedPaymentMethods\`
+or \`primaryButtonLabel\` — grep those names to find all three edit sites at
+once.
+
+### Step B — iOS Swift wrapper (REQUIRED when applicable)
+
+${ns?.ios?.configStruct
+    ? `File: ${ns.ios.configStruct}`
+    : `Discover the file — from ${targetDir} run:
+    Grep: "struct Configuration" OR "class Configuration" in ios/**/*.swift
+  Typical path: ios/hyperswitch/Classes/Paymentsheet/PaymentSheetTypes.swift or similar.`}
+
+Add a matching optional property named \`${ns?.ios?.propertyName ?? configKey}\`.
+Mirror the iOS pattern used by the same reference field you used for Android.
+
+### Step C — verify Bundle-key alignment (REQUIRED when applicable)
+
+After editing, run: Grep -n "${ns?.android?.bundleKey ?? configKey}" across
+both the ReScript parser AND the Kotlin \`toBundle()\` you just edited. The
+literal string MUST appear identically in BOTH places. If they differ,
+Android merchants will silently send the value and the JS side will receive
+\`None\`.
+
+### Step D — do NOT touch demo apps
+
+Do NOT modify \`android/demo-app/.../MainActivity.kt\` or any iOS demo
+ViewController here. Those are owned by the "Test in demo app" step.
+
+### ⚠️ Completion criteria (only when ReScript record changed)
+
+Before outputting your final JSON, confirm with \`git diff --stat\`:
+  - At least ONE file under \`android/\` was modified
+  - At least ONE file under \`ios/\` was modified
+  - \`src/types/SdkTypes.res\` (or the shared record you changed) was modified
+If any of those three is missing and you DID change a shared record, your
+work is not done — go back and finish it.`
+    : "";
+
   return `You are implementing a feature in the ${repoLabel} repository.
 
 Your cwd is the TARGET repo: ${targetDir}
@@ -808,7 +1112,7 @@ ReScript-specific pitfalls (also see spec.reScriptGotchas):
 ## Output (only after build exits 0)
 
 Output ONLY this JSON — no code fences, no extra text:
-{"what":"<one-line description>","files":[{"path":"<path relative to target repo>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<optional caveats>"}`;
+{"what":"<one-line description>","files":[{"path":"<path relative to target repo>","change":"<brief>"}],"backward_compatible":true,"build_status":"passed","build_attempts":<n>,"notes":"<optional caveats>"}${nativeBridgeBlock}`;
 }
 
 function buildFallbackImplementerPrompt(opts: {

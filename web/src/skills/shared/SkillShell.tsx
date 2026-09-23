@@ -77,11 +77,8 @@ export function SkillShell({
           })}
         </div>
 
-        {/* Content area — scrollable so long skill results (diff + TestRunner + history)
-            don't get cut off by the 90vh modal cap. */}
-        <div className="flex-1 overflow-y-auto">
-          {children}
-        </div>
+        {/* Content area */}
+        {children}
       </div>
     </div>
   );

@@ -1,46 +1,6 @@
 // Thin API client. The vite dev server proxies /api → http://localhost:5174.
 const BASE = "/api";
 
-/**
- * Thrown when an action targets a patch whose git branch no longer exists
- * locally AND isn't on origin. Raised from jsonFetch when the server replies
- * 409 with `code: "BRANCH_GONE"`. Components catch it by `instanceof` to
- * mark the patch row stale and prompt the user to regenerate — without
- * showing the raw git pathspec error.
- */
-export class BranchGoneError extends Error {
-  readonly code = "BRANCH_GONE" as const;
-  constructor(
-    message: string,
-    readonly branch: string,
-    readonly repo: "web" | "mobile",
-  ) {
-    super(message);
-    this.name = "BranchGoneError";
-  }
-}
-
-/**
- * No model is assigned for one or more pipeline stages, so nothing can run.
- * Configuration is deliberately explicit rather than defaulted — a silent
- * fallback to some other runtime would make quality comparisons lie.
- */
-export class AgentsNotConfiguredError extends Error {
-  readonly code = "AGENTS_NOT_CONFIGURED" as const;
-  constructor(readonly slots: string[], message?: string) {
-    super(message || `No model assigned for: ${slots.join(", ") || "one or more stages"}`);
-    this.name = "AgentsNotConfiguredError";
-  }
-}
-
-/** A runtime is missing, unauthorized, or cannot honour the requested access. */
-export class RuntimeConfigError extends Error {
-  constructor(readonly code: string, message: string) {
-    super(message);
-    this.name = "RuntimeConfigError";
-  }
-}
-
 export interface Report {
   id: number;
   created_at: string;
@@ -96,10 +56,6 @@ export interface ChatMessageRow {
 /**
  * One event from the POST /patches/:id/chat NDJSON stream. Mirrors
  * server/src/llm.ts → StreamChunk but with the wire field names.
- *
- * `code`, `branch`, `repo` are populated on structured errors (currently
- * only BRANCH_GONE — the chat route streams these when a pre-flight says
- * the branch is reachable but it disappears by the time the lock is held).
  */
 export interface ChatStreamChunk {
   type: "text" | "tool_use" | "tool_result" | "done" | "error";
@@ -107,9 +63,6 @@ export interface ChatStreamChunk {
   tool?: { name: string; input?: unknown; id?: string };
   toolResult?: { id: string; content?: string; isError?: boolean };
   error?: string;
-  code?: "BRANCH_GONE";
-  branch?: string;
-  repo?: "web" | "mobile";
   turn?: number;
 }
 
@@ -117,6 +70,12 @@ export interface ChatStreamChunk {
  * Final chunk emitted by POST /gaps/:id/patch/stream on success.
  * All prior chunks are plain ChatStreamChunk (text/tool_use/tool_result).
  */
+export interface SubmodulePrLink {
+  subDir: string;
+  prUrl: string;
+  prNumber: number;
+}
+
 export interface PatchDoneChunk {
   type: "patch_done";
   patchId: number;
@@ -130,6 +89,7 @@ export interface PatchDoneChunk {
   prUrl: string | null;
   prNumber: number | null;
   prWarning: string | null;
+  submodulePrs?: SubmodulePrLink[];
 }
 
 /** Emitted at the start of each agent phase in the multi-Opus pipeline. */
@@ -152,7 +112,29 @@ export interface PatchBuildFailedChunk {
   filesTouched: number;
 }
 
-export type PatchStreamChunk = ChatStreamChunk | PatchDoneChunk | PatchBuildFailedChunk | PhaseMarkerChunk;
+/**
+ * Emitted when the mobile native-wrapper gate trips (SdkTypes.res touched but
+ * android/ or ios/ not touched). The agent's edits are already committed on
+ * the branch — the UI should show a "Raise PR anyway" button that calls
+ * POST /patches/:id/force-pr to continue.
+ */
+export interface NativeGateWarningChunk {
+  type: "native_gate_warning";
+  patchId: number;
+  branch: string;
+  repo: string;
+  missing: string[];
+  diff: string;
+  filesTouched: number;
+  summary: string;
+}
+
+export type PatchStreamChunk =
+  | ChatStreamChunk
+  | PatchDoneChunk
+  | PatchBuildFailedChunk
+  | NativeGateWarningChunk
+  | PhaseMarkerChunk;
 
 export interface SkillRunSummary {
   id: number;
@@ -180,23 +162,6 @@ export interface PatchResponse {
   prWarning?: string | null;
 }
 
-export type PrState =
-  | "draft"
-  | "awaiting_review"
-  | "changes_requested"
-  | "approved"
-  | "merged"
-  | "tested";
-
-export const PR_STATES: readonly PrState[] = [
-  "draft",
-  "awaiting_review",
-  "changes_requested",
-  "approved",
-  "merged",
-  "tested",
-];
-
 export interface PatchRow {
   id: number;
   gap_id: number;
@@ -213,6 +178,7 @@ export interface PatchRow {
   pr_url?: string | null;
   pr_number?: number | null;
   pr_warning?: string | null;
+  submodule_prs?: string | null;
   // Enriched from JOIN with gaps table
   canonical_name?: string;
   category?: string;
@@ -224,63 +190,19 @@ export interface Health {
   counts: { reports: number; gaps: number; patches: number };
 }
 
-/**
- * Result of GET /patches/branch-health, keyed by patch id.
- * - `exists`      — the branch is present in the local clone right now.
- * - `recoverable` — if missing locally, whether it can still be fetched from
- *   origin. A row is considered "stale" only when both are false, i.e. the
- *   branch is gone from every reachable location.
- */
-export interface PatchBranchHealth {
-  exists: boolean;
-  recoverable: boolean;
-}
-
-export type PatchBranchHealthMap = Record<number, PatchBranchHealth>;
-
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init);
   if (!r.ok) {
     // Surface the server's error body when present so the UI shows
     // "build failed: <ReScript error>" instead of an opaque HTTP code.
     let detail = "";
-    let body: unknown = null;
     try {
-      body = await r.json();
+      const body = await r.json();
       if (body && typeof body === "object") {
-        const b = body as Record<string, unknown>;
-        if (typeof b.error === "string") detail = b.error;
-        else detail = JSON.stringify(b).slice(0, 300);
+        if (typeof body.error === "string") detail = body.error;
+        else detail = JSON.stringify(body).slice(0, 300);
       }
     } catch { /* body wasn't JSON */ }
-    // Typed recovery path: the server signals "this patch's branch is gone"
-    // via 409 + {code: "BRANCH_GONE"}. Callers catch BranchGoneError to
-    // self-heal (drop the row from patchedGaps, prompt regenerate).
-    if (r.status === 409 && body && typeof body === "object") {
-      const b = body as Record<string, unknown>;
-      if (b.code === "BRANCH_GONE" && typeof b.branch === "string" && typeof b.repo === "string") {
-        throw new BranchGoneError(
-          typeof b.message === "string" ? b.message : detail,
-          b.branch,
-          b.repo as "web" | "mobile",
-        );
-      }
-    }
-    // Same typed-recovery shape for runtime configuration. A run cannot start
-    // until every stage it needs has a model assigned, so the shell catches
-    // this and opens Settings rather than surfacing an opaque failure.
-    if (body && typeof body === "object") {
-      const b = body as Record<string, unknown>;
-      if (b.code === "AGENTS_NOT_CONFIGURED") {
-        throw new AgentsNotConfiguredError(
-          Array.isArray(b.slots) ? (b.slots as string[]) : [],
-          detail,
-        );
-      }
-      if (b.code === "RUNTIME_UNAVAILABLE" || b.code === "UNSUPPORTED_RUNTIME_CAPABILITY" || b.code === "MODEL_UNAUTHORIZED") {
-        throw new RuntimeConfigError(String(b.code), detail);
-      }
-    }
     throw new Error(detail ? `${r.status}: ${detail}` : `${url} → ${r.status}`);
   }
   return r.json() as Promise<T>;
@@ -294,60 +216,7 @@ function skillPost<T>(skillId: string, spec: unknown): Promise<T> {
   });
 }
 
-// ─── runtime settings ────────────────────────────────────────────────────────
-
-export interface RuntimeProfile {
-  runtime: "claude-code" | "codex" | "opencode";
-  invocation: string;
-  effort?: string;
-}
-export interface AgentSettingsPayload {
-  profiles: Record<string, RuntimeProfile>;
-  assignments: Record<string, string>;
-}
-export interface RuntimeInfo {
-  id: "claude-code" | "codex" | "opencode";
-  installed: boolean;
-  version?: string;
-  models: string[];
-  error?: string;
-  accessPolicies: string[];
-  notes: string[];
-}
-export interface SettingsResponse {
-  agents: AgentSettingsPayload;
-  patchQuality: { repairRounds: number; criticPasses: string[]; crossRuntimeVerify: boolean };
-  slots: string[];
-  accessPolicies: string[];
-  unassignedSlots: string[];
-}
-
 export const api = {
-  getSettings: () => jsonFetch<SettingsResponse>(`${BASE}/settings`),
-  putSettings: (body: { agents?: AgentSettingsPayload; patchQuality?: unknown }) =>
-    jsonFetch<{ agents: AgentSettingsPayload; warnings?: string[] }>(`${BASE}/settings`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  probeRuntimes: (refresh = false) =>
-    jsonFetch<{ runtimes: RuntimeInfo[]; cached: boolean }>(
-      `${BASE}/runtimes/probe${refresh ? "?refresh=1" : ""}`,
-    ),
-  /**
-   * Live one-token round trip. Returns the failure body instead of throwing,
-   * because "this key is blocked" is the answer the user wants to read, not an
-   * exception to handle.
-   */
-  testRuntimeRoute: async (profile: RuntimeProfile) => {
-    const r = await fetch(`${BASE}/runtimes/probe/route`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(profile),
-    });
-    return (await r.json()) as { ok: boolean; latencyMs: number; reply?: string; error?: string };
-  },
-
   health: () => jsonFetch<Health>(`${BASE}/health`),
   latestReport: () => jsonFetch<Report | null>(`${BASE}/reports/latest`),
   gaps: (reportId?: number) =>
@@ -374,6 +243,11 @@ export const api = {
       method: "POST",
       signal,
     }),
+  forcePatchPr: (patchId: number, signal?: AbortSignal): Promise<Response> =>
+    fetch(`${BASE}/patches/${patchId}/force-pr`, {
+      method: "POST",
+      signal,
+    }),
   getPatch: (patchId: number) =>
     jsonFetch<PatchRow>(`${BASE}/patches/${patchId}`),
   getGapSource: (gapId: number) =>
@@ -381,19 +255,6 @@ export const api = {
       `${BASE}/gaps/${gapId}/source`,
     ),
   listPatches: () => jsonFetch<PatchRow[]>(`${BASE}/patches`),
-  /**
-   * Branch-health is advisory — the per-action 409 path is the real
-   * source of truth. Cap the request at 8 s so a slow/unreachable
-   * origin (ls-remote hang) can never stall the dashboard refresh loop.
-   * On timeout or any network error the caller falls back to "assume fresh".
-   */
-  patchBranchHealth: () => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    return jsonFetch<PatchBranchHealthMap>(`${BASE}/patches/branch-health`, {
-      signal: ctrl.signal,
-    }).finally(() => clearTimeout(timer));
-  },
   // ─── Skill run history ───────────────────────────────────────────────────
   listSkillRuns: (skillId: string) =>
     jsonFetch<SkillRunSummary[]>(`${BASE}/skills/${skillId}/runs`),
@@ -411,6 +272,11 @@ export const api = {
   clearChat: (patchId: number) =>
     jsonFetch<{ deleted: number }>(`${BASE}/patches/${patchId}/chat`, {
       method: "DELETE",
+    }),
+  testFeatureInDemo: (patchId: number, signal?: AbortSignal): Promise<Response> =>
+    fetch(`${BASE}/preview/test-feature/${patchId}`, {
+      method: "POST",
+      signal,
     }),
   // Legacy props endpoint (backward compat)
   generateProp: (spec: PropSpec) =>
@@ -439,16 +305,6 @@ export const api = {
     jsonFetch<{ deleted: boolean }>(`${BASE}/gap-prs/${prId}`, {
       method: "DELETE",
     }),
-  listPrStates: () => jsonFetch<PrStateMap>(`${BASE}/pr-states`),
-  setPrState: (prUrl: string, state: PrState | null) =>
-    jsonFetch<{ pr_url: string; state: PrState | null; updated_at: string | null }>(
-      `${BASE}/pr-state`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pr_url: prUrl, state }),
-      },
-    ),
   seedReset: () =>
     jsonFetch<{ message: string; gapsInserted: number; patchesRelinked: number; patchesOrphaned: number }>(
       `${BASE}/analysis/seed-reset`,
@@ -480,47 +336,6 @@ export const api = {
     jsonFetch<{ lines: string[]; total: number }>(
       `${BASE}/preview/${repoKey}/logs?since=${since}`,
     ),
-  // Mock merchant server (in-process, port 5252)
-  getMockServer: () => jsonFetch<MockServerState>(`${BASE}/preview/mock-server`),
-  startMockServer: () =>
-    jsonFetch<MockServerState>(`${BASE}/preview/mock-server/start`, { method: "POST" }),
-  stopMockServer: () =>
-    jsonFetch<MockServerState>(`${BASE}/preview/mock-server/stop`, { method: "POST" }),
-  setMockServerConfig: (paymentIntentBody: Record<string, unknown>) =>
-    jsonFetch<MockServerState>(`${BASE}/preview/mock-server/config`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ paymentIntentBody }),
-    }),
-  tailMockServerLogs: (since = 0) =>
-    jsonFetch<{ lines: string[]; total: number }>(
-      `${BASE}/preview/mock-server/logs?since=${since}`,
-    ),
-  getMockServerCredentials: () =>
-    jsonFetch<HyperswitchCredentials>(`${BASE}/preview/mock-server/credentials`),
-  setMockServerCredentials: (patch: Partial<HyperswitchCredentials>) =>
-    jsonFetch<HyperswitchCredentials>(`${BASE}/preview/mock-server/credentials`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    }),
-  // ─── Test-suite runs (Detox / Cypress) ─────────────────────────────────────
-  listTestRuns: (params: { repo?: "web" | "mobile"; branch?: string; limit?: number } = {}) => {
-    const q = new URLSearchParams();
-    if (params.repo) q.set("repo", params.repo);
-    if (params.branch) q.set("branch", params.branch);
-    if (params.limit) q.set("limit", String(params.limit));
-    const qs = q.toString();
-    return jsonFetch<TestRunSummary[]>(`${BASE}/skills/tests/runs${qs ? `?${qs}` : ""}`);
-  },
-  getTestRun: (id: number) =>
-    jsonFetch<TestRunFull>(`${BASE}/skills/tests/runs/${id}`),
-  resolvePrUrl: (prUrl: string) =>
-    jsonFetch<{ branch: string; prUrl: string }>(`${BASE}/skills/tests/resolve-pr`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prUrl }),
-    }),
   // ─── Feature Agent ─────────────────────────────────────────────────────────
   createFeatureSession: (description: string) =>
     jsonFetch<FeatureSession>(`${BASE}/feature/sessions`, {
@@ -547,15 +362,13 @@ export const api = {
   listDocs: () =>
     jsonFetch<DocSummary[]>(`${BASE}/docs`),
   getDoc: (id: number) =>
-    jsonFetch<DocFull>(`${BASE}/docs/${id}`),
+    jsonFetch<DocSummary>(`${BASE}/docs/${id}`),
   searchDocs: (q: string) =>
     jsonFetch<DocSummary[]>(`${BASE}/docs/search?q=${encodeURIComponent(q)}`),
   deleteDoc: (id: number) =>
     jsonFetch<{ deleted: boolean }>(`${BASE}/docs/${id}`, { method: "DELETE" }),
   regenerateDoc: (id: number) =>
-    jsonFetch<DocFull>(`${BASE}/docs/${id}/regenerate`, { method: "POST" }),
-  regenerateOfficialDoc: (id: number) =>
-    jsonFetch<DocFull>(`${BASE}/docs/${id}/regenerate-official`, { method: "POST" }),
+    jsonFetch<DocSummary>(`${BASE}/docs/${id}/regenerate`, { method: "POST" }),
   // ─── Achievements ──────────────────────────────────────────────────────────
   getAchievementsSummary: () =>
     jsonFetch<AchievementsSummary>(`${BASE}/achievements/summary`),
@@ -580,26 +393,6 @@ export interface PreviewState {
   startedAt: number;
   readyAt?: number;
   error?: string;
-}
-
-export interface MockServerState {
-  running: boolean;
-  port: number;
-  startedAt: number | null;
-  paymentIntentBody: Record<string, unknown>;
-}
-
-/**
- * Hyperswitch credentials used by the mock merchant server AND by Cypress.
- * Editable at runtime from the Preview → Credentials panel; the server
- * falls back to .env values when a field is empty.
- */
-export interface HyperswitchCredentials {
-  publishableKey: string;
-  secretKey: string;
-  profileId: string;
-  netceteraApiKey: string;
-  baseUrl: string;
 }
 
 export interface PropSpec {
@@ -643,26 +436,6 @@ export interface SkillRepoResult {
   error?: string;
 }
 
-export type TestRunStatus = "running" | "passed" | "failed" | "error";
-
-export interface TestRunSummary {
-  id: number;
-  repo: "web" | "mobile";
-  branch: string;
-  pr_url: string | null;
-  status: TestRunStatus;
-  started_at: string;
-  ended_at: string | null;
-  exit_code: number | null;
-  pass_count: number | null;
-  fail_count: number | null;
-  error_message: string | null;
-}
-
-export interface TestRunFull extends TestRunSummary {
-  logs_ndjson: string | null;
-}
-
 export interface TestWriterSpec {
   branch: string;
   repo: "web" | "mobile" | "both";
@@ -690,13 +463,6 @@ export interface GapPrRow {
   pr_url: string;
   added_at: string;
 }
-
-export interface PrStateEntry {
-  state: PrState;
-  updated_at: string;
-}
-
-export type PrStateMap = Record<string, PrStateEntry>;
 
 export interface ReviewHistoryRow {
   id: number;
@@ -746,12 +512,6 @@ export interface DocSummary {
   files_json: string;
   created_at: string;
   updated_at: string;
-}
-
-/** Full doc row returned by GET /docs/:id. Carries both markdown bodies. */
-export interface DocFull extends DocSummary {
-  content: string;
-  official_content: string | null;
 }
 
 // ─── Achievements types ──────────────────────────────────────────────────────

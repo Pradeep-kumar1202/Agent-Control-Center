@@ -35,7 +35,6 @@ export async function extractBackendApis(
   );
 
   const result = await askJson<{ endpoints: ExtractedFeature[] }>(prompt, {
-    slot: "analysis.extract",
     model: MODEL_EXTRACT,
     timeoutMs: 240_000,
   });
