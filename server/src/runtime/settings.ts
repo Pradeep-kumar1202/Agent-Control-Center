@@ -36,6 +36,18 @@ export interface AgentSettings {
 const EMPTY: AgentSettings = { profiles: {}, assignments: {} };
 const KEY = "agents";
 
+/**
+ * What every stage uses until someone saves a configuration: Claude Code on
+ * Opus 5.5, through the operator's own Claude login. A fresh install must work
+ * without opening Settings — an empty table used to make every skill fail with
+ * AGENTS_NOT_CONFIGURED.
+ */
+export const DEFAULT_MODEL = "claude-opus-5-5";
+export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
+  profiles: { opus: { runtime: "claude-code", invocation: DEFAULT_MODEL } },
+  assignments: { default: "opus" },
+};
+
 const RUNTIMES: RuntimeId[] = ["claude-code", "codex", "opencode"];
 
 export function isProfile(v: unknown): v is Profile {
@@ -61,8 +73,12 @@ export function setSetting(key: string, value: unknown): void {
 
 export function getAgentSettings(): AgentSettings {
   const s = getSetting<AgentSettings>(KEY, EMPTY);
+  const profiles = s.profiles && typeof s.profiles === "object" ? s.profiles : {};
+  if (Object.keys(profiles).length === 0) {
+    return { profiles: { ...DEFAULT_AGENT_SETTINGS.profiles }, assignments: { ...DEFAULT_AGENT_SETTINGS.assignments } };
+  }
   return {
-    profiles: s.profiles && typeof s.profiles === "object" ? s.profiles : {},
+    profiles,
     assignments: s.assignments && typeof s.assignments === "object" ? s.assignments : {},
   };
 }
@@ -106,7 +122,8 @@ export function setAgentSettings(next: AgentSettings): SettingsValidation {
  */
 export function seedFromEnvIfEmpty(): AgentSettings {
   const existing = getAgentSettings();
-  if (Object.keys(existing.profiles).length > 0) return existing;
+  const stored = getSetting<AgentSettings>(KEY, EMPTY);
+  if (Object.keys(stored.profiles ?? {}).length > 0) return existing;
 
   const profiles: Record<string, Profile> = {};
   const assignments: Record<string, string> = {};

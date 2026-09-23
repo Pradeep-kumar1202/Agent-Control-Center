@@ -81,5 +81,7 @@ export const REPOS: Record<
 };
 
 // LLM model selection — extraction is cheap, validation/patching is expensive.
-export const MODEL_EXTRACT = "sonnet";
-export const MODEL_REASON = "opus";
+// Legacy direct-call path (no slot assigned). Opus 5.5 everywhere by default;
+// per-stage choices belong in Settings (runtime/settings.ts).
+export const MODEL_EXTRACT = "claude-opus-5-5";
+export const MODEL_REASON = "claude-opus-5-5";

@@ -7,3 +7,6 @@ dist
 data
 *.log
 .DS_Store
+# Build/install state that is machine-specific
+*.tsbuildinfo
+.yarn/install-state.gz

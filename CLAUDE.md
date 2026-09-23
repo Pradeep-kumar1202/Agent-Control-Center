@@ -4,7 +4,7 @@ This file is auto-loaded by Claude Code when working in this directory. It exist
 
 ## What this project is
 
-A local-only web dashboard at `/Users/pradeep.kumar/Documents/Agent-Control-Center/` that compares two payment SDK repos — `hyperswitch-web` (ReScript web SDK) and `hyperswitch-client-core` (ReScript mobile SDK) — and surfaces feature gaps the user can turn into local patches.
+A local-only web dashboard (this repository; SDK clones live in `workspace/`) that compares two payment SDK repos — `hyperswitch-web` (ReScript web SDK) and `hyperswitch-client-core` (ReScript mobile SDK) — and surfaces feature gaps the user can turn into local patches.
 
 Stack:
 - Server: Node + Express + better-sqlite3 + TypeScript. **Requires Node 22** —
