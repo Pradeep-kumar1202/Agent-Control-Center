@@ -420,6 +420,11 @@ export function FeatureAgent() {
                                   View PR
                                 </a>
                               )}
+                              {r.prWarning && (
+                                <div style={{ color: "var(--amber)", marginTop: 4 }}>
+                                  {r.prWarning as string}
+                                </div>
+                              )}
                             </>
                         }
                       </div>

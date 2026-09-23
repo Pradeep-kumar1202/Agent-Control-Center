@@ -18,10 +18,10 @@ import { askStream, extractBalancedJson } from "../../llm.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
 import { commitWithSubmodules, getDiffWithSubmodules, resetSubmodules, forceCheckoutBranch } from "../submoduleGit.js";
 import { runRescriptBuild } from "../buildCheck.js";
-import { pushBranchToFork, createPullRequest, pushSubmoduleToFork, rewriteGitmodulesToForks } from "../githubPr.js";
+import { publishPullRequest } from "../githubPr.js";
 import { withRepoLock } from "../../workspace/mutex.js";
 import { generateDoc } from "../docs/generator.js";
-import simpleGit from "simple-git";
+import { localGit } from "../../workspace/git.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -133,7 +133,7 @@ async function runIntegrationPipeline(
     try {
       // Checkout main first
       await forceCheckoutBranch(repoDir, repoKey, "main");
-      const git = simpleGit(repoDir);
+      const git = localGit(repoDir);
       try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
       await git.checkoutLocalBranch(branchName);
 
@@ -309,21 +309,13 @@ Output JSON: {pass: boolean, issues: string[]}`;
       let prWarning: string | null = null;
 
       try {
-        for (const sub of submodulesChanged) {
-          await pushSubmoduleToFork({ parentDir: repoDir, subDir: sub, branchName });
-        }
-        if (submodulesChanged.length > 0) {
-          await rewriteGitmodulesToForks(repoDir, submodulesChanged);
-          const g = simpleGit(repoDir);
-          await g.add(".gitmodules");
-          await g.commit("chore: point submodules at bot forks for build");
-        }
-        await pushBranchToFork(repoDir, repoKey, branchName);
-        const pr = await createPullRequest({
+        const pr = await publishPullRequest({
+          repoDir,
           repoKey,
           branch: branchName,
           title: `feat: integrate ${docSpec?.paymentMethodName ?? description}`,
           body: `## Integration Agent\n\nIntegrated **${docSpec?.paymentMethodName ?? description}** from external documentation.\n\n${agentText.slice(0, 1000)}`,
+          submodulesChanged,
         });
         prUrl = pr.prUrl;
         prNumber = pr.prNumber;

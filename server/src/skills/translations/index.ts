@@ -16,7 +16,7 @@
 import type { Request, Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
-import simpleGit from "simple-git";
+import { localGit } from "../../workspace/git.js";
 import { REPOS } from "../../config.js";
 import { saveSkillRun } from "../../db.js";
 import { generateDoc } from "../docs/generator.js";
@@ -200,7 +200,7 @@ async function processRepo(
   translations: Record<string, string>,
 ): Promise<SkillRepoResult> {
   const repoDir = REPOS[repoKey].dir;
-  const git = simpleGit(repoDir);
+  const git = localGit(repoDir);
   const slug = spec.keyName.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 40);
   const branchName = `feat/translate-${slug}-${repoKey}`;
 

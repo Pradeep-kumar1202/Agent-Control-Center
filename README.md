@@ -10,9 +10,9 @@ Claude Code, Codex, or OpenCode. Each CLI uses its own existing authentication
 and provider configuration; the dashboard does not store model credentials.
 
 > The orchestration and workspace are local, but prompts are sent to the model
-> provider configured in the selected CLI. Workflows can also commit, push to
-> the configured bot forks, and open upstream pull requests when GitHub access
-> is configured.
+> provider configured in the selected CLI. Workflows can also commit, push a
+> generated branch directly to the canonical `juspay/*` repository, and open a
+> pull request there when GitHub access is configured.
 
 ## What it does
 
@@ -92,6 +92,7 @@ those routes finish migrating.
 | Git | Any recent version | `git --version` |
 | Agent CLI | At least one of Claude Code, Codex, or OpenCode | See below |
 | GitHub CLI | Optional; needed to open PRs automatically | `gh --version` |
+| gitleaks | Required for any automatic push/PR | `gitleaks version` |
 | Android SDK + emulator | Optional; needed for mobile Preview | `adb devices` |
 
 ### Use Node 22
@@ -170,7 +171,6 @@ workspace/hyperswitch-client-core
 ```
 
 Submodules are initialized from their upstream GitHub repositories over HTTPS.
-Bot forks are used only as push targets for generated changes.
 
 ### 3. Install dependencies in both SDK workspaces
 
@@ -240,7 +240,7 @@ can be inspected or repaired.
 ### Port an existing PR across SDKs
 
 Open **Agents → PR Port** and paste a recognized `/pull/<number>` URL from
-`hyperswitch-web`, `hyperswitch-client-core`, or their configured bot forks.
+`juspay/hyperswitch-web` or `juspay/hyperswitch-client-core`.
 
 The workflow:
 
@@ -256,6 +256,11 @@ The workflow:
 Build and validator failures preserve the target branch and report rather than
 deleting the work. The target workspace must be on a clean `main` checkout when
 the run starts.
+
+> Current limitation: PR Port does not yet have a dedicated target-equivalence
+> gate. If the behavior is already present and the implementer makes no edits,
+> the run stops with `Implementer produced no target changes` and opens no PR;
+> it does not currently classify that outcome as `already_present`.
 
 ### Preview a generated gap patch
 
@@ -273,29 +278,100 @@ the result. This is expected. Starting a patch-specific Preview should check the
 generated branch back out. If the panel shows or compiles `main`, close it and
 reopen Preview from the patch row, then confirm the displayed branch name.
 
+For mobile previews, the image inside the panel is the real Android AVD
+framebuffer, not a browser fallback. On macOS, Windows, or Linux with a desktop
+display, the dashboard also launches a visible Android Emulator window. Linux
+without `DISPLAY`/`WAYLAND_DISPLAY` remains headless. Override detection in the
+dashboard `.env` when needed:
+
+```bash
+PREVIEW_EMU_HEADLESS=false  # always show the emulator window
+PREVIEW_EMU_GPU=auto        # optional; defaults by launch mode
+```
+
+Launch mode is fixed when the AVD process starts. If an AVD is already running
+headless, stop that exact emulator and start Preview again; merely changing the
+environment cannot add a window to the existing process. The payment sheet can
+still look web-like because the Android SDK renders part of its UI through its
+embedded React Native/WebView surface.
+
 ## GitHub PR creation
 
-Automatic PR creation uses the `gh` CLI and the shared bot fork configuration.
-Authenticate only the approved bot account:
+Automatic publishing pushes the generated parent branch directly to the
+canonical repository and opens the PR there:
+
+```text
+juspay/hyperswitch-web
+juspay/hyperswitch-client-core
+```
+
+Authenticate an account with branch-push and pull-request permissions for those
+repositories:
 
 ```bash
 gh auth login
 gh auth status
 ```
 
-Defaults can be overridden in `.env`:
+Install the mandatory pre-push secret scanner:
 
 ```bash
-BOT_FORK_OWNER=pradeep120230-creator
-WEB_FORK_REPO=sdk-agent-hyperswitch-web
-MOBILE_FORK_REPO=sdk-agent-hyperswitch-client-core
-SHARED_CODE_FORK=sdk-agent-hyperswitch-sdk-utils
-ANDROID_FORK=sdk-agent-hyperswitch-sdk-android
-IOS_FORK=sdk-agent-hyperswitch-sdk-ios
+brew install gitleaks
+gitleaks version
 ```
 
-If pushing or `gh pr create` fails, the workflow returns a `prWarning`; the local
-branch and generated diff remain available.
+If `gitleaks` is missing, times out, or cannot scan the complete payload, the
+dashboard fails closed with `SECRET_SCAN_UNAVAILABLE` and performs no remote
+operation.
+
+Run `gh --version` and `gh auth status` in the same shell that starts
+`npm run dev`; the backend inherits that shell's `PATH` and authentication
+environment.
+
+Before pushing, the publisher verifies that the workspace's `origin` resolves
+to the expected `juspay/*` repository and that the generated branch has commits
+ahead of `origin/main`. It resolves the branch to an immutable commit, scans
+that commit, rechecks that the branch did not move, and pushes that exact object.
+Existing tool-owned branches are updated with `--force-with-lease`, never an
+unconditional force push.
+
+Every publish also crosses a mandatory secret gate before any remote read or
+write. It:
+
+- scans every commit in `origin/main..generated-commit`, including secrets added and
+  removed in a later commit;
+- rejects committed `.env*`, private-key, credential-store, scanner-policy, and
+  opaque archive files;
+- captures values from both SDK workspaces' `.env*` files at server startup and
+  again at publish time, then rejects raw, base64/base64url, hexadecimal, or URL-encoded
+  copies anywhere in committed blobs, commit metadata, branch names, PR titles,
+  or PR bodies;
+- blocks LFS pointers, opaque binaries/archives, oversized blobs, and merge
+  histories that cannot be completely inspected automatically;
+- runs gitleaks with a dashboard-owned configuration and ignore file, so a
+  generated branch cannot self-allowlist a finding;
+- redacts all values from errors and returns `SECRET_SCAN_BLOCKED` without
+  invoking the GitHub publishing transport.
+
+Agent subprocesses themselves do not receive `GH_TOKEN`, `GITHUB_TOKEN`, the
+SSH agent socket, Git credential helpers, or the authenticated `gh` config.
+Their Git environment rewrites GitHub URLs to a blocked local endpoint and sets
+the origin push URL to a non-network scheme. Model-provider credentials remain
+available only where required for the selected runtime. Consequently, an agent
+cannot bypass the scanner by running the normal `git push` or `gh pr create`
+commands; only the server-side publisher retains that authority.
+Runtime profiles that use a GitHub-backed model must therefore authenticate via
+that CLI's own login/configuration; a `GITHUB_TOKEN` environment variable is
+intentionally not passed into model subprocesses.
+
+Parent PR automation currently rejects changes inside `shared-code`, `android`,
+or `ios`. Those changes require separate PRs to the corresponding canonical
+submodule repositories and merge ordering before the parent PR. The dashboard
+preserves the local branch and returns `SUBMODULE_PRS_REQUIRED` instead of
+rewriting `.gitmodules` or publishing a broken parent PR.
+
+If pushing or `gh pr create` fails, the workflow returns a `prWarning`; the
+local branch and generated diff remain available.
 
 ## Optional headless profile seeding
 
@@ -434,9 +510,10 @@ configuration. It does not edit the tracked `.gitmodules` files.
 
 ### PR creation failed or `gh` is missing
 
-Install the [GitHub CLI](https://cli.github.com/), authenticate the approved bot
-account, and retry the push/PR step manually if needed. The dashboard preserves
-the local branch and reports the failure as `prWarning`.
+Install the [GitHub CLI](https://cli.github.com/), authenticate an account with
+write access to the canonical `juspay/*` repository, and retry the push/PR step
+manually if needed. The dashboard preserves the local branch and reports the
+failure as `prWarning`.
 
 ## Local data and credentials
 
@@ -452,3 +529,6 @@ The following paths are intentionally excluded from Git:
 The dashboard stores runtime/model **names**, not provider secrets. Claude Code,
 Codex, OpenCode, and `gh` keep their own authentication outside this repository.
 Browser-local agent settings contain only profile and assignment metadata.
+Workspace `.env*` files may contain real SDK keys; the publisher fingerprints
+their values only in server memory for leak detection and never logs or persists
+those values.

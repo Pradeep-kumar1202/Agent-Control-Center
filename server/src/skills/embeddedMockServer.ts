@@ -30,6 +30,36 @@ const LOG_CAP = 500;
 
 type Json = Record<string, unknown>;
 
+function requiredPaymentField(data: Json, key: string): string {
+  const value = data[key];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Hyperswitch /payments response is missing required field ${key}`);
+  }
+  return value;
+}
+
+/**
+ * Translate the Hyperswitch `/payments` response into the stable contract
+ * consumed by the SDK demo applications.
+ *
+ * Kept as a named seam because this contract spans two repositories: changing
+ * it here without changing the Android/iOS clients produces a successful HTTP
+ * request followed by a misleading client-side "Could not connect" error.
+ */
+export function buildPaymentIntentClientResponse(
+  data: Json,
+  publishableKey: string,
+  profileId: string,
+): Json {
+  return {
+    publishableKey,
+    sdkAuthorization: requiredPaymentField(data, "sdk_authorization"),
+    clientSecret: requiredPaymentField(data, "client_secret"),
+    paymentId: requiredPaymentField(data, "payment_id"),
+    profileId: profileId || null,
+  };
+}
+
 export interface Credentials {
   publishableKey: string;
   secretKey: string;
@@ -224,11 +254,7 @@ function buildApp(): express.Express {
         return;
       }
       pushLog(`[create-payment-intent] ok — payment_id=${String(data.payment_id ?? "?")}`);
-      res.json({
-        publishableKey: publishable,
-        clientSecret: data.client_secret,
-        profileId: profileId || null,
-      });
+      res.json(buildPaymentIntentClientResponse(data, publishable, profileId));
     } catch (err) {
       pushLog(`[create-payment-intent] error: ${(err as Error).message}`);
       res.status(500).json({

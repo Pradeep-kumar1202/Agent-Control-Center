@@ -102,13 +102,20 @@ export function PrPortForm({ onResult, onError }: SkillFormProps) {
         } else if (chunk.type === "tool_use") {
           const tool = chunk.tool as { name?: string } | undefined;
           if (tool?.name) setToolChips((prev) => [...prev.slice(-19), tool.name!]);
+        } else if (chunk.type === "triage_repair") {
+          setTriageNote("Triage response was inconsistent — correcting it once…");
         } else if (chunk.type === "triage_result") {
           const triage = chunk.triage as { portability?: string; reasons?: string[] };
+          const repaired = chunk.repaired === true;
           setTriageNote(
             triage.portability === "yes"
-              ? "Triage: portable"
-              : `Triage: ${triage.portability ?? "unknown"}${triage.reasons?.[0] ? ` — ${triage.reasons[0]}` : ""}`,
+              ? `Triage: portable${repaired ? " (corrected once)" : ""}`
+              : `Triage: ${triage.portability ?? "unknown"}${repaired ? " (corrected once)" : ""}${triage.reasons?.[0] ? ` — ${triage.reasons[0]}` : ""}`,
           );
+        } else if (chunk.type === "spec_repair") {
+          setGateNote("Source specification contained an invalid path — correcting it once…");
+        } else if (chunk.type === "spec_result" && chunk.repaired === true) {
+          setGateNote("Source specification corrected once");
         } else if (chunk.type === "build_result") {
           setGateNote(chunk.passed ? "Build passed" : "Build failed — preserving the branch");
         } else if (chunk.type === "validators") {

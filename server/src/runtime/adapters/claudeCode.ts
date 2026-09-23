@@ -25,6 +25,7 @@ import {
   type ResolvedAgentRequest, type RuntimeStatus, type Usage,
 } from "../types.js";
 import { classifyExit, streamProcess } from "../proc.js";
+import { runtimeCliEnv } from "../agentEnv.js";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -201,7 +202,10 @@ export const claudeCodeRuntime: AgentRuntime = {
 
   async probe(): Promise<RuntimeStatus> {
     try {
-      const { stdout } = await execFileAsync(BIN, ["--version"], { timeout: 5000 });
+      const { stdout } = await execFileAsync(BIN, ["--version"], {
+        timeout: 5000,
+        env: runtimeCliEnv(),
+      });
       return {
         id: "claude-code",
         installed: true,

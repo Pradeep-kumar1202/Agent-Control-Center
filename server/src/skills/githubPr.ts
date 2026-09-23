@@ -1,69 +1,44 @@
 /**
- * GitHub PR creation — push the feature branch to a fork and open a pull
- * request against the upstream juspay repo.
+ * Canonical GitHub publishing.
  *
- * Authentication piggybacks on `gh auth login` (HTTPS). The gh CLI installs
- * itself as a git credential helper, so `git push` to the fork URL just works
- * without us touching tokens. PR creation goes through `gh pr create` for the
- * same reason.
+ * Every caller supplies one finished parent-repository branch. This module
+ * owns all externally-visible publishing behavior: verify the branch is safe,
+ * verify `origin` is the expected juspay repository, push with a lease, and
+ * create (or reuse) the PR in that same canonical repository.
  *
- * NOTE on submodules: both hyperswitch repos use submodules. A PR against the
- * parent fork only carries the parent commit (which is a submodule pointer
- * bump). If the agent edited inside a submodule, those changes will not be
- * visible in the upstream PR unless the submodule commit is also pushed to a
- * reachable repo. We detect that case in the caller and skip PR creation with
- * a clear warning instead of opening a half-broken PR.
+ * Authentication stays outside the dashboard. Git uses the user's configured
+ * credential helper and PR creation shells out to the already-authenticated
+ * `gh` CLI. No token is read or persisted here.
+ *
+ * Before the transport can perform any remote operation, a fail-closed secret
+ * gate scans full branch history and PR metadata, including exact values from
+ * workspace `.env*` files. An unavailable scanner is a publishing failure.
+ *
+ * Submodule changes deliberately fail before any network mutation. Publishing
+ * those correctly requires separate branches and PRs against sdk-utils,
+ * sdk-android, or sdk-ios followed by an ordered parent PR. Pointing
+ * `.gitmodules` at a fork would make a canonical PR non-mergeable, so this
+ * module refuses that former shortcut.
  */
 
 import { spawn } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
-import simpleGit from "simple-git";
+import { publishGit } from "../workspace/git.js";
 import type { RepoKey } from "../config.js";
-
-export interface ForkConfig {
-  /** GitHub username that owns the forks. */
-  owner: string;
-  /** Fork repo name for hyperswitch-web. */
-  webRepo: string;
-  /** Fork repo name for hyperswitch-client-core. */
-  mobileRepo: string;
-}
-
-export const FORK_CONFIG: ForkConfig = {
-  owner: process.env.BOT_FORK_OWNER ?? "pradeep120230-creator",
-  webRepo: process.env.WEB_FORK_REPO ?? "sdk-agent-hyperswitch-web",
-  mobileRepo: process.env.MOBILE_FORK_REPO ?? "sdk-agent-hyperswitch-client-core",
-};
-
-/**
- * Submodule-directory → bot fork repo name. Both hyperswitch repos use the
- * same `shared-code` dir name pointing at the same upstream, so a single
- * mapping covers both parents. android/ios only exist under mobile.
- */
-export const SUBMODULE_FORKS: Record<string, string> = {
-  "shared-code": process.env.SHARED_CODE_FORK ?? "sdk-agent-hyperswitch-sdk-utils",
-  "android": process.env.ANDROID_FORK ?? "sdk-agent-hyperswitch-sdk-android",
-  "ios": process.env.IOS_FORK ?? "sdk-agent-hyperswitch-sdk-ios",
-};
+import { runtimeCliEnv } from "../runtime/agentEnv.js";
+import { assertPublishPayloadContainsNoSecrets } from "./secretScan.js";
 
 const UPSTREAM: Record<RepoKey, { owner: string; repo: string }> = {
   web: { owner: "juspay", repo: "hyperswitch-web" },
   mobile: { owner: "juspay", repo: "hyperswitch-client-core" },
 };
 
-export function forkSlug(repoKey: RepoKey): string {
-  const repo = repoKey === "web" ? FORK_CONFIG.webRepo : FORK_CONFIG.mobileRepo;
-  return `${FORK_CONFIG.owner}/${repo}`;
-}
-
 export function upstreamSlug(repoKey: RepoKey): string {
   const u = UPSTREAM[repoKey];
   return `${u.owner}/${u.repo}`;
 }
 
-function forkRemoteUrl(repoKey: RepoKey): string {
-  return `https://github.com/${forkSlug(repoKey)}.git`;
+function upstreamRemoteUrl(repoKey: RepoKey): string {
+  return `https://github.com/${upstreamSlug(repoKey)}.git`;
 }
 
 /** Run a command, return stdout. Throws with stderr on non-zero exit. */
@@ -76,7 +51,7 @@ function run(
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env: runtimeCliEnv(),
     });
     let stdout = "";
     let stderr = "";
@@ -100,176 +75,242 @@ function run(
   });
 }
 
-/**
- * Force-push the current feature branch to the bot's fork. Adds a `bot`
- * remote on first use and updates its URL otherwise.
- */
-export async function pushBranchToFork(
-  repoDir: string,
-  repoKey: RepoKey,
-  branch: string,
-): Promise<{ remoteUrl: string }> {
-  const git = simpleGit(repoDir);
-  const remoteUrl = forkRemoteUrl(repoKey);
+export class SubmodulePublishingRequiredError extends Error {
+  readonly code = "SUBMODULE_PRS_REQUIRED" as const;
 
-  const remotes = await git.getRemotes(true);
-  const existing = remotes.find((r) => r.name === "bot");
-  if (existing) {
-    if (existing.refs.push !== remoteUrl) {
-      await git.raw(["remote", "set-url", "bot", remoteUrl]);
-    }
-  } else {
-    await git.addRemote("bot", remoteUrl);
-  }
-
-  // Force-push: the agent re-runs may rewrite the same branch name.
-  await git.push(["--force", "bot", branch]);
-  return { remoteUrl };
-}
-
-/**
- * Push a single submodule's HEAD to its corresponding bot fork as the same
- * feature branch name. The submodule was already committed by
- * commitWithSubmodules — at this point HEAD inside the submodule points at
- * the new commit. We push that SHA to the fork via a refspec so we don't
- * have to create a real branch in the submodule's detached state.
- *
- * Returns the fork URL we pushed to (used to rewrite .gitmodules).
- */
-export async function pushSubmoduleToFork(args: {
-  parentDir: string;
-  subDir: string; // e.g. "shared-code"
-  branchName: string;
-}): Promise<{ forkUrl: string; sha: string }> {
-  const forkRepoName = SUBMODULE_FORKS[args.subDir];
-  if (!forkRepoName) {
-    throw new Error(`no fork mapping for submodule "${args.subDir}"`);
-  }
-  const forkUrl = `https://github.com/${FORK_CONFIG.owner}/${forkRepoName}.git`;
-  const subPath = path.join(args.parentDir, args.subDir);
-  const subGit = simpleGit(subPath);
-
-  const remotes = await subGit.getRemotes(true);
-  const existing = remotes.find((r) => r.name === "bot");
-  if (existing) {
-    if (existing.refs.push !== forkUrl) {
-      await subGit.raw(["remote", "set-url", "bot", forkUrl]);
-    }
-  } else {
-    await subGit.addRemote("bot", forkUrl);
-  }
-
-  // Push HEAD into a real branch on the fork. Submodules are typically in
-  // detached HEAD after `git submodule update`, so a refspec is the cleanest
-  // way to give that commit a name on the remote.
-  await subGit.push(["--force", "bot", `HEAD:refs/heads/${args.branchName}`]);
-
-  const sha = (await subGit.revparse(["HEAD"])).trim();
-  return { forkUrl, sha };
-}
-
-/**
- * Rewrite `.gitmodules` in the parent working tree to point at bot forks for
- * the submodules listed. Only edits URLs we have a fork mapping for; leaves
- * everything else alone.
- *
- * This is what makes `git submodule update --init --recursive` work for
- * anyone who checks out the feature branch from the parent fork — without
- * the rewrite, git would chase the original juspay URL which doesn't have
- * the new submodule SHA.
- *
- * Returns the list of submodule dirs that were actually rewritten.
- */
-export function rewriteGitmodulesToForks(
-  parentDir: string,
-  submoduleDirs: string[],
-): string[] {
-  const gitmodulesPath = path.join(parentDir, ".gitmodules");
-  if (!fs.existsSync(gitmodulesPath)) return [];
-
-  let content = fs.readFileSync(gitmodulesPath, "utf8");
-  const rewritten: string[] = [];
-
-  for (const subDir of submoduleDirs) {
-    const forkRepoName = SUBMODULE_FORKS[subDir];
-    if (!forkRepoName) continue;
-    const forkUrl = `https://github.com/${FORK_CONFIG.owner}/${forkRepoName}.git`;
-
-    // Match the submodule section and rewrite its `url = ...` line.
-    // Section header looks like:  [submodule "shared-code"]
-    const sectionRegex = new RegExp(
-      `(\\[submodule\\s+"${escapeRegex(subDir)}"\\][^\\[]*?\\burl\\s*=\\s*)([^\\n]+)`,
-      "m",
+  constructor(readonly submodules: string[]) {
+    super(
+      `Automatic PR creation to the canonical parent repository is blocked because this change modifies ` +
+      `${submodules.join(", ")}. Publish separate PRs to the corresponding juspay submodule repositories first; ` +
+      `the local parent branch has been preserved.`,
     );
-    if (sectionRegex.test(content)) {
-      content = content.replace(sectionRegex, `$1${forkUrl}`);
-      rewritten.push(subDir);
-    }
+    this.name = "SubmodulePublishingRequiredError";
   }
-
-  if (rewritten.length > 0) {
-    fs.writeFileSync(gitmodulesPath, content);
-  }
-  return rewritten;
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * Open a pull request **inside the bot's own fork** — i.e. the head is the
- * feature branch, the base is the fork's own `main`. We deliberately do
- * NOT target juspay:main because:
- *
- *   1. The bot doesn't have merge permission on juspay/* — any PR there
- *      would sit open waiting for upstream maintainers.
- *   2. Testing our dashboard end-to-end needs a PR the user can merge
- *      themselves, exercising the full "build → PR → review → merge"
- *      story without cross-org approval.
- *
- * `gh pr create` inside a single repo doesn't need the `owner:branch`
- * prefix for `--head` — we pass just the branch name. The base is `main`
- * of the same fork.
- */
-export async function createPullRequest(args: {
+export interface PublishPullRequestArgs {
+  repoDir: string;
   repoKey: RepoKey;
   branch: string;
   title: string;
   body: string;
-  /** Open as a draft when semantic verification still needs a human. */
   draft?: boolean;
-}): Promise<{ prUrl: string; prNumber: number }> {
-  const fork = forkSlug(args.repoKey);
+  submodulesChanged?: string[];
+}
 
-  // gh pr create prints the PR URL to stdout on success.
-  const createArgs = [
-    "pr",
-    "create",
-    "--repo",
-    fork,
-    "--head",
-    args.branch,
-    "--base",
-    "main",
-    "--title",
-    args.title,
-    "--body",
-    args.body,
-  ];
-  if (args.draft) createArgs.push("--draft");
+interface PushRequest {
+  repoDir: string;
+  repoSlug: string;
+  remoteUrl: string;
+  branch: string;
+  /** Immutable object that passed the secret gate. Never replace with branch. */
+  targetCommit: string;
+  baseCommit: string;
+}
 
-  const url = await run(
-    "gh",
-    createArgs,
-    { timeoutMs: 60_000 },
-  );
+interface CreateRequest {
+  repoSlug: string;
+  branch: string;
+  title: string;
+  body: string;
+  draft: boolean;
+}
 
-  const match = url.match(/\/pull\/(\d+)/);
-  if (!match) {
-    throw new Error(`gh pr create returned unexpected output: ${url}`);
+/** Internal true-external seam: production uses Git/gh; checks inject a fake. */
+export interface GitHubPublishTransport {
+  pushBranch(request: PushRequest): Promise<void>;
+  createOrFindPullRequest(request: CreateRequest): Promise<string>;
+}
+
+function slugFromRemoteUrl(value: string): string | null {
+  const trimmed = value.trim().replace(/\.git$/i, "");
+  const scp = trimmed.match(/^git@github\.com:([^/]+\/[^/]+)$/i);
+  if (scp) return scp[1].toLowerCase();
+  try {
+    const url = new URL(trimmed);
+    if (url.hostname.toLowerCase() !== "github.com") return null;
+    const parts = url.pathname.split("/").filter(Boolean);
+    return parts.length === 2 ? `${parts[0]}/${parts[1]}`.toLowerCase() : null;
+  } catch {
+    return null;
   }
-  return { prUrl: url, prNumber: Number(match[1]) };
+}
+
+const liveTransport: GitHubPublishTransport = {
+  async pushBranch(request): Promise<void> {
+    const git = publishGit(request.repoDir);
+    const current = (await git.revparse(["--abbrev-ref", "HEAD"])).trim();
+    if (current !== request.branch) {
+      throw new Error("Refusing to push: the scanned generated branch is not currently checked out");
+    }
+
+    const currentCommit = (await git.revparse(["--verify", `${request.branch}^{commit}`])).trim();
+    if (currentCommit !== request.targetCommit) {
+      throw new Error(
+        "Refusing to push: the generated branch changed after its secret scan; run publishing again",
+      );
+    }
+
+    const ahead = Number((await git.raw([
+      "rev-list", "--count", `${request.baseCommit}..${request.targetCommit}`,
+    ])).trim());
+    if (!Number.isFinite(ahead) || ahead < 1) {
+      throw new Error("Refusing to push: the scanned commit has no commits ahead of origin/main");
+    }
+
+    const originUrl = (await git.raw(["remote", "get-url", "--push", "origin"])).trim();
+    if (slugFromRemoteUrl(originUrl) !== request.repoSlug.toLowerCase()) {
+      throw new Error(
+        `Refusing to push: origin is not the canonical repository ${request.repoSlug}`,
+      );
+    }
+
+    // Refresh the remote-tracking branch immediately before force-with-lease.
+    // If the branch does not exist, ls-remote is empty and the lease correctly
+    // expects a new branch. Never use an unconditional force against juspay/*.
+    const remoteRef = `refs/heads/${request.branch}`;
+    const remoteHead = await git.raw(["ls-remote", "--heads", "origin", remoteRef]);
+    const expectedRemoteSha = remoteHead.trim().split(/\s+/, 1)[0] ?? "";
+    if (expectedRemoteSha) {
+      await git.raw([
+        "fetch", "--no-tags", "--no-recurse-submodules", "origin",
+        `${remoteRef}:refs/remotes/origin/${request.branch}`,
+      ]);
+    }
+    // Pin the lease to the SHA observed above. An empty expected SHA means the
+    // branch must still not exist, so a concurrent creator is protected too.
+    await git.raw([
+      "push",
+      `--force-with-lease=${remoteRef}:${expectedRemoteSha}`,
+      "origin",
+      `${request.targetCommit}:${remoteRef}`,
+    ]);
+  },
+
+  async createOrFindPullRequest(request): Promise<string> {
+    const existingRaw = await run("gh", [
+      "pr", "list",
+      "--repo", request.repoSlug,
+      "--head", request.branch,
+      "--state", "open",
+      "--limit", "1",
+      "--json", "url,number",
+    ], { timeoutMs: 30_000 });
+    try {
+      const existing = JSON.parse(existingRaw) as Array<{ url?: unknown; number?: unknown }>;
+      if (typeof existing[0]?.url === "string" && Number.isFinite(existing[0]?.number)) {
+        return existing[0].url;
+      }
+    } catch { /* let gh create the PR */ }
+
+    const createArgs = [
+      "pr", "create",
+      "--repo", request.repoSlug,
+      "--head", request.branch,
+      "--base", "main",
+      "--title", request.title,
+      "--body", request.body,
+    ];
+    if (request.draft) createArgs.push("--draft");
+    return run("gh", createArgs, { timeoutMs: 60_000 });
+  },
+};
+
+interface PublishSnapshot {
+  /** Local remote-tracking main, so local-only commits on main are scanned too. */
+  baseCommit: string;
+  /** Immutable branch tip that both scanners approve and the transport pushes. */
+  targetCommit: string;
+}
+
+async function resolvePublishSnapshot(repoDir: string, branch: string): Promise<PublishSnapshot> {
+  const git = publishGit(repoDir);
+  let current: string;
+  let baseCommit: string;
+  let targetCommit: string;
+  try {
+    [current, baseCommit, targetCommit] = await Promise.all([
+      git.revparse(["--abbrev-ref", "HEAD"]),
+      git.revparse(["--verify", "refs/remotes/origin/main^{commit}"]),
+      git.revparse(["--verify", `${branch}^{commit}`]),
+    ]);
+  } catch {
+    throw new Error(
+      `Refusing to publish: could not resolve the generated branch and origin/main. ` +
+      `Synchronize the workspace before publishing.`,
+    );
+  }
+  current = current.trim();
+  baseCommit = baseCommit.trim();
+  targetCommit = targetCommit.trim();
+  if (current !== branch) {
+    throw new Error("Refusing to publish: the requested generated branch is not currently checked out");
+  }
+  const ahead = Number((await git.raw([
+    "rev-list", "--count", `${baseCommit}..${targetCommit}`,
+  ])).trim());
+  if (!Number.isFinite(ahead) || ahead < 1) {
+    throw new Error("Refusing to publish: the generated branch has no commits ahead of origin/main");
+  }
+  return { baseCommit, targetCommit };
+}
+
+/**
+ * Publish one parent-only branch to the canonical juspay repository.
+ *
+ * The interface intentionally exposes no remote names, fork owners, push
+ * ordering, secret-scan policy, or gh arguments. Callers either receive a
+ * canonical PR or one actionable failure, and tests exercise the same
+ * interface with a fake transport.
+ */
+export async function publishPullRequest(
+  args: PublishPullRequestArgs,
+  transport: GitHubPublishTransport = liveTransport,
+): Promise<{ prUrl: string; prNumber: number; remoteUrl: string }> {
+  const submodules = [...new Set(args.submodulesChanged ?? [])];
+  if (submodules.length > 0) throw new SubmodulePublishingRequiredError(submodules);
+  if (!args.branch.trim() || args.branch === "main" || args.branch === "master") {
+    throw new Error("Refusing to publish a protected or empty branch");
+  }
+
+  // Resolve once, scan immutable object IDs, and push that exact object. This
+  // closes the scan/push race where another job could advance the branch name
+  // after scanning but before transport.
+  const snapshot = await resolvePublishSnapshot(args.repoDir, args.branch);
+
+  // This is deliberately outside the transport: every production publishing
+  // path crosses the same mandatory local gate before any remote read or write.
+  await assertPublishPayloadContainsNoSecrets({
+    repoDir: args.repoDir,
+    baseCommit: snapshot.baseCommit,
+    targetCommit: snapshot.targetCommit,
+    branch: args.branch,
+    title: args.title,
+    body: args.body,
+  });
+
+  const repoSlug = upstreamSlug(args.repoKey);
+  const remoteUrl = upstreamRemoteUrl(args.repoKey);
+  await transport.pushBranch({
+    repoDir: args.repoDir,
+    repoSlug,
+    remoteUrl,
+    branch: args.branch,
+    baseCommit: snapshot.baseCommit,
+    targetCommit: snapshot.targetCommit,
+  });
+  const url = await transport.createOrFindPullRequest({
+    repoSlug,
+    branch: args.branch,
+    title: args.title,
+    body: args.body,
+    draft: args.draft === true,
+  });
+  const match = url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)\/?$/i);
+  if (!match || match[1].toLowerCase() !== repoSlug.toLowerCase()) {
+    throw new Error(`GitHub returned an unexpected canonical PR URL: ${url}`);
+  }
+  return { prUrl: url, prNumber: Number(match[2]), remoteUrl };
 }
 
 export interface PortPrBodyArgs {
@@ -277,7 +318,13 @@ export interface PortPrBodyArgs {
   sourceRepo: string;
   targetRepo: string;
   featureName: string;
-  portability: "yes" | "partial";
+  /**
+   * `no` is reachable: triage may advise against porting while the analyst,
+   * which reads both repositories, finds real behavior to port. The disagreement
+   * is surfaced in the body rather than hidden, because it is precisely what a
+   * reviewer should scrutinise.
+   */
+  portability: "yes" | "partial" | "no";
   portabilityReasons: string[];
   summaryJson: string;
   filesTouched: number;
@@ -286,7 +333,6 @@ export interface PortPrBodyArgs {
   verdict: "pass" | "needs_review";
   findings: Array<{ level: string; rule?: string; message: string; file?: string }>;
   verifierIssues: string[];
-  submodulePushes?: string[];
 }
 
 /** Build the reviewer-facing report for a cross-SDK port. */
@@ -313,10 +359,6 @@ export function formatPortPrBody(args: PortPrBodyArgs): string {
   const build = args.buildLog
     ? `<details><summary>ReScript build log (tail)</summary>\n\n\`\`\`\n${args.buildLog.split("\n").slice(-30).join("\n")}\n\`\`\`\n\n</details>`
     : "ReScript build passed.";
-  const submodules = args.submodulePushes?.length
-    ? `\n## Submodules\n\n${args.submodulePushes.map((s) => `- \`${s}\``).join("\n")}\n`
-    : "";
-
   return [
     "## Summary",
     "",
@@ -327,7 +369,9 @@ export function formatPortPrBody(args: PortPrBodyArgs): string {
     `Ported from [${args.sourceRepo} PR](${args.sourcePrUrl}) into \`${args.targetRepo}\`.`,
     `${args.filesTouched} target file(s) changed.`,
     "",
-    `## Portability: ${args.portability}`,
+    args.portability === "no"
+      ? "## Portability: triage advised against porting — review carefully"
+      : `## Portability: ${args.portability}`,
     "",
     portability,
     "",
@@ -346,81 +390,9 @@ export function formatPortPrBody(args: PortPrBodyArgs): string {
     "## Build",
     "",
     build,
-    submodules,
     "---",
     "*Generated by Agent Control Center. Platform-specific behavior still requires reviewer validation.*",
   ].join("\n");
-}
-
-/**
- * Open a PR on a submodule's own bot fork.
- *
- * The native reviewers for android/ios/shared-code typically live in that
- * repo's own PR workflow, so we mirror the parent-fork PR flow: head is the
- * feature branch we just pushed, base is the fork's own main. Same rationale
- * as createPullRequest — the bot owns the fork, so merge permissions are
- * trivially satisfied.
- *
- * Returns null (not throws) on failure so a single submodule PR failure
- * doesn't block the parent PR — the parent body links whatever did succeed.
- */
-export async function createSubmodulePullRequest(args: {
-  subDir: string; // e.g. "shared-code" | "android" | "ios"
-  branch: string;
-  title: string;
-  body: string;
-}): Promise<{ prUrl: string; prNumber: number; subDir: string } | null> {
-  const forkRepoName = SUBMODULE_FORKS[args.subDir];
-  if (!forkRepoName) return null;
-  const fork = `${FORK_CONFIG.owner}/${forkRepoName}`;
-
-  try {
-    const url = await run(
-      "gh",
-      [
-        "pr",
-        "create",
-        "--repo",
-        fork,
-        "--head",
-        args.branch,
-        "--base",
-        "main",
-        "--title",
-        args.title,
-        "--body",
-        args.body,
-      ],
-      { timeoutMs: 60_000 },
-    );
-    const match = url.match(/\/pull\/(\d+)/);
-    if (!match) return null;
-    return { prUrl: url, prNumber: Number(match[1]), subDir: args.subDir };
-  } catch (err) {
-    console.error(`[createSubmodulePullRequest] ${args.subDir}:`, (err as Error).message);
-    return null;
-  }
-}
-
-/**
- * Return the number of commits on `branch` that are ahead of the bot fork's
- * `main`. Used as a post-commit sanity check: if we're about to push a
- * branch that has zero new commits, something earlier failed silently —
- * abort loudly instead of opening an empty PR.
- */
-export async function commitsAheadOfForkMain(
-  repoDir: string,
-  branch: string,
-): Promise<number> {
-  const git = simpleGit(repoDir);
-  try {
-    // Use main@origin if local main is ahead; otherwise plain main.
-    const out = await git.raw(["rev-list", "--count", `main..${branch}`]);
-    const n = Number(out.trim());
-    return Number.isFinite(n) ? n : 0;
-  } catch {
-    return 0;
-  }
 }
 
 /** Build a PR markdown body from agent summary + build log + branch info. */
@@ -432,7 +404,6 @@ export function formatPrBody(args: {
   summaryJson: string;
   filesTouched: number;
   buildLog: string | null;
-  submodulePushes?: string[];
 }): string {
   // Try to surface the agent's "what" line if the summary parses cleanly.
   let what = "";
@@ -449,11 +420,6 @@ export function formatPrBody(args: {
     ? `\n## Build\n\nReScript build passed.\n\n<details><summary>build log (tail)</summary>\n\n\`\`\`\n${args.buildLog.split("\n").slice(-30).join("\n")}\n\`\`\`\n\n</details>\n`
     : "";
 
-  const submoduleSection =
-    args.submodulePushes && args.submodulePushes.length > 0
-      ? `\n## Submodules\n\nThis branch touches submodules and rewrites \`.gitmodules\` to point at bot forks so it is **checkout-buildable**. The submodule pointer SHAs live in:\n\n${args.submodulePushes.map((s) => `- \`${s}\``).join("\n")}\n\n> ⚠️ Because \`.gitmodules\` was rewritten, this PR is not directly mergeable into upstream as-is. To land it upstream, the submodule changes need their own PRs against the submodule upstream first, then this PR with .gitmodules reverted. Use this branch for build/preview validation.\n`
-      : "";
-
   return [
     `## Summary`,
     ``,
@@ -468,7 +434,6 @@ export function formatPrBody(args: {
     `feature-gap-dashboard, gap #${args.gapId} (category: \`${args.category}\`).`,
     `${args.filesTouched} file(s) touched.`,
     notes ? `\n## Notes\n\n${notes}\n` : "",
-    submoduleSection,
     buildSection,
     `---`,
     `*Automated PR. Reviewer: please verify the implementation matches the existing patterns in this repo and run any platform-specific tests.*`,

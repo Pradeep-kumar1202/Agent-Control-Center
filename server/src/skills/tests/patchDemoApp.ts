@@ -20,7 +20,7 @@
  *
  * Both steps are idempotent. `forceCheckoutBranch()` resets the working tree
  * back to a clean state every run, so the patch is re-applied fresh each
- * time and we never accidentally commit these changes to the fork.
+ * time and we never accidentally include these changes in a generated PR.
  */
 
 import fs from "node:fs";

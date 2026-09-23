@@ -1,0 +1,15 @@
+title = "Agent Control Center pre-push secret policy"
+
+# Extend gitleaks' maintained default rules. Passing this file explicitly keeps
+# a generated SDK branch from weakening the scanner with its own config.
+[extend]
+useDefault = true
+
+# Keep the gate conservative for GitHub credentials. The dashboard can push to
+# canonical organization repositories, so even a nonstandard/legacy gh token
+# prefix is sufficient reason to stop and ask for manual review.
+[[rules]]
+id = "acc-github-token"
+description = "GitHub access token"
+regex = '''\b(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255})\b'''
+keywords = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]

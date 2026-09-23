@@ -9,6 +9,19 @@ A local-only web dashboard at `/Users/pradeep.kumar/Documents/Agent-Control-Cent
 Stack:
 - Server: Node + Express + better-sqlite3 + TypeScript. **Requires Node 22** —
   `better-sqlite3@11` has no prebuild for Node 26 and its source build fails.
+  Pinned in `.nvmrc` + `engines`, and enforced by `scripts/preflight.mjs`, which
+  `npm run dev` runs first. Run `nvm use 22` before starting; on the wrong Node
+  the failure otherwise looks like a dashboard outage rather than a setup error.
+- **All server-side git goes through `server/src/workspace/git.ts`.** Never call
+  `simpleGit()` directly. `localGit()` disables hooks and refuses prompts, so a
+  repo-supplied interactive hook cannot deadlock a run — `hyperswitch-client-core`
+  ships a `prepare-commit-msg` that execs commitizen against `/dev/tty`, and
+  `--no-verify` does *not* cover that hook. `publishGit()` deliberately leaves
+  hooks enabled so this machine's global `core.hooksPath=/etc/git-guardian/hooks`
+  **pre-push** secret scanner still runs; pushes must never use `localGit()`.
+  Git diffs are stored byte-for-byte as git emits them — never `.trim()` a diff,
+  and join multiple diffs with `concatDiffs`, not `join("\n")`. See LEARNINGS
+  2026-08-12 for the corrupt-patch and deadlock incidents these prevent.
   Model calls go through `server/src/runtime/`, which drives whichever agent CLI
   a stage is assigned (`claude`, `codex`, `opencode`) using that CLI's own login
   — **no API key, no `ANTHROPIC_API_KEY`, never import `@anthropic-ai/sdk`**.
@@ -40,11 +53,10 @@ Every proposal must be checked against all four:
    `GET /runtimes/probe`. This wording exists because the old "Max plan only,
    `claude -p` only" rule flip-flopped twice — LEARNINGS 2026-04-10 declared it
    superseded by GitHub Models, the code silently reverted to `claude -p`, and
-   `.env.example` still documents a dead `GITHUB_TOKEN`. A sentence here cannot
-   track that; a probed, persisted setting can.
+   runtime assignments cannot track that; a probed, persisted setting can.
 2. **No false positives.** Quality is non-negotiable. A real gap buried in noise is worse than a smaller, trustworthy list.
 3. **No token waste.** No bulk Opus+tools passes. Prefer deterministic filtering, cache hits, and on-demand escalation.
-4. **Shared machine, scoped credentials only.** This box is shared across the team — never write per-user credentials, never write project context to `~/.claude`. All persistent project context goes in this repo (CLAUDE.md, LEARNINGS.md). **GitHub push is now allowed via the shared `pradeep120230-creator` bot account only**, authenticated via `gh auth login` (token in `~/.config/gh/hosts.yml`, marked as `keyring`). The patches route uses this to push feature branches to bot forks under `pradeep120230-creator/sdk-agent-*` and open PRs against `juspay/*`. See LEARNINGS.md iteration 5 for the full story. **Do not** generate per-user PATs, do not write tokens into the repo, do not push from any account other than the bot.
+4. **Shared machine, scoped credentials only.** This box is shared across the team — never write per-user credentials, never write project context to `~/.claude`. All persistent project context goes in this repo (CLAUDE.md, LEARNINGS.md). GitHub publishing uses the already-authenticated `gh`/Git credential configuration and may push generated parent branches only to the canonical `juspay/hyperswitch-web` and `juspay/hyperswitch-client-core` repositories. Agent subprocesses must always use `runtime/agentEnv.ts`, which removes GitHub/SSH publishing credentials and disables direct GitHub Git/gh access; only the server publisher may retain push authority. The publisher must verify `origin`, refuse protected branches, use `--force-with-lease`, and never persist a token. Before any remote operation it must resolve an immutable branch commit, pass the fail-closed secret gate in `skills/secretScan.ts` over `origin/main..commit` plus PR metadata, recheck that the branch did not move, and push only that scanned commit. Reject sensitive files, compare against values captured from workspace `.env*` files without logging them, and require gitleaks. A missing or failed scanner means no push. Automatic publishing of submodule changes is blocked until separate canonical submodule PR orchestration exists; never restore the `.gitmodules`-to-fork shortcut. See the latest LEARNINGS.md entries for the superseding decisions.
 
 ## Known truths about the repos
 

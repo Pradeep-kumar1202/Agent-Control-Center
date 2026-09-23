@@ -130,6 +130,54 @@ db.exec(`
     ON skill_runs(skill_id, created_at DESC);
 `);
 
+// Jobs — the durable record of a skill run.
+//
+// Before this table, a run existed only as an open HTTP response: reloading the
+// page, losing wifi, or restarting the server destroyed it with no trace, and
+// `saveSkillRun` only ever fired on the happy path. A run that failed after 20
+// minutes left literally nothing behind.
+//
+// A job row is written BEFORE any work starts and every emitted event is
+// appended to job_events, so a run can be replayed from seq 0 into a fresh
+// browser tab and a crashed run is visible as 'interrupted' rather than absent.
+//
+// `client_key` is an idempotency guard: React StrictMode double-invokes effects
+// in dev and users double-click, so the same logical run must not start twice.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS jobs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id     TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN
+                 ('queued','running','done','error','cancelled','interrupted')),
+    client_key   TEXT UNIQUE,
+    input_json   TEXT NOT NULL,
+    result_json  TEXT,
+    error        TEXT,
+    skill_run_id INTEGER,
+    last_seq     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    started_at   TEXT,
+    ended_at     TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_jobs_skill  ON jobs(skill_id, created_at DESC);
+`);
+
+// One row per emitted event. WITHOUT ROWID with (job_id, seq) as the primary
+// key clusters a job's events contiguously, so replay is a single range scan
+// rather than an index lookup per row. `type` is denormalised out of the
+// payload so a replay can cheaply skip text deltas.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS job_events (
+    job_id  INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,
+    at      TEXT NOT NULL,
+    type    TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+  ) WITHOUT ROWID;
+`);
+
 // Test-suite runs (Detox / Cypress) triggered from the Test Writer skill.
 // Persists the full NDJSON stream so a user can reopen a past run long after
 // the browser tab is closed. pass/fail counts are parsed from the runner's
@@ -226,8 +274,8 @@ try {
   db.exec(`ALTER TABLE patches ADD COLUMN build_log TEXT`);
 } catch { /* already exists */ }
 
-// Migrate: add PR fields. Set when the patches route successfully pushes the
-// branch to the bot fork and opens a PR via gh.
+// Migrate: add PR fields. Set when the patches route successfully publishes
+// the branch and PR to the canonical juspay repository via Git/gh.
 try {
   db.exec(`ALTER TABLE patches ADD COLUMN pr_url TEXT`);
 } catch { /* already exists */ }

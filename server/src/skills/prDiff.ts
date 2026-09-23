@@ -1,4 +1,4 @@
-import simpleGit from "simple-git";
+import { localGit } from "../workspace/git.js";
 import type { RepoKey } from "../config.js";
 import { parsePrUrl, repoKeyForSlug } from "./prUrl.js";
 
@@ -14,7 +14,7 @@ async function diffRefs(
   baseRef: string,
   headRef: string,
 ): Promise<Pick<BranchDiff, "diff" | "stat">> {
-  const git = simpleGit(repoDir);
+  const git = localGit(repoDir);
   try {
     const [diff, stat] = await Promise.all([
       git.diff([`${baseRef}...${headRef}`]),
@@ -31,10 +31,10 @@ async function diffRefs(
 }
 
 async function fetchSha(repoDir: string, remoteUrl: string, ref: string): Promise<string> {
-  const git = simpleGit(repoDir);
+  const git = localGit(repoDir);
   // The workspace may configure fetch.recurseSubmodules=on-demand. A parent PR
-  // diff needs no submodule objects, and recursing can fail on stale bot-fork
-  // refs before FETCH_HEAD is usable, so make the isolation explicit.
+  // diff needs no submodule objects, and recursing can fail on an unavailable
+  // nested remote before FETCH_HEAD is usable, so make the isolation explicit.
   await git.raw(["fetch", "--no-tags", "--no-recurse-submodules", remoteUrl, ref]);
   return (await git.revparse(["FETCH_HEAD"])).trim();
 }
@@ -65,7 +65,13 @@ async function fetchExactPrDiff(prUrl: string): Promise<string> {
   if (diff.length > 750 * 1024) {
     throw new Error("PR diff exceeds the 750 KiB safe analysis limit; split the source change before porting it");
   }
-  return diff.trim();
+  // Emptiness is tested on a trimmed COPY; the diff itself is returned intact.
+  // Trimming the return value truncates the source PR's final hunk whenever it
+  // ends on a blank line, because a context line for a blank line is a single
+  // space. That hunk is what the triage and analyst stages read, so the trim
+  // quietly hid the last line of the change being ported. Same defect class as
+  // the stored-patch corruption in submoduleGit.ts — see LEARNINGS 2026-08-12.
+  return diff;
 }
 
 async function getPrDiff(
@@ -93,7 +99,7 @@ async function getPrDiff(
     const diff = await fetchExactPrDiff(pr.url);
     let headSha: string | undefined;
     try {
-      const out = await simpleGit(repoDir).raw(["ls-remote", remoteUrl, `refs/pull/${pr.number}/head`]);
+      const out = await localGit(repoDir).raw(["ls-remote", remoteUrl, `refs/pull/${pr.number}/head`]);
       headSha = out.trim().split(/\s+/)[0] || undefined;
     } catch { /* provenance convenience only */ }
     return { diff, stat: statFromUnifiedDiff(diff), headSha };
@@ -117,7 +123,7 @@ async function getPrDiff(
       // PRs. If it is unavailable, fail rather than silently diff against
       // today's main and port unrelated history.
       const mergeSha = await fetchSha(repoDir, remoteUrl, `refs/pull/${pr.number}/merge`);
-      const baseSha = (await simpleGit(repoDir).revparse([`${mergeSha}^1`])).trim();
+      const baseSha = (await localGit(repoDir).revparse([`${mergeSha}^1`])).trim();
       return { ...(await diffRefs(repoDir, baseSha, headSha)), baseSha, headSha };
     } catch (mergeError) {
       throw new Error(
@@ -144,7 +150,7 @@ export async function getBranchDiff(
     return getPrDiff(repoDir, branchOrPr, baseBranch, expectedRepo);
   }
 
-  const git = simpleGit(repoDir);
+  const git = localGit(repoDir);
   try {
     const branches = await git.branch(["-a"]);
     const exists = branches.all.some(

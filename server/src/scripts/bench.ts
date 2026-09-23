@@ -159,9 +159,9 @@ function resetToBaseline(repoKey: RepoKey, env: RepoEnv): void {
   // a working tree necessarily carries a local submodule bump (the same
   // situation LEARNINGS iteration 6 describes). Resetting to the recorded
   // pointer would guarantee a red build on every single case and the whole
-  // benchmark would measure nothing. Second, `submodule update` would try to
-  // fetch the recorded SHA from the bot fork, which is behind upstream and
-  // does not have it — a slow network round trip that ends in failure.
+  // benchmark would measure nothing. Second, `submodule update` adds a network
+  // dependency to every case and may fail when a recorded SHA is unavailable;
+  // preserving the measured baseline is both faster and deterministic.
   for (const [subPath, subSha] of Object.entries(env.submodules)) {
     const subDir = path.join(dir, subPath);
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;

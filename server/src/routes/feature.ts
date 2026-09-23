@@ -16,9 +16,9 @@ import { REPOS, type RepoKey } from "../config.js";
 import { withRepoLock } from "../workspace/mutex.js";
 import { forceCheckoutBranch, commitWithSubmodules, getDiffWithSubmodules, resetSubmodules } from "../skills/submoduleGit.js";
 import { runRescriptBuild } from "../skills/buildCheck.js";
-import { pushBranchToFork, createPullRequest, pushSubmoduleToFork, rewriteGitmodulesToForks } from "../skills/githubPr.js";
+import { publishPullRequest } from "../skills/githubPr.js";
 import { generateDoc } from "../skills/docs/generator.js";
-import simpleGit from "simple-git";
+import { localGit } from "../workspace/git.js";
 
 export const featureRouter = Router();
 
@@ -224,7 +224,7 @@ featureRouter.post("/feature/sessions/:id/implement", async (req, res) => {
     }
   }
 
-  const results: Record<string, { branch: string; diff: string; fileCount: number; prUrl: string | null; summary: string; error?: string }> = {};
+  const results: Record<string, { branch: string; diff: string; fileCount: number; prUrl: string | null; prWarning?: string | null; summary: string; error?: string }> = {};
 
   try {
     for (const repoKey of repos) {
@@ -236,7 +236,7 @@ featureRouter.post("/feature/sessions/:id/implement", async (req, res) => {
       const result = await withRepoLock(repoKey, async () => {
         try {
           await forceCheckoutBranch(repoDir, repoKey, "main");
-          const git = simpleGit(repoDir);
+          const git = localGit(repoDir);
           try { await git.deleteLocalBranch(branchName, true); } catch { /* */ }
           await git.checkoutLocalBranch(branchName);
 
@@ -327,25 +327,20 @@ When build is green, output a one-line summary.`;
             await commitWithSubmodules(repoDir, repoKey, `feat: ${session.title}`);
 
           let prUrl: string | null = null;
+          let prWarning: string | null = null;
           try {
-            for (const sub of submodulesChanged) {
-              await pushSubmoduleToFork({ parentDir: repoDir, subDir: sub, branchName });
-            }
-            if (submodulesChanged.length > 0) {
-              await rewriteGitmodulesToForks(repoDir, submodulesChanged);
-              const g = simpleGit(repoDir);
-              await g.add(".gitmodules");
-              await g.commit("chore: point submodules at bot forks for build");
-            }
-            await pushBranchToFork(repoDir, repoKey, branchName);
-            const pr = await createPullRequest({
+            const pr = await publishPullRequest({
+              repoDir,
               repoKey,
               branch: branchName,
               title: `feat: ${session.title}`,
               body: `## Feature Agent\n\n${agentText.slice(0, 1000)}`,
+              submodulesChanged,
             });
             prUrl = pr.prUrl;
-          } catch { /* PR failed — not fatal */ }
+          } catch (err) {
+            prWarning = `PR creation failed; the local branch is preserved: ${(err as Error).message}`;
+          }
 
           await forceCheckoutBranch(repoDir, repoKey, "main");
 
@@ -354,6 +349,7 @@ When build is green, output a one-line summary.`;
             diff: combinedDiff || diff,
             fileCount: totalFiles || fileCount,
             prUrl,
+            prWarning,
             summary: agentText.slice(0, 2000),
           };
         } catch (err) {
@@ -382,6 +378,7 @@ When build is green, output a one-line summary.`;
           filesTouched: v.fileCount,
           diff: v.diff,
           prUrl: v.prUrl,
+          prWarning: v.prWarning,
           summary: v.summary,
           error: v.error,
         }]),

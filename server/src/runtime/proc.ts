@@ -20,6 +20,7 @@
 
 import { spawn } from "node:child_process";
 import { killProcessGroup, terminateProcessGroup } from "../procGroup.js";
+import { agentSubprocessEnv } from "./agentEnv.js";
 
 export interface SpawnSpec {
   bin: string;
@@ -72,7 +73,7 @@ export async function* streamProcess(spec: SpawnSpec): AsyncGenerator<ProcEvent>
 
   const child = spawn(bin, args, {
     stdio: ["pipe", "pipe", "pipe"],
-    env: env ?? process.env,
+    env: agentSubprocessEnv(env ?? process.env),
     cwd,
     // Own process group, so grandchildren die with the parent.
     detached: true,

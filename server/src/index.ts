@@ -14,10 +14,13 @@ import { propsRouter } from "./routes/props.js";
 import { reviewsRouter } from "./routes/reviews.js";
 import { settingsRouter } from "./routes/settings.js";
 import { skillsRouter } from "./routes/skills.js";
+import { jobsRouter } from "./jobs/routes.js";
+import { pruneJobEvents, sweepInterruptedJobs } from "./jobs/runner.js";
 import { lintAgents } from "./agents/loader.js";
 import { seedFromEnvIfEmpty } from "./runtime/index.js";
 import { stopAllPreviews } from "./skills/previewManager.js";
 import { stopMockServer } from "./skills/embeddedMockServer.js";
+
 
 const app = express();
 app.use(cors());
@@ -44,6 +47,7 @@ app.use(propsRouter);    // legacy /props/generate (backward compat)
 app.use(reviewsRouter);  // /reviews/* (review history)
 app.use(settingsRouter); // /settings, /runtimes/* (runtime + model assignment)
 app.use(skillsRouter);   // /skills/* (new unified endpoint)
+app.use(jobsRouter);     // /jobs/* + POST /skills/:id/jobs (durable runs)
 
 // Seed runtime profiles from env on first boot only, so headless runs
 // (npm run analyze, cron) work without anyone opening the Settings page.
@@ -52,6 +56,16 @@ seedFromEnvIfEmpty();
 // Fail fast on a malformed agent definition: a typo in agents/*.md should
 // surface at `npm run dev`, not eight minutes into a patch run.
 for (const issue of lintAgents()) console.warn(`[agents] ${issue}`);
+
+// Any job still 'queued' or 'running' belongs to a process that is gone. Mark
+// them 'interrupted' and append a terminal event, so the history shows what
+// happened and a replaying client reaches a clean end instead of hanging.
+sweepInterruptedJobs();
+
+// Transcripts of long-finished runs are the only unbounded thing here; the job
+// rows themselves are small and stay.
+const prunedEvents = pruneJobEvents();
+if (prunedEvents > 0) console.log(`[jobs] pruned ${prunedEvents} aged event row(s)`);
 
 const server = app.listen(PORT, () => {
   console.log(`[server] listening on http://localhost:${PORT}`);

@@ -29,6 +29,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { DATA_DIR } from "../../config.js";
 import { classifyExit, streamProcess } from "../proc.js";
+import { runtimeCliEnv } from "../agentEnv.js";
 import {
   UnsupportedRuntimeCapabilityError,
   type AccessPolicy, type AgentEvent, type AgentRuntime,
@@ -270,10 +271,17 @@ export const opencodeRuntime: AgentRuntime = {
 
   async probe(): Promise<RuntimeStatus> {
     try {
-      const { stdout: ver } = await execFileAsync(BIN, ["--version"], { timeout: 10_000 });
+      const { stdout: ver } = await execFileAsync(BIN, ["--version"], {
+        timeout: 10_000,
+        env: runtimeCliEnv(),
+      });
       let models: string[] = [];
       try {
-        const { stdout } = await execFileAsync(BIN, ["models"], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
+        const { stdout } = await execFileAsync(BIN, ["models"], {
+          timeout: 30_000,
+          maxBuffer: 8 * 1024 * 1024,
+          env: runtimeCliEnv(),
+        });
         models = stdout.split("\n").map((s) => s.trim()).filter((s) => s.includes("/"));
       } catch { /* catalog is a convenience */ }
       return { id: "opencode", installed: true, version: ver.trim(), models };

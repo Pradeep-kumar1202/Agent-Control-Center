@@ -12,7 +12,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import simpleGit from "simple-git";
+// Every git call here is local (status/diff/add/commit/checkout/clean), so it
+// goes through localGit: hooks disabled, prompts refused, deadlocks bounded.
+// See workspace/git.ts for why commits hang without this.
+import { localGit } from "../workspace/git.js";
 
 /** Known submodule directories per repo. */
 const SUBMODULE_DIRS: Record<string, string[]> = {
@@ -39,7 +42,7 @@ export async function captureSubmoduleHeads(
     const subDir = path.join(repoDir, dir);
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;
     try {
-      heads.push({ dir, sha: (await simpleGit(subDir).revparse(["HEAD"])).trim() });
+      heads.push({ dir, sha: (await localGit(subDir).revparse(["HEAD"])).trim() });
     } catch { /* an uninitialised submodule is handled by the build gate */ }
   }
   return heads;
@@ -57,7 +60,7 @@ export async function restoreSubmoduleHeads(
   for (const head of heads) {
     const subDir = path.join(repoDir, head.dir);
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;
-    await simpleGit(subDir).raw(["checkout", "--force", "--detach", head.sha]);
+    await localGit(subDir).raw(["checkout", "--force", "--detach", head.sha]);
   }
 }
 
@@ -66,7 +69,7 @@ export async function restoreSubmoduleHeads(
  */
 async function submoduleHasChanges(subDir: string): Promise<boolean> {
   try {
-    const git = simpleGit(subDir);
+    const git = localGit(subDir);
     const status = await git.status();
     return (
       status.modified.length > 0 ||
@@ -110,7 +113,7 @@ async function diffWorkingTree(
   excludePathspecs: string[] = [],
   pathPrefix = "",
 ): Promise<string> {
-  const git = simpleGit(dir);
+  const git = localGit(dir);
   const untracked = await untrackedPaths(git, excludePathspecs);
 
   // `pathPrefix` re-roots a submodule's paths under the parent repo. We ask git
@@ -131,15 +134,46 @@ async function diffWorkingTree(
     } catch { /* fall through — we still report tracked changes */ }
   }
   try {
-    return (
-      await git.raw(["diff", "HEAD", ...prefixArgs, "--", ".", ...excludePathspecs])
-    ).trim();
+    // Returned EXACTLY as git produced it. Do not trim.
+    //
+    // `.trim()` here silently produced unappliable patches. A unified diff's
+    // context line for a BLANK source line is a single space, so a hunk that
+    // ends on a blank line ends with " \n" — and trim() eats both the space-only
+    // line and the terminating newline. The stored patch then has two fewer
+    // lines than its own hunk header declares, and `git apply` rejects it with
+    // "corrupt patch at line N". Measured on
+    // port-web-pr-1412: header declared old=6 new=9, body carried old=5 new=8.
+    //
+    // ReScript files routinely end on a blank line, so this fired often. Git's
+    // output is already canonical; any normalisation belongs at the point of
+    // use, never here.
+    return await git.raw(["diff", "HEAD", ...prefixArgs, "--", ".", ...excludePathspecs]);
   } finally {
     if (untracked.length > 0) {
       // Undo the intent-to-add markers so the index is exactly as we found it.
       try { await git.raw(["reset", "-q", "--", ...untracked]); } catch { /* */ }
     }
   }
+}
+
+/**
+ * Concatenate several diffs into one patch that `git apply` accepts.
+ *
+ * The counterpart to not trimming in `diffWorkingTree`. Two rules, both learned
+ * from patches git rejected:
+ *
+ *  - Every part must KEEP its terminating newline. `git apply` reads a patch
+ *    line-by-line; an unterminated final line is "corrupt patch at line N".
+ *  - Parts must be joined with NOTHING between them. Joining with "\n" inserts a
+ *    blank line between two diffs, and a blank line inside a hunk body is read
+ *    as a context line for an empty source line — silently shifting every
+ *    subsequent line count in the combined patch.
+ */
+function concatDiffs(parts: string[]): string {
+  return parts
+    .filter((part) => part.length > 0)
+    .map((part) => (part.endsWith("\n") ? part : `${part}\n`))
+    .join("");
 }
 
 /**
@@ -151,7 +185,7 @@ async function countChangedFiles(
   dir: string,
   excludePathspecs: string[] = [],
 ): Promise<number> {
-  const git = simpleGit(dir);
+  const git = localGit(dir);
   const untracked = await untrackedPaths(git, excludePathspecs);
 
   if (untracked.length > 0) {
@@ -179,7 +213,7 @@ async function countChangedFiles(
  * get intent-to-added into the parent index.
  */
 async function untrackedPaths(
-  git: ReturnType<typeof simpleGit>,
+  git: ReturnType<typeof localGit>,
   excludePathspecs: string[],
 ): Promise<string[]> {
   const excluded = excludePathspecs
@@ -236,7 +270,7 @@ export async function commitWithSubmodules(
   repoKey: "web" | "mobile",
   commitMessage: string,
 ): Promise<SubmoduleCommitResult> {
-  const parentGit = simpleGit(repoDir);
+  const parentGit = localGit(repoDir);
   const submodules = SUBMODULE_DIRS[repoKey] ?? [];
 
   const diffs: string[] = [];
@@ -257,18 +291,20 @@ export async function commitWithSubmodules(
     if (diff) diffs.push(diff);
 
     // Stage and commit inside the submodule
-    const subGit = simpleGit(subDir);
+    const subGit = localGit(subDir);
     await subGit.add(".");
     const subStatus = await subGit.status();
     const filesInSub = subStatus.staged.length;
     totalFiles += filesInSub;
-    submodulesChanged.push(subName);
 
-    try {
-      await subGit.commit(commitMessage);
-    } catch {
-      // Might fail if nothing was actually staged — that's OK
-    }
+    // "Nothing staged" is the only benign reason this commit can be skipped, so
+    // test for it directly instead of swallowing every error. The previous
+    // catch-all reported success while nothing was committed — that is how a
+    // blocked commit hook produced a run that claimed to have preserved work it
+    // had actually dropped.
+    if (filesInSub === 0) continue;
+    submodulesChanged.push(subName);
+    await subGit.commit(commitMessage);
   }
 
   // Step 3: Collect parent-level diff (files in src/, etc. — NOT submodule pointers)
@@ -301,18 +337,18 @@ export async function commitWithSubmodules(
     try { await parentGit.raw(["add", sub]); } catch { /* */ }
   }
 
-  // Step 5: Commit in parent (only if there's something to commit)
+  // Step 5: Commit in parent (only if there's something to commit).
+  //
+  // A failure here must propagate. Callers use this to preserve a run's work
+  // before tearing the branch down, so logging and returning would report the
+  // work as saved while it was about to be discarded.
   const parentStatus = await parentGit.status();
   if (parentStatus.staged.length > 0) {
-    try {
-      await parentGit.commit(commitMessage);
-    } catch (err) {
-      console.error("[submoduleGit] parent commit failed:", (err as Error).message);
-    }
+    await parentGit.commit(commitMessage);
   }
 
   return {
-    combinedDiff: diffs.join("\n"),
+    combinedDiff: concatDiffs(diffs),
     totalFiles,
     submodulesChanged,
   };
@@ -353,7 +389,7 @@ export async function getDiffWithSubmodules(
     fileCount += await countChangedFiles(repoDir, excludePaths);
   }
 
-  return { diff: diffs.join("\n"), fileCount };
+  return { diff: concatDiffs(diffs), fileCount };
 }
 
 /**
@@ -369,7 +405,7 @@ export async function resetSubmodules(
     const subDir = path.join(repoDir, subName);
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;
     try {
-      const git = simpleGit(subDir);
+      const git = localGit(subDir);
       await git.raw(["checkout", "--force", "."]);
       await git.clean("f", ["-d"]);
     } catch { /* ignore */ }
@@ -390,7 +426,7 @@ export async function syncSubmodulesToMain(
   repoKey: "web" | "mobile",
 ): Promise<void> {
   const submodules = SUBMODULE_DIRS[repoKey] ?? [];
-  const parentGit = simpleGit(repoDir);
+  const parentGit = localGit(repoDir);
   try {
     await parentGit.raw(["submodule", "update", "--init", "--recursive", "--force"]);
   } catch (err) {
@@ -400,7 +436,7 @@ export async function syncSubmodulesToMain(
     const subDir = path.join(repoDir, subName);
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;
     try {
-      const subGit = simpleGit(subDir);
+      const subGit = localGit(subDir);
       await subGit.fetch("origin");
       await subGit.raw(["reset", "--hard", "HEAD"]);
       await subGit.clean("f", ["-d"]);
@@ -434,7 +470,7 @@ export async function advanceSubmodulesToOriginMain(
     const subDir = path.join(repoDir, subName);
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;
     try {
-      const subGit = simpleGit(subDir);
+      const subGit = localGit(subDir);
       const before = (await subGit.revparse(["HEAD"])).trim();
       await subGit.fetch("origin", "main");
       // Hard-reset to origin/main so we're exactly at the latest upstream SHA.
@@ -463,7 +499,7 @@ export async function ensureSubmodulesClean(
   repoDir: string,
   _repoKey: "web" | "mobile",
 ): Promise<void> {
-  const parentGit = simpleGit(repoDir);
+  const parentGit = localGit(repoDir);
   const status = await parentGit.raw(["submodule", "status", "--recursive"]);
   const dirty = status.split("\n").filter((l) => /^[+\-U]/.test(l));
   if (dirty.length > 0) {
@@ -488,7 +524,7 @@ export async function forceCheckoutBranch(
   branch: string,
 ): Promise<void> {
   await resetSubmodules(repoDir, repoKey);
-  const git = simpleGit(repoDir);
+  const git = localGit(repoDir);
   await git.raw(["checkout", "--force", branch]);
   // Clean untracked files from parent repo so no leftovers from prior agent runs
   await git.clean("f", ["-d"]);
@@ -527,7 +563,7 @@ export class BranchGoneError extends Error {
 /** All local branch short names in the given repo. */
 export async function listLocalBranches(repoDir: string): Promise<string[]> {
   try {
-    const git = simpleGit(repoDir);
+    const git = localGit(repoDir);
     const out = await git.raw(["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
     return out.split("\n").map((l) => l.trim()).filter(Boolean);
   } catch {
@@ -563,7 +599,7 @@ export async function listRemoteBranches(
 ): Promise<Set<string>> {
   if (branches.length === 0) return new Set();
   try {
-    const git = simpleGit(repoDir, { timeout: { block: 8000 } });
+    const git = localGit(repoDir, { timeout: { block: 8000 } });
     const out = await git.raw(["ls-remote", "--heads", "origin", ...branches]);
     const found = new Set<string>();
     for (const line of out.split("\n")) {
@@ -599,7 +635,7 @@ export async function checkoutOrRecover(
     await forceCheckoutBranch(repoDir, repoKey, branch);
     return;
   }
-  const git = simpleGit(repoDir);
+  const git = localGit(repoDir);
   // Probe the remote for just this one branch (fast — one ls-remote call).
   const remote = await listRemoteBranches(repoDir, [branch]);
   if (!remote.has(branch)) {

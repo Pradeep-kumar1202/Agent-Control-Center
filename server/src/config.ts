@@ -50,7 +50,15 @@ export const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
 export const WORKSPACE_DIR = path.join(PROJECT_ROOT, "workspace");
 export const DATA_DIR = path.join(PROJECT_ROOT, "data");
 export const PATCHES_DIR = path.join(DATA_DIR, "patches");
-export const DB_PATH = path.join(DATA_DIR, "app.db");
+/**
+ * `ACC_DB_PATH` lets a check script point at a throwaway database.
+ *
+ * Without it, every test that exercises persistence would write jobs, patches
+ * and skill runs into the operator's real `data/app.db` — which both pollutes
+ * the dashboard's history and makes the tests depend on whatever state happens
+ * to be there. Deterministic tests need a private store.
+ */
+export const DB_PATH = process.env.ACC_DB_PATH ?? path.join(DATA_DIR, "app.db");
 
 export const PORT = Number(process.env.PORT ?? 5174);
 

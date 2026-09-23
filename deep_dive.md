@@ -352,8 +352,10 @@ Simple loop: for each canonical feature, if one side is null, it's a gap. Gaps a
 1. Capture git diff (submodule-aware)
 2. Server-side build verification (safety net)
 3. Commit on feature branch
-4. Push to bot fork (`pradeep120230-creator/sdk-agent-*`)
-5. Open PR against `juspay/*` upstream
+4. Resolve an immutable commit and run the fail-closed secret scan over `origin/main..commit`, workspace `.env*` values, and PR metadata
+5. Verify `origin` is the expected canonical `juspay/*` repository
+6. Recheck the branch tip and push only the scanned commit with an exact `--force-with-lease`
+7. Open or reuse a PR in that canonical repository
 
 **Streaming**: The browser shows real-time tool-call chips (Read/Grep in Phase 1, Edit/Write in Phase 2, Bash for builds) via NDJSON streaming.
 
@@ -626,6 +628,7 @@ docs            -- Auto-generated documentation (content, official_content)
 | 5 | Apr 11 | Real PRs + Android preview + bot forks | ✅ End-to-end: gap → PR |
 | 6 | Apr 11 | Agent self-verification (Bash) + build fix | ✅ Agent iterates on build errors |
 | 7 | Apr 13 | Streaming + two-phase source analysis | ✅ Agent reads source repo first |
+| 8 | Aug 11 | Canonical parent publishing replaces fork publishing | ✅ Direct `juspay/*` branch + PR with origin/lease guards |
 
 ---
 
@@ -680,8 +683,8 @@ A: Three safety layers:
 A: The mobile repo has 3 git submodules (`shared-code`, `android`, `ios`). The project has submodule-aware git operations throughout:
 - `getDiffWithSubmodules()` captures diffs from both parent and submodules
 - `commitWithSubmodules()` commits inside submodules first, then parent
-- `pushSubmoduleToFork()` pushes each submodule to its own bot fork
-- `.gitmodules` is rewritten to point at bot forks so the PR branch is buildable
+- parent-only changes can be published directly to the canonical parent repository
+- automatic publishing stops with `SUBMODULE_PRS_REQUIRED` when a submodule changed; the local branch is preserved until separate canonical submodule PRs and merge ordering are handled
 
 ### Process Questions
 

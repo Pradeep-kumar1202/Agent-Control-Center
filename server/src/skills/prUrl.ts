@@ -1,5 +1,5 @@
 import type { RepoKey } from "../config.js";
-import { forkSlug, upstreamSlug } from "./githubPr.js";
+import { upstreamSlug } from "./githubPr.js";
 
 export interface ParsedPr {
   owner: string;
@@ -66,12 +66,11 @@ export function parsePrUrl(raw: string): ParsedPr | null {
   };
 }
 
-/** Map both upstream repos and the configured dashboard forks to one workspace repo. */
+/** Map the two canonical juspay repositories to one workspace repo. */
 export function repoKeyForSlug(owner: string, repo: string): RepoKey | null {
   const wanted = `${owner}/${normalizeRepo(repo)}`.toLowerCase();
   for (const key of ["web", "mobile"] as const) {
     if (wanted === upstreamSlug(key).toLowerCase()) return key;
-    if (wanted === forkSlug(key).toLowerCase()) return key;
   }
   return null;
 }
@@ -80,8 +79,6 @@ export function recognisedPrSlugs(): string[] {
   return [
     upstreamSlug("web"),
     upstreamSlug("mobile"),
-    forkSlug("web"),
-    forkSlug("mobile"),
   ];
 }
 

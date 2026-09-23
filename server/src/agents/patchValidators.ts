@@ -23,7 +23,7 @@ import path from "node:path";
 // ─── types ───────────────────────────────────────────────────────────────────
 
 export type PatchRuleId =
-  | "diff/empty" | "diff/malformed" | "diff/path_mismatch"
+  | "diff/empty" | "diff/malformed" | "diff/path_mismatch" | "diff/corrupt_artifact"
   | "scope/lockfile" | "scope/generated" | "scope/gitignored"
   | "scope/binary" | "scope/env" | "scope/gitmodules" | "scope/docs_only" | "scope/tests_only"
   | "size/too_many_files" | "size/too_many_lines" | "size/single_file_rewrite" | "size/single_file"
@@ -222,12 +222,10 @@ export function checkDiffScope(files: DiffFile[], policy: ScopePolicy): PatchFin
         }));
     }
     if (!policy.allowGitmodules && /(^|\/)\.gitmodules$/.test(f.path)) {
-      // The submodule-fork rewrite is a SEPARATE commit made after the diff is
-      // captured. Seeing it inside the diff means the ordering broke.
       out.push(finding("scope/gitmodules", "reject",
         ".gitmodules changed inside the feature diff", {
           file: f.path, category: "patterns",
-          suggestion: "The fork rewrite must be its own commit after diff capture.",
+          suggestion: "Keep canonical submodule URLs unchanged; publish submodule changes through separate upstream PRs.",
         }));
     }
     if (!policy.allowNative && /^(ios|android)\//.test(f.path)) {
@@ -460,9 +458,30 @@ export function checkPatchApplies(repoDir: string, patchPath: string): PatchFind
     return [];
   } catch (err) {
     const e = err as { stderr?: string };
+    const stderr = String(e.stderr ?? "");
+
+    // Separate the two failures, because they have opposite owners and git
+    // already tells them apart.
+    //
+    //  - "corrupt patch at line N" means the patch is not valid unified diff.
+    //    The model never sees the serialised patch, so this is always OUR bug —
+    //    the artifact was damaged between `git diff` and disk. Saying "it will
+    //    not apply" here sends the reader off to inspect the model's changes,
+    //    which are usually fine. That misdirection cost two days once already:
+    //    the real cause was a `.trim()` eating a space-only context line.
+    //  - anything else means the diff parsed but does not match the tree, which
+    //    is a genuine content problem.
+    const corrupt = /corrupt patch at line (\d+)/.exec(stderr);
+    if (corrupt) {
+      return [finding("diff/corrupt_artifact", "reject",
+        `Stored patch is not valid unified diff (corrupt at line ${corrupt[1]}). ` +
+        "This is a patch-serialization defect in the dashboard, not a problem with " +
+        "the generated code — check how the diff was written, not what it contains.",
+        { detail: stderr.slice(0, 500) })];
+    }
     return [finding("diff/malformed", "reject",
       "Stored patch does not describe the working tree — it will not apply", {
-        detail: String(e.stderr ?? "").slice(0, 500),
+        detail: stderr.slice(0, 500),
       })];
   }
 }

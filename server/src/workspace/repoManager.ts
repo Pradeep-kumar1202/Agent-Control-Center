@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { simpleGit, type SimpleGit } from "simple-git";
+import { type SimpleGit } from "simple-git";
+import { localGit } from "./git.js";
 import { REPOS, WORKSPACE_DIR, type RepoKey } from "../config.js";
 
 fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
@@ -29,12 +30,16 @@ export async function cloneOrPull(key: RepoKey): Promise<RepoState> {
 
   if (!exists) {
     fs.mkdirSync(path.dirname(repo.dir), { recursive: true });
-    const git = simpleGit();
+    // Clone is the one local operation that may legitimately stay silent longer
+    // than the default block timeout: git writes no progress to a non-tty, so a
+    // large or slow first clone looks identical to a hang. Opt out of the
+    // deadlock guard here rather than risk killing a healthy clone.
+    const git = localGit(undefined, { timeout: undefined });
     console.log(`[repo] cloning ${repo.name} → ${repo.dir}`);
     await git.clone(repo.url, repo.dir, ["--depth", "1"]);
   }
 
-  const git: SimpleGit = simpleGit(repo.dir);
+  const git: SimpleGit = localGit(repo.dir);
 
   // Fetch latest. Use --no-tags to keep things minimal.
   if (exists) {

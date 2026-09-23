@@ -54,6 +54,49 @@ const ANDROID_HOME = process.env.ANDROID_HOME ?? "/home/sdk/android-sdk";
 const EMULATOR_MEMORY_MB = Number(process.env.PREVIEW_EMU_MEMORY_MB ?? 6144);
 const EMULATOR_CORES = Number(process.env.PREVIEW_EMU_CORES ?? 4);
 
+export interface EmulatorLaunchConfig {
+  headless: boolean;
+  gpu: string;
+}
+
+/** Resolve launch mode without touching the process table, so it is testable. */
+export function resolveEmulatorLaunchConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): EmulatorLaunchConfig {
+  const raw = env.PREVIEW_EMU_HEADLESS?.trim().toLowerCase();
+  if (raw !== undefined && !["true", "false", "1", "0"].includes(raw)) {
+    throw new Error("PREVIEW_EMU_HEADLESS must be true or false");
+  }
+  const hasDesktop = platform === "darwin" || platform === "win32" ||
+    Boolean(env.DISPLAY?.trim() || env.WAYLAND_DISPLAY?.trim());
+  const headless = raw === undefined ? !hasDesktop : raw === "true" || raw === "1";
+  return {
+    headless,
+    gpu: env.PREVIEW_EMU_GPU?.trim() || (headless ? "swiftshader_indirect" : "auto"),
+  };
+}
+
+export function buildEmulatorArgs(
+  avd: string,
+  memoryMb: number,
+  cores: number,
+  launch: EmulatorLaunchConfig,
+): string[] {
+  return [
+    "-avd", avd,
+    ...(launch.headless ? ["-no-window"] : []),
+    "-no-audio",
+    "-no-snapshot-save",
+    "-no-boot-anim",
+    "-gpu", launch.gpu,
+    "-memory", String(memoryMb),
+    "-cores", String(cores),
+  ];
+}
+
+const EMULATOR_LAUNCH = resolveEmulatorLaunchConfig();
+
 const slots = new Map<RepoKey, PreviewSlot>();
 
 // The emulator is intentionally module-scoped so it survives across previews
@@ -345,24 +388,12 @@ async function prepareAndroidDevice(slot: PreviewSlot): Promise<void> {
   } else {
     pushLog(
       slot,
-      `[emulator] booting AVD ${PREVIEW_AVD} headless (memory=${EMULATOR_MEMORY_MB}MB cores=${EMULATOR_CORES})`,
+      `[emulator] booting AVD ${PREVIEW_AVD} ${EMULATOR_LAUNCH.headless ? "headless" : "with a visible window"} ` +
+      `(gpu=${EMULATOR_LAUNCH.gpu} memory=${EMULATOR_MEMORY_MB}MB cores=${EMULATOR_CORES})`,
     );
     emulatorProc = spawn(
       emulatorBin(),
-      [
-        "-avd",
-        PREVIEW_AVD,
-        "-no-window",
-        "-no-audio",
-        "-no-snapshot-save",
-        "-no-boot-anim",
-        "-gpu",
-        "swiftshader_indirect",
-        "-memory",
-        String(EMULATOR_MEMORY_MB),
-        "-cores",
-        String(EMULATOR_CORES),
-      ],
+      buildEmulatorArgs(PREVIEW_AVD, EMULATOR_MEMORY_MB, EMULATOR_CORES, EMULATOR_LAUNCH),
       {
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],

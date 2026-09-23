@@ -257,6 +257,40 @@ export function listAgents(): AgentDef[] {
 }
 
 /**
+ * Native structured-output APIs accept a stricter JSON Schema subset than a
+ * general-purpose validator. Every declared object property must appear in
+ * `required`; optional values are represented as required-but-nullable.
+ */
+export function structuredOutputSchemaIssues(schema: unknown, location = "$"): string[] {
+  if (Array.isArray(schema)) {
+    return schema.flatMap((entry, index) => structuredOutputSchemaIssues(entry, `${location}[${index}]`));
+  }
+  if (typeof schema !== "object" || schema === null) return [];
+
+  const record = schema as Record<string, unknown>;
+  const issues: string[] = [];
+  const properties = record.properties;
+  if (typeof properties === "object" && properties !== null && !Array.isArray(properties)) {
+    const keys = Object.keys(properties);
+    const required = new Set(Array.isArray(record.required)
+      ? record.required.filter((value): value is string => typeof value === "string")
+      : []);
+    const missing = keys.filter((key) => !required.has(key));
+    if (missing.length > 0) {
+      issues.push(`${location}: required must include every property; missing ${missing.join(", ")}`);
+    }
+    if (record.additionalProperties !== false) {
+      issues.push(`${location}: additionalProperties must be false`);
+    }
+  }
+
+  for (const [key, value] of Object.entries(record)) {
+    issues.push(...structuredOutputSchemaIssues(value, `${location}.${key}`));
+  }
+  return issues;
+}
+
+/**
  * Validate every definition. Returns human-readable problems; empty means clean.
  * Call at boot so a broken prompt fails fast instead of mid-run.
  */
@@ -271,6 +305,11 @@ export function lintAgents(): string[] {
       }
       if (def.output === "json" && !def.schema) {
         issues.push(`${id}: output is json but no schema is declared — parse-and-repair is the only fallback`);
+      }
+      if (def.schema) {
+        for (const issue of structuredOutputSchemaIssues(def.schema)) {
+          issues.push(`${id}: structured-output schema ${issue}`);
+        }
       }
     } catch (err) {
       issues.push(err instanceof Error ? err.message : String(err));

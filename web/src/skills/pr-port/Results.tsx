@@ -13,6 +13,8 @@ interface PortMeta {
   target?: "web" | "mobile";
   sourcePr?: { url?: string; owner?: string; repo?: string; number?: number };
   triage?: { portability?: string; reasons?: string[]; skippedFiles?: FileDecision[] };
+  triageRepair?: { attempted?: boolean; repaired?: boolean; initialError?: string; repairError?: string };
+  portSpecRepair?: { attempted?: boolean; repaired?: boolean; initialError?: string; repairError?: string };
   spec?: { featureName?: string; notPorting?: FileDecision[] };
   quality?: { findings?: Finding[]; stats?: { files: number; added: number; removed: number } };
   verifier?: { parsed?: boolean; issues?: string[] };
@@ -85,6 +87,18 @@ export function PrPortResults({ result, onClose }: SkillResultsProps) {
           {active.error && (
             <div className="rounded-lg border border-red-800 bg-red-950/30 px-4 py-3 text-sm text-red-300">
               {active.error}
+            </div>
+          )}
+
+          {meta.triageRepair?.attempted && meta.triageRepair.repaired && (
+            <div className="rounded border border-cyan-700/50 bg-cyan-950/20 px-3 py-2 text-xs text-cyan-300">
+              The first triage response was inconsistent and was corrected automatically before continuing.
+            </div>
+          )}
+
+          {meta.portSpecRepair?.attempted && meta.portSpecRepair.repaired && (
+            <div className="rounded border border-cyan-700/50 bg-cyan-950/20 px-3 py-2 text-xs text-cyan-300">
+              The first source specification contained invalid paths and was corrected automatically before continuing.
             </div>
           )}
 

@@ -1,24 +1,20 @@
 /**
- * First-time setup: clone both SDK repos into ./workspace/ and initialise
- * their submodules from the bot's public forks on GitHub.
+ * First-time setup: clone both canonical SDK repos into ./workspace/ and
+ * initialise their submodules from upstream over HTTPS.
  *
  *   npm run sync -w server     # called by `npm run setup` at repo root
  *
  * The submodule URLs in .gitmodules point at juspay/* repos — two of them
  * (ios, android) use git@github.com: SSH which would break for a fresh
- * clone on a machine without SSH keys. We override those URLs in local
- * .git/config (not in tracked .gitmodules) to point at the bot's public
- * HTTPS forks so first-time setup needs no credentials.
+ * clone on a machine without SSH keys. We normalize those same upstream URLs
+ * to HTTPS in local .git/config; tracked .gitmodules remains untouched.
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import simpleGit, { type SimpleGit } from "simple-git";
+import { type SimpleGit } from "simple-git";
+import { localGit } from "../workspace/git.js";
 import { syncAllRepos } from "../workspace/repoManager.js";
-// Note: the bot forks (FORK_CONFIG / SUBMODULE_FORKS in skills/githubPr.ts) are
-// deliberately NOT used here. They are a push target, not a source of truth —
-// they lag upstream, so cloning from them yields commits the parent repos do
-// not build against.
 
 async function main() {
   const t0 = Date.now();
@@ -32,23 +28,23 @@ async function main() {
     console.log(`            ${s.dir}`);
   }
 
-  console.log("\ninitialising submodules from bot forks…");
+  console.log("\ninitialising submodules from canonical upstream repositories…");
   for (const s of Object.values(states)) {
-    await initSubmodulesFromForks(s.dir, s.name);
+    await initSubmodulesFromUpstream(s.dir, s.name);
   }
   console.log("\nsetup complete.");
 }
 
 /**
- * For each submodule listed in the parent's .gitmodules, override its URL in
- * local .git/config to point at the corresponding bot fork (if we have a
- * mapping for it), then run `git submodule update --init --recursive`.
+ * For each submodule listed in the parent's .gitmodules, normalize its URL to
+ * canonical upstream HTTPS in local .git/config, then run
+ * `git submodule update --init --recursive`.
  *
  * We deliberately do NOT edit the tracked .gitmodules file — keeping it in
  * its upstream-juspay state so subsequent PRs compare cleanly against
  * upstream. The URL override lives only in the workspace checkout.
  */
-async function initSubmodulesFromForks(repoDir: string, repoName: string): Promise<void> {
+async function initSubmodulesFromUpstream(repoDir: string, repoName: string): Promise<void> {
   const gitmodulesPath = path.join(repoDir, ".gitmodules");
   if (!fs.existsSync(gitmodulesPath)) {
     console.log(`  ${repoName}: no submodules`);
@@ -61,23 +57,14 @@ async function initSubmodulesFromForks(repoDir: string, repoName: string): Promi
     return;
   }
 
-  const git: SimpleGit = simpleGit(repoDir);
+  const git: SimpleGit = localGit(repoDir);
 
   for (const s of subs) {
-    // Point at UPSTREAM over HTTPS, not at the bot forks.
-    //
     // The override exists only because client-core's .gitmodules uses
     // `git@github.com:` SSH, which breaks a fresh clone on a machine with no
-    // SSH keys. Redirecting to the bot forks solved that but introduced a
-    // worse problem: the forks lag upstream, so a recorded submodule pointer
-    // may not exist there at all. `git submodule update` then cannot fetch it
-    // and silently leaves the fork's own main checked out — which is how a
-    // fresh setup produced a workspace where hyperswitch-web did not compile
-    // (`phoneInvalidText does not belong to type localeStrings`).
-    //
-    // Upstream HTTPS keeps the no-credentials property and always has the
-    // recorded commit. Pushing is unaffected: pushSubmoduleToFork adds its own
-    // separate `bot` remote and never relies on `origin`.
+    // SSH keys. Canonical upstream HTTPS preserves the no-SSH setup while
+    // keeping every recorded submodule commit reachable. Parent PR publishing
+    // leaves these canonical submodule origins untouched.
     const upstreamUrl = toHttpsUrl(s.url);
     if (!upstreamUrl) {
       console.log(`  ${repoName}/${s.subpath}: unrecognised url "${s.url}" — leaving as-is`);
@@ -109,7 +96,7 @@ async function initSubmodulesFromForks(repoDir: string, repoName: string): Promi
     if (!fs.existsSync(path.join(subDir, ".git"))) continue;
     try {
       const recorded = (await git.raw(["ls-tree", "HEAD", s.subpath])).trim().split(/\s+/)[2];
-      const actual = (await simpleGit(subDir).revparse(["HEAD"])).trim();
+      const actual = (await localGit(subDir).revparse(["HEAD"])).trim();
       if (recorded && actual && recorded !== actual) {
         drift++;
         console.warn(

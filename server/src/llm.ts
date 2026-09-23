@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { RUNTIMES } from "./runtime/index.js";
+import { agentSubprocessEnv } from "./runtime/agentEnv.js";
 import { getAgentSettings, resolveSlot } from "./runtime/settings.js";
 import type { AccessPolicy, AgentSlot, ModelRef } from "./runtime/types.js";
 
@@ -237,7 +238,7 @@ export function ask(prompt: string, opts: AskOptions = {}): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("claude", args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: agentSubprocessEnv(process.env),
       cwd,
     });
     activeChildren.add(child);
@@ -359,7 +360,7 @@ export function askStream(
   return new Promise((resolve, reject) => {
     const child = spawn("claude", args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: agentSubprocessEnv(process.env),
       cwd,
     });
     activeChildren.add(child);

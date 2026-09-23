@@ -22,6 +22,6 @@
     "build_attempts": { "type": "integer", "minimum": 1 },
     "notes": { "type": "string" }
   },
-  "required": ["what", "files", "backward_compatible", "build_status", "build_attempts"],
+  "required": ["what", "files", "backward_compatible", "build_status", "build_attempts", "notes"],
   "additionalProperties": false
 }

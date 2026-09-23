@@ -1,0 +1,2 @@
+# Intentionally empty. The publisher passes this protected file explicitly and
+# ignores inline gitleaks:allow comments so generated branches cannot self-exempt.

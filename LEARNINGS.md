@@ -689,3 +689,296 @@ reports `opencode cancelled` with no surviving process and a clean workspace.
 General rule this earns: **spawning a long-running child from a request handler
 requires a cancellation path, not just a "don't write to a dead socket" flag.**
 The flag makes the symptom invisible while the work keeps running.
+
+### 2026-08-11 — Canonical upstream PR publishing replaces bot forks
+
+**Context shift.** The local operator now has authenticated branch-push and PR
+permissions on `juspay/hyperswitch-web` and
+`juspay/hyperswitch-client-core`. The previous fork-only constraint is
+superseded for those two parent repositories.
+
+**What changed.** GitHub publishing is now one deep module interface:
+`publishPullRequest`. Every patch/skill caller supplies a finished branch and
+receives a canonical PR result. The module verifies that the current checkout
+is the requested non-protected branch, that it has commits ahead of `main`, and
+that `origin` resolves to the expected `juspay/*` repository. It refreshes the
+remote branch and pushes with `--force-with-lease`, then reuses an existing open
+PR for that branch or runs `gh pr create --repo juspay/<repo>`. Fork ownership,
+remote setup, ordering, and gh arguments no longer leak into six callers.
+
+**Submodule safety.** The former shortcut pushed detached submodule commits to
+bot forks and rewrote `.gitmodules`. That produces a checkout-buildable branch
+but not a directly mergeable canonical PR. Direct publishing now rejects
+`shared-code`, `android`, or `ios` changes before any network mutation with
+`SUBMODULE_PRS_REQUIRED`, preserving the local branch. Supporting these changes
+properly requires separate authorized PRs to the canonical submodule
+repositories and explicit merge ordering; that is a distinct future workflow,
+not something to infer from permission on the two parent repos.
+
+**Verification cost.** The publisher has a true-external transport seam. Its
+deterministic check uses a fake transport to prove canonical slugs, operation
+ordering, protected-branch rejection, and pre-network submodule rejection. No
+real branch was pushed and no PR was opened during implementation.
+
+**Known gap exposed by the PR Port question.** PR Port currently has no
+target-equivalence stage before implementation. Triage and analysis are
+source-only. If the target already contains the behavior, a careful implementer
+may make no edits and the workflow reports `Implementer produced no target
+changes`; a less careful implementer may still create redundant edits. The
+correct next step is a read-only target assessor with an explicit
+`already_present | needs_port | partial` contract. Do not relabel every empty
+diff as `already_present`, because an empty diff can also mean the implementer
+failed to find a safe implementation.
+
+### 2026-08-11 — Publishing is fail-closed on workspace secrets
+
+**Threat clarified.** The SDK workspaces contain real keys in `.env*` files.
+Checking only for a few well-known token prefixes is insufficient: an agent can
+copy an unknown-format value into another filename, a secret can be committed
+and removed before the final diff, and generated PR text can leak it without the
+Git branch containing it.
+
+**What changed.** `publishPullRequest` now has one mandatory local gate before
+its transport can perform even a remote read. `secretScan.ts` captures values
+from both SDK workspaces' `.env*` files when the server starts and refreshes all
+of them at publish time, regardless of which workspace is the PR target. Raw,
+base64/base64url, hex, and URL-encoded forms are compared
+against every version of each blob in every new commit, commit identity/message,
+file and branch names, PR title, and PR body.
+Sensitive paths such as `.env*`, private keys, credential stores, scanner policy
+files, LFS pointers, opaque binaries/archives, and oversized blobs are rejected
+outright. Findings contain rule, path, line, and abbreviated commit only; the
+matched value is never returned, logged, or persisted.
+
+**Independent scanner.** gitleaks 8 is required and scans `origin/main..commit` plus PR
+metadata with a config and empty ignore file owned by this dashboard. The
+publisher ignores inline `gitleaks:allow` comments and never trusts a config or
+ignore file from the generated SDK branch. Missing binary, timeout, parse error,
+unreadable workspace path, oversized blob, or merge history all fail closed as
+`SECRET_SCAN_UNAVAILABLE` or `SECRET_SCAN_BLOCKED`; no push follows.
+
+**Push authority is not given to the model.** A publisher gate is meaningless
+if a repo-write agent can simply run `git push` or `gh pr create` itself.
+`runtime/agentEnv.ts` now wraps every Claude, Codex, and OpenCode subprocess,
+including the legacy Claude path. It removes GitHub tokens and `SSH_AUTH_SOCK`,
+disables credential helpers/interactive prompts/SSH, hides authenticated gh
+configuration, gives `origin` a non-network push URL, and rewrites direct
+GitHub Git URLs to a blocked loopback endpoint. Provider variables such as the
+OpenCode model key remain available; GitHub publishing credentials do not.
+
+**Verification.** The publishing check creates isolated local Git histories and
+proves: a safe branch reaches the fake transport; a token committed and later
+deleted does not; a copied value from an untracked `.env` does not; committing
+`.env.local` does not; PR-body leakage does not; all messages are redacted; and
+a missing gitleaks binary prevents publishing. It also proves the agent
+environment removes GitHub credentials and resolves both origin pushes and raw
+GitHub URLs only to blocked destinations. The same read-only scanner completed
+against both real workspace layouts without exposing their values.
+
+**Race and base safety.** The publisher resolves `origin/main` and the generated
+branch to immutable commit IDs before scanning. The transport rechecks that the
+branch still points to the approved commit and pushes that exact object rather
+than resolving the branch name again. This closes a concurrent scan/push race,
+and using `origin/main` as the base means an accidental local-only commit on
+`main` is included in the outbound scan instead of being treated as trusted.
+
+**Cost and lesson.** This adds local disk/Git scanning and two gitleaks passes to
+the final publish step, which is the correct tradeoff for canonical repositories.
+The invariant is now stronger than “the final diff looks clean”: **nothing
+leaves the machine unless the entire outbound payload can be scanned and passes.**
+
+### 2026-08-11 — The embedded mock server must preserve the SDK demo contract
+
+**Symptom.** The Android preview showed “Could not connect to the server” even
+though the emulator was online and `/create-payment-intent` returned HTTP 200.
+Error-only logcat identified the real failure: `JSONException: No value for
+sdkAuthorization`.
+
+**Root cause and fix.** The dashboard's embedded mock server returned
+`clientSecret` but had drifted from the client-core `mockServer.js` contract,
+which returns `sdkAuthorization`, `clientSecret`, and `paymentId`. The response
+mapping now lives in `buildPaymentIntentClientResponse` and preserves all three
+fields. `checkEmbeddedMockServer.ts` asserts the exact cross-repository contract
+and is part of the deterministic server check command.
+
+**Lesson.** A successful transport check is not an end-to-end readiness check.
+When a local compatibility server replaces a repository-owned server, treat its
+response schema as a versioned boundary and test the fields consumed by the
+actual demo client. Generic UI connection errors can hide schema failures.
+
+### 2026-08-11 — Desktop Android previews should not silently force headless mode
+
+**Symptom and cause.** The Preview Panel displayed a working Android payment
+sheet, but no standalone Emulator window appeared. This was not a web fallback:
+the dashboard was polling the real AVD framebuffer while `previewManager.ts`
+unconditionally launched QEMU with `-no-window`.
+
+**Fix.** Emulator launch mode is now resolved explicitly. macOS, Windows, and
+Linux with `DISPLAY` or `WAYLAND_DISPLAY` default to a visible window; Linux
+without a desktop stays headless. `PREVIEW_EMU_HEADLESS` and `PREVIEW_EMU_GPU`
+are escape hatches. The argument builder is deterministic and
+`checkPreviewManager.ts` proves visible mode omits `-no-window`, headless mode
+retains it, platform defaults are correct, and explicit overrides win.
+
+**Operational lesson.** An emulator cannot switch between headed and headless
+after launch. A changed setting only applies after terminating the exact AVD
+process and starting Preview again. “Rendered in a web dashboard” and “rendered
+by a web fallback” are different: this panel is a transport for the actual
+Android framebuffer.
+
+### 2026-08-12 — Two silent Git bugs, not a model failure, broke PR porting
+
+**Symptom.** A `pr-port` run against `juspay/hyperswitch-web#1412` produced two
+correct ReScript changes and a **green** ReScript build, then failed the
+deterministic validators with `corrupt patch at line 128`, and finally wedged
+forever on the phase label “Running deterministic patch validators…”. Two days
+were spent looking at the model, the skill and the secret scanner. None of them
+was at fault.
+
+**Root cause 1 — `.trim()` destroyed the patch.** `submoduleGit.ts` trimmed the
+raw output of `git diff HEAD` before storing it. In unified diff format, a
+context line for a *blank source line* is **a single space**. Trimming a hunk
+that ends on a blank line therefore removes both that space-only line and the
+terminating newline, leaving a patch two lines shorter than its own hunk header
+declares. Measured on the stored artifact: the final hunk declared `old=6 new=9`
+and carried `old=5 new=8`; the file was 127 lines where the true diff was 129.
+Appending exactly the two lost bytes (`"\n \n"`) made the same patch apply
+cleanly. ReScript sources routinely end on a blank line, so this fired often.
+
+The `join("\n")` used to combine submodule and parent diffs was the same bug in
+mirror image: it inserted a blank line *between* diffs, which git reads as a
+context line and which shifts every subsequent count. Both are now handled by
+`concatDiffs`, and `diffWorkingTree` returns git's bytes verbatim.
+
+**Root cause 2 — an interactive hook deadlocked the commit.**
+`hyperswitch-client-core` ships `.husky/prepare-commit-msg`, which runs
+`exec < /dev/tty && node_modules/.bin/git-cz --hook`. Because the dashboard is
+started **from a terminal**, `/dev/tty` resolves to the operator's real
+terminal, so commitizen opened an interactive prompt on a terminal nobody was
+watching. `simple-git` imposes no timeout by default, so the commit blocked
+indefinitely and the UI kept showing the last phase it had been told about.
+
+Two traps here. **`--no-verify` does not fix this** — it bypasses `pre-commit`
+and `commit-msg` only, never `prepare-commit-msg`. And **simple-git refuses
+`core.hooksPath` via its `config` option** ("not permitted without enabling
+allowUnsafeHooksPath"), so the override has to travel as `GIT_CONFIG_COUNT` /
+`GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, which is the same idiom
+`runtime/agentEnv.ts` already uses.
+
+**Root cause 3 — the failure was then swallowed.** `commitWithSubmodules`
+wrapped both commits in catch-alls that logged and continued, so a blocked or
+failing commit still reported success. This is why `preserveWork` reported the
+run's work as saved while the `port/pr-1412-*` branch was in fact left **empty**
+and the work was lost. Commit failures now propagate; only "nothing staged" is
+treated as benign, and it is tested for directly rather than inferred from an
+exception.
+
+**Fix.** All server-side git now goes through `workspace/git.ts`:
+- `localGit()` — hooks disabled, `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=true`,
+  and a 120 s *silence* timeout so no local command can deadlock a run.
+- `publishGit()` — hooks deliberately **left enabled**, because this machine has
+  a global `core.hooksPath=/etc/git-guardian/hooks` supplying a **pre-push**
+  secret scanner. That is a real control on a shared box. The hang was entirely
+  at commit time, so pushes keep their hooks and no timeout is imposed on them.
+
+**Lesson — separate "our artifact is broken" from "the model's work is wrong".**
+`checkPatchApplies` reported both as “Stored patch does not describe the working
+tree”. Git already distinguishes them: `corrupt patch at line N` means the diff
+is not parseable, and since the model never sees the serialised patch, that is
+*always* a dashboard bug. It now reports as `diff/corrupt_artifact` and says so.
+Conflating the two is what sent the investigation at the model for two days.
+
+**Lesson — a passing test that cannot fail is worse than no test.**
+`checkGitSafety.ts` was written first and passed against deliberately reverted
+code. Two separate reasons, both instructive: the fixture used
+`["…","}",""].join("\n")`, which yields one terminating newline rather than a
+blank final line, so git emitted no space-only context line at all; and the hunk
+checker counted the trailing split artefact as a context line, which masked the
+missing line it existed to detect. **Every regression test here was re-run
+against the reintroduced bug and confirmed to fail before being kept.**
+
+**Lesson — BSD `sed` has no `\b`.** `sed -i '' 's/\bsimpleGit(/localGit(/g'`
+silently matched nothing on macOS and reported success. Identical in shape to
+the earlier `git grep -E '\b'` incident. On this machine, assume GNU regex
+extensions are absent and verify the substitution count.
+
+**Related — the run left no record.** The last `skill_runs` row for this work is
+15:14, while the stored patch is timestamped 20:17: the wedged run was killed
+and vanished entirely, because `saveSkillRun` is only called at the end. This is
+the durability gap already noted in the reliability review; unchanged here.
+
+### 2026-08-12 — Wrong Node version presented as a dashboard outage
+
+**Symptom.** `/api/reports/latest` returned 500, then the whole dashboard died,
+with hundreds of lines of `[vite] http proxy error: ECONNREFUSED` scrolling the
+real error out of the terminal.
+
+**Cause.** `/opt/homebrew/bin/node` is v26; `better-sqlite3` is built for Node 22
+(`NODE_MODULE_VERSION 127` vs `147`). Nothing prevented starting on the wrong
+interpreter — there was no `.nvmrc` and no `engines` field.
+
+**Fix.** `.nvmrc` (22), `engines.node`, and `scripts/preflight.mjs`, which runs
+before `npm run dev` and refuses to start with an actionable message naming the
+interpreter in play and the exact `nvm use 22` to run. It is dependency-free
+plain `.mjs` on purpose: it has to run correctly on the *wrong* Node, which is
+the only case it matters in. It also *loads* `better-sqlite3` rather than
+comparing ABI numbers, so a missing or wrong-architecture binary is caught too,
+and warns when port 5174 is already held.
+
+The vite proxy now collapses "API is down" into one actionable line and answers
+503 with a JSON body, instead of printing a stack per polled request.
+
+**Lesson.** When a native module pins a runtime version, encode that in the
+repo, enforce it in the entry script, and make the failure message name the fix.
+An environment error that presents as an application outage costs far more than
+the check would have.
+
+### 2026-08-12 — A validator that rejects correct output is worse than the bug it fixes
+
+**Context.** PR porting of `juspay/hyperswitch-web#1593` ("eligibility feature
+enhancement with surcharge calculation", 29 files, +402/−66) failed three times
+in a row. The diff fetch was never at fault — `fetchExactPrDiff` returned
+exactly the right 29 files. Both failures were ours.
+
+**Failure 1 — a placeholder became a verdict.** After 170 s the triage agent
+emitted `featureName: "Eligibility check triage in progress"` and a first-person
+note about which skill it was consulting, with `portability: "no"`. It had not
+finished thinking. **The strict parser accepted it**: `"no"` required non-empty
+`reasons` (the narration satisfied that) and no `portableFiles` (empty satisfied
+that). Schema-valid is not the same as answered.
+
+**Failure 2 — the fix rejected a correct answer.** The guard added to catch
+failure 1 rejected the words `pending`, `reviewing` and `analysing` anywhere in
+the output. The next run produced a *good* triage — `partial`, with the finding
+"The **pending** eligibility message and localized surcharge disclosure are
+observable behaviors" — and the guard threw it away, twice (initial + repair).
+"Pending" is ordinary payment vocabulary (pending payment, pending eligibility).
+
+**Lesson.** When adding a guard against bad model output, the failure signature
+must be something only bad output has. Self-reference ("I'm using the X skill")
+is such a signature. Domain vocabulary is not. A false negative here costs one
+wasted run; a false positive costs *every* run of a feature that happens to use
+the word — and it is much harder to diagnose, because the output looks right.
+The guard is now scoped: status-as-a-name is checked on `featureName` only,
+`reasons` is checked only for first-person process narration.
+
+**Structural lesson — the cheapest stage must not hold the veto.** Triage sees
+only a diff, has never read the target repo, and was able to end the entire run
+with one word. It now only *scopes*. A `no` is honoured only when a
+zero-token deterministic rule agrees (mobile has no static payment-method
+registry; native-only changes have no web counterpart); otherwise the pipeline
+continues and the source analyst — which reads real code in both repos — decides.
+Declining also requires naming each skipped file, so "no" cannot be asserted
+without having looked at what is being declined.
+
+**Design lesson — blindness is not a substitute for instruction.** The
+implementer was deliberately denied access to the source repo and the diff, with
+the PortSpec JSON as "the entire bridge", to prevent verbatim copying. That made
+the spec lossy: anything the analyst omitted became invisible, and the
+implementer could not check an edge case, a default, or a backend field name.
+The result read like mechanical translation. It now has `readDirs` access to the
+source checkout plus the diff as reference, and is told in prose that it is
+*not* translating a diff — that deciding "this needs nothing here, because X" is
+a correct answer, and that backend contracts (field names, enum values) are the
+one thing to mirror exactly. Copying is prevented by instruction, the build gate
+and the validators, not by withholding context.

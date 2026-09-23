@@ -10,10 +10,11 @@
 import type { Request, Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
-import simpleGit from "simple-git";
+import { localGit } from "../../workspace/git.js";
 import { PATCHES_DIR, REPOS, type RepoKey } from "../../config.js";
 import { db, saveSkillRun } from "../../db.js";
-import { renderAgent, type VarBag } from "../../agents/loader.js";
+import type { VarBag } from "../../agents/loader.js";
+import { extractJson, isRecord, isStringArray } from "../../agents/json.js";
 import {
   computePatchVerdict,
   parseDiffFiles,
@@ -23,39 +24,56 @@ import {
   AgentsNotConfiguredError,
   UnsupportedRuntimeCapabilityError,
   resolveRun,
-  runAgent,
   type AccessPolicy,
   type AgentSlot,
   type ProfileSnapshot,
-  type Usage,
 } from "../../runtime/index.js";
-import { validateAgentSettings, type AgentSettings } from "../../runtime/settings.js";
+import {
+  RepairFailedError,
+  abortIfNeeded,
+  beginPhase,
+  makeEnvelope,
+  newTotals,
+  resolveWithRepair,
+  resultFor,
+  runStage,
+  slugify,
+  type StageContext,
+} from "../pipeline.js";
+import {
+  assertWorkspaceReady,
+  cleanupTarget,
+  preserveWork,
+} from "../../workspace/session.js";
+import { requestOverride } from "../../routes/profile.js";
 import type { SkillEnvelope, SkillRepoResult } from "../registry.js";
 import { getBranchDiff } from "../prDiff.js";
 import { resolvePortDirection, type PortDirection } from "../prUrl.js";
 import { runRescriptBuild } from "../buildCheck.js";
 import {
   captureSubmoduleHeads,
-  commitWithSubmodules,
   forceCheckoutBranch,
   getDiffWithSubmodules,
   restoreSubmoduleHeads,
-  submoduleDirsFor,
-  type SubmoduleCommitResult,
   type SubmoduleHead,
 } from "../submoduleGit.js";
 import {
-  commitsAheadOfForkMain,
-  createPullRequest,
   formatPortPrBody,
-  pushBranchToFork,
-  pushSubmoduleToFork,
-  rewriteGitmodulesToForks,
+  publishPullRequest,
 } from "../githubPr.js";
 import { withRepoLocks } from "../../workspace/mutex.js";
 
 export interface PrPortInput {
   prUrl: string;
+  /**
+   * Open the pull request as a draft. Defaults to TRUE.
+   *
+   * Publishing targets the canonical `juspay/*` repositories, so a generated
+   * port arriving as ready-for-review would page real reviewers on work no
+   * human has looked at yet. Draft is the safe default; a caller must opt out
+   * deliberately. A non-passing verdict is always a draft regardless.
+   */
+  draft?: boolean;
 }
 
 type ChangeKind = "config" | "component" | "api" | "bugfix" | "refactor" | "infra";
@@ -76,6 +94,35 @@ export interface TriageResult {
   skippedFiles: PortFileDecision[];
 }
 
+export interface TriageRepairRequest {
+  invalidOutput: string;
+  validationError: string;
+}
+
+export interface TriageRepairDiagnostics {
+  attempted: boolean;
+  repaired: boolean;
+  initialError?: string;
+  repairError?: string;
+  initialOutputChars: number;
+  repairOutputChars?: number;
+}
+
+export interface TriageResolution {
+  triage: TriageResult;
+  diagnostics: TriageRepairDiagnostics;
+}
+
+export class TriageRepairFailedError extends Error {
+  constructor(
+    message: string,
+    readonly diagnostics: TriageRepairDiagnostics,
+  ) {
+    super(message);
+    this.name = "TriageRepairFailedError";
+  }
+}
+
 export interface PortSpec {
   featureName: string;
   changeKind: ChangeKind;
@@ -89,6 +136,35 @@ export interface PortSpec {
   notPorting: PortFileDecision[];
 }
 
+export interface PortSpecRepairRequest {
+  invalidOutput: string;
+  validationError: string;
+}
+
+export interface PortSpecRepairDiagnostics {
+  attempted: boolean;
+  repaired: boolean;
+  initialError?: string;
+  repairError?: string;
+  initialOutputChars: number;
+  repairOutputChars?: number;
+}
+
+export interface PortSpecResolution {
+  spec: PortSpec;
+  diagnostics: PortSpecRepairDiagnostics;
+}
+
+export class PortSpecRepairFailedError extends Error {
+  constructor(
+    message: string,
+    readonly diagnostics: PortSpecRepairDiagnostics,
+  ) {
+    super(message);
+    this.name = "PortSpecRepairFailedError";
+  }
+}
+
 interface VerifierResult {
   parsed: boolean;
   pass: boolean;
@@ -96,16 +172,16 @@ interface VerifierResult {
   raw: string;
 }
 
-interface AgentTotals extends Usage {
-  stages: number;
-}
-
-interface PipelineContext {
+/**
+ * This pipeline's context: the shared stage fields plus the PR-port specifics.
+ * Phase timing, usage accumulation and emit all come from `StageContext`.
+ */
+interface PipelineContext extends StageContext {
   direction: PortDirection;
-  snapshot: ProfileSnapshot;
-  emit: (event: unknown) => void;
-  signal: AbortSignal;
-  usage: AgentTotals;
+  triageRepair?: TriageRepairDiagnostics;
+  portSpecRepair?: PortSpecRepairDiagnostics;
+  /** Open the resulting PR as a draft; see PrPortInput.draft. */
+  draft: boolean;
 }
 
 const PORT_SLOTS: AgentSlot[] = [
@@ -115,12 +191,33 @@ const PORT_SLOTS: AgentSlot[] = [
   "port.verifier",
 ];
 
+/**
+ * Stages that must be able to read a second repository.
+ *
+ * Declared so `resolveRun` fails at 422 before any work starts if the assigned
+ * runtime cannot grant it. OpenCode has no `--add-dir` equivalent; running the
+ * implementer there without source access would silently produce worse output
+ * rather than an error, which is exactly the class of quiet degradation this
+ * pipeline is meant to avoid.
+ */
+const PORT_READ_DIRS: Partial<Record<AgentSlot, boolean>> = {
+  "port.implementer": true,
+};
+
 const PORT_ACCESS: Partial<Record<AgentSlot, AccessPolicy>> = {
   "port.triage": "repo-read",
   "port.source-analyst": "repo-read",
   "port.implementer": "repo-write",
   "port.verifier": "repo-read",
 };
+
+/**
+ * Branches this skill owns. `cleanupTarget` will only ever delete a branch
+ * starting with this, so a bug that passed the wrong name cannot remove a
+ * human's branch. Distinct from the patch pipeline's prefix on purpose, so
+ * branch-health and cleanup can tell the two apart.
+ */
+const BRANCH_PREFIX = "port/pr-";
 
 const CHANGE_KINDS = new Set<ChangeKind>(["config", "component", "api", "bugfix", "refactor", "infra"]);
 const PORTABILITIES = new Set<Portability>(["yes", "partial", "no"]);
@@ -168,42 +265,6 @@ export function deterministicPortabilityHints(
 
 // ─── structured output parsing ──────────────────────────────────────────────
 
-function extractJson(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidates: string[] = fenced ? [fenced[1].trim()] : [];
-  const start = text.search(/[\[{]/);
-  if (start >= 0) {
-    let depth = 0;
-    let quoted = false;
-    let escaped = false;
-    for (let i = start; i < text.length; i++) {
-      const ch = text[i];
-      if (quoted) {
-        if (escaped) escaped = false;
-        else if (ch === "\\") escaped = true;
-        else if (ch === '"') quoted = false;
-        continue;
-      }
-      if (ch === '"') quoted = true;
-      else if (ch === "{" || ch === "[") depth++;
-      else if (ch === "}" || ch === "]") {
-        depth--;
-        if (depth === 0) {
-          candidates.push(text.slice(start, i + 1));
-          break;
-        }
-      }
-    }
-  }
-  for (const candidate of candidates) {
-    try { return JSON.parse(candidate); } catch { /* try next */ }
-  }
-  throw new Error("agent output was not valid JSON");
-}
-
-const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
-
 function parseFileDecisions(value: unknown, field: string): PortFileDecision[] {
   if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
   return value.map((entry, index) => {
@@ -212,6 +273,49 @@ function parseFileDecisions(value: unknown, field: string): PortFileDecision[] {
     }
     return { path: entry.path, why: entry.why };
   });
+}
+
+/**
+ * Text that means the agent was still working rather than answering.
+ *
+ * Observed on hyperswitch-web#1593: after 170 s the model emitted
+ * `featureName: "Eligibility check triage in progress"` with a first-person
+ * note about which skill it was consulting, and `portability: "no"`. Every
+ * structural rule passed — `"no"` requires non-empty `reasons` (the narration
+ * satisfied it) and no `portableFiles` (empty satisfied it) — so a placeholder
+ * became a verdict and cancelled a perfectly portable feature.
+ *
+ * Schema-valid is not the same as answered. These patterns are the difference.
+ */
+/**
+ * A `featureName` that states a status instead of naming the capability.
+ *
+ * Scoped to this field only, and kept narrow. An earlier version also rejected
+ * the words "pending", "reviewing" and "analysing" anywhere in the output —
+ * which promptly failed a perfectly good triage of hyperswitch-web#1593 whose
+ * reason read "The **pending** eligibility message and localized surcharge
+ * disclosure are observable...". Those are ordinary payment-domain terms
+ * (pending payment, pending eligibility). Rejecting a correct answer is worse
+ * than the placeholder bug this guard exists to catch.
+ */
+const STATUS_AS_NAME = /\b(in progress|tbd|to be determined)\b|^\s*(analy[sz]ing|triaging|reviewing|checking|investigating)\b/i;
+
+/**
+ * The agent describing its own activity rather than reporting a finding.
+ *
+ * This is the actual failure signature: first-person process talk, e.g.
+ * "I'm using the design-sdk-change skill to verify…". Domain vocabulary is
+ * deliberately not matched here — only self-reference is.
+ */
+const SELF_NARRATION = /\b(i['’]m|i am|i['’]ll|i will|let me|i['’]ve|my analysis)\b|\busing the [\w-]+ skill\b/i;
+
+function assertAnswered(field: string, value: string, checkStatus: boolean): void {
+  if (checkStatus && STATUS_AS_NAME.test(value)) {
+    throw new Error(`triage ${field} states a status rather than naming the capability ("${value.slice(0, 80)}") — report the finished conclusion`);
+  }
+  if (SELF_NARRATION.test(value)) {
+    throw new Error(`triage ${field} narrates your process instead of stating a finding ("${value.slice(0, 80)}")`);
+  }
 }
 
 export function parseTriageResult(text: string): TriageResult {
@@ -223,11 +327,23 @@ export function parseTriageResult(text: string): TriageResult {
   if (!isStringArray(value.reasons)) throw new Error("triage reasons must be an array of strings");
   const portableFiles = parseFileDecisions(value.portableFiles, "portableFiles");
   const skippedFiles = parseFileDecisions(value.skippedFiles, "skippedFiles");
+
+  // The status check applies to the NAME only. `reasons` is prose about the
+  // code and legitimately contains words like "pending" or "under review".
+  assertAnswered("featureName", value.featureName, true);
+  for (const reason of value.reasons) assertAnswered("reasons", reason, false);
+
   if (value.portability !== "yes" && value.reasons.length === 0) {
     throw new Error("triage must explain partial/no portability");
   }
   if (value.portability !== "no" && portableFiles.length === 0) {
     throw new Error("triage marked work portable but named no portable files");
+  }
+  // Declining the whole PR is the most expensive answer to get wrong: it ends
+  // the run. Require the decision to be shown per file, so "no" cannot be
+  // asserted without having looked at what is being declined.
+  if (value.portability === "no" && skippedFiles.length === 0) {
+    throw new Error("triage marked the PR non-portable but named no skipped files — list each source file and why it has no target counterpart");
   }
   return {
     featureName: value.featureName.trim(),
@@ -239,7 +355,30 @@ export function parseTriageResult(text: string): TriageResult {
   };
 }
 
-export function parsePortSpec(text: string, sourceDir: string, sourceDiff: string): PortSpec {
+/**
+ * Parse triage output and make at most one fail-closed semantic repair attempt.
+ *
+ * The generic machinery lives in `pipeline.resolveWithRepair`; this wrapper only
+ * supplies the parser and re-labels the failure so callers keep receiving a
+ * `TriageRepairFailedError`. The stage label is the exact noun phrase used in
+ * the user-facing message.
+ */
+export async function resolveTriageResult(
+  initialText: string,
+  repair: (request: TriageRepairRequest) => Promise<string>,
+): Promise<TriageResolution> {
+  try {
+    const { value, diagnostics } = await resolveWithRepair(
+      "triage output", initialText, parseTriageResult, repair,
+    );
+    return { triage: value, diagnostics };
+  } catch (err) {
+    if (err instanceof RepairFailedError) throw new TriageRepairFailedError(err.message, err.diagnostics);
+    throw err;
+  }
+}
+
+export function parsePortSpec(text: string, _sourceDir: string, sourceDiff: string): PortSpec {
   const value = extractJson(text);
   if (!isRecord(value)) throw new Error("port spec must be an object");
   if (typeof value.featureName !== "string" || !value.featureName.trim()) throw new Error("port spec featureName is required");
@@ -251,23 +390,35 @@ export function parsePortSpec(text: string, sourceDir: string, sourceDiff: strin
   }
 
   const changedPaths = new Set(parseDiffFiles(sourceDiff).map((f) => f.path));
+  const normalizeChangedPath = (rawPath: string, field: string, index: number): string => {
+    const withSlashes = rawPath.replaceAll("\\", "/");
+    const normalized = path.posix.normalize(withSlashes);
+    if (
+      normalized.startsWith("../") || normalized.startsWith("/") || normalized === ".." ||
+      /^[A-Za-z]:\//.test(withSlashes)
+    ) {
+      throw new Error(`${field}[${index}] escapes the source repo: ${rawPath}`);
+    }
+    if (!changedPaths.has(normalized)) {
+      throw new Error(`${field}[${index}] is not present in the source PR diff: ${normalized}`);
+    }
+    return normalized;
+  };
   const sourceFiles = value.sourceFiles.map((entry, index) => {
     if (!isRecord(entry) || typeof entry.path !== "string" || typeof entry.role !== "string" || typeof entry.whatChanged !== "string") {
       throw new Error(`sourceFiles[${index}] must contain path, role and whatChanged strings`);
     }
-    const normalized = path.posix.normalize(entry.path.replaceAll("\\", "/"));
-    if (normalized.startsWith("../") || normalized.startsWith("/") || normalized === "..") {
-      throw new Error(`sourceFiles[${index}] escapes the source repo: ${entry.path}`);
-    }
-    const existsInCheckout = fs.existsSync(path.join(sourceDir, normalized));
-    if (!existsInCheckout && !changedPaths.has(normalized)) {
-      throw new Error(`sourceFiles[${index}] is not present in the checkout or PR diff: ${normalized}`);
-    }
+    const normalized = normalizeChangedPath(entry.path, "sourceFiles", index);
     return { path: normalized, role: entry.role, whatChanged: entry.whatChanged };
   });
 
   const optionalString = (key: string): string | undefined =>
     typeof value[key] === "string" && value[key] !== "" ? value[key] as string : undefined;
+  if (!isStringArray(value.reScriptGotchas)) throw new Error("port spec reScriptGotchas must be an array of strings");
+  const notPorting = parseFileDecisions(value.notPorting, "notPorting").map((entry, index) => ({
+    ...entry,
+    path: normalizeChangedPath(entry.path, "notPorting", index),
+  }));
   return {
     featureName: value.featureName.trim(),
     changeKind: value.changeKind as ChangeKind,
@@ -277,9 +428,30 @@ export function parsePortSpec(text: string, sourceDir: string, sourceDiff: strin
     typeDefinition: optionalString("typeDefinition"),
     configKey: optionalString("configKey"),
     defaultValue: optionalString("defaultValue"),
-    reScriptGotchas: isStringArray(value.reScriptGotchas) ? value.reScriptGotchas : [],
-    notPorting: value.notPorting === undefined ? [] : parseFileDecisions(value.notPorting, "notPorting"),
+    reScriptGotchas: value.reScriptGotchas,
+    notPorting,
   };
+}
+
+/** Parse a PortSpec and make at most one fail-closed semantic repair attempt. */
+export async function resolvePortSpec(
+  initialText: string,
+  sourceDir: string,
+  sourceDiff: string,
+  repair: (request: PortSpecRepairRequest) => Promise<string>,
+): Promise<PortSpecResolution> {
+  try {
+    const { value, diagnostics } = await resolveWithRepair(
+      "source specification",
+      initialText,
+      (text) => parsePortSpec(text, sourceDir, sourceDiff),
+      repair,
+    );
+    return { spec: value, diagnostics };
+  } catch (err) {
+    if (err instanceof RepairFailedError) throw new PortSpecRepairFailedError(err.message, err.diagnostics);
+    throw err;
+  }
 }
 
 function parseVerifier(text: string): VerifierResult {
@@ -299,16 +471,10 @@ function parseVerifier(text: string): VerifierResult {
 
 // ─── agent execution ────────────────────────────────────────────────────────
 
-function mergeUsage(total: AgentTotals, usage: Usage): void {
-  for (const key of [
-    "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
-    "reasoningTokens", "costUsd", "numTurns", "durationMs",
-  ] as const) {
-    const value = usage[key];
-    if (typeof value === "number") total[key] = (total[key] ?? 0) + value;
-  }
-}
-
+/**
+ * Thin adapter over the shared `runStage`, preserving this pipeline's
+ * positional call shape and its SOURCE_DIR / TARGET_DIR reserved vars.
+ */
 async function runDefinition(
   ctx: PipelineContext,
   id: string,
@@ -317,102 +483,14 @@ async function runDefinition(
   sourceDir: string,
   targetDir: string,
   allowEmpty = false,
+  readDirs?: string[],
 ): Promise<string> {
-  const rendered = renderAgent(id, vars, {
-    SOURCE_DIR: sourceDir,
-    TARGET_DIR: targetDir,
-    TOOL_NOTES: "Use only the repository tools allowed by this stage.",
-    OUTPUT_NOTES: "Return only the requested structured output.",
-    BUILD_COMMAND: "npm run --silent re:build 2>&1",
-    BUILD_NOTES: "Cold ReScript builds may take up to 180 seconds.",
-  });
-
-  let text = "";
-  let failure: string | null = null;
-  for await (const event of runAgent({
-    slot: rendered.def.slot,
-    prompt: rendered.prompt,
+  return runStage(ctx, id, vars, {
     cwd,
-    access: rendered.def.access,
-    outputSchema: rendered.schema,
-    timeoutMs: rendered.def.timeoutMs,
-    signal: ctx.signal,
-  }, ctx.snapshot)) {
-    ctx.emit(event);
-    if (event.type === "text") text += event.text;
-    else if (event.type === "usage") mergeUsage(ctx.usage, event.usage);
-    else if (event.type === "error") failure = event.error;
-  }
-  ctx.usage.stages++;
-  if (failure) throw new Error(failure);
-  if (!allowEmpty && !text.trim()) throw new Error(`${id} returned no output`);
-  return text.trim();
-}
-
-// ─── workspace safety ───────────────────────────────────────────────────────
-
-function abortIfNeeded(signal: AbortSignal): void {
-  if (!signal.aborted) return;
-  const err = new Error("PR port cancelled");
-  err.name = "AbortError";
-  throw err;
-}
-
-async function assertWorkspaceReady(repoKey: RepoKey, requireMain: boolean): Promise<void> {
-  const repoDir = REPOS[repoKey].dir;
-  if (!fs.existsSync(path.join(repoDir, ".git"))) {
-    throw new Error(`Workspace repo is missing: ${repoDir}. Run npm run setup first.`);
-  }
-  const git = simpleGit(repoDir);
-  const status = await git.status();
-  if (requireMain && status.current !== "main") {
-    throw new Error(`${REPOS[repoKey].name} must be on main before it can be used as the read-only source (currently ${status.current ?? "detached"})`);
-  }
-  const submodules = new Set(submoduleDirsFor(repoKey));
-  const parentChanges = status.files.filter((f) => !submodules.has(f.path));
-  if (parentChanges.length > 0) {
-    throw new Error(
-      `${REPOS[repoKey].name} has unrelated working-tree changes: ${parentChanges.slice(0, 5).map((f) => f.path).join(", ")}`,
-    );
-  }
-  for (const sub of submodules) {
-    const subDir = path.join(repoDir, sub);
-    if (!fs.existsSync(path.join(subDir, ".git"))) continue;
-    const subStatus = await simpleGit(subDir).status();
-    if (!subStatus.isClean()) throw new Error(`${REPOS[repoKey].name}/${sub} has unrelated working-tree changes`);
-  }
-}
-
-async function cleanupTarget(
-  repoKey: RepoKey,
-  baseline: SubmoduleHead[],
-  branchName: string,
-  keepBranch: boolean,
-): Promise<void> {
-  const repoDir = REPOS[repoKey].dir;
-  await forceCheckoutBranch(repoDir, repoKey, "main");
-  // Safe because assertWorkspaceReady proved there were no parent-level
-  // untracked files before the run and the repo lock excludes concurrent jobs.
-  await simpleGit(repoDir).clean("f", ["-d"]);
-  await restoreSubmoduleHeads(repoDir, baseline);
-  if (!keepBranch && branchName.startsWith("port/pr-")) {
-    try { await simpleGit(repoDir).deleteLocalBranch(branchName, true); } catch { /* absent/empty */ }
-  }
-}
-
-function slugify(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48) || "change";
-}
-
-function resultFor(
-  repo: RepoKey,
-  branch: string,
-  diff: string,
-  filesTouched: number,
-  summary: string,
-  extra: Partial<SkillRepoResult> = {},
-): SkillRepoResult {
-  return { repo, branch, diff, filesTouched, summary, ...extra };
+    reserved: { SOURCE_DIR: sourceDir, TARGET_DIR: targetDir },
+    allowEmpty,
+    readDirs,
+  });
 }
 
 function envelope(
@@ -423,27 +501,14 @@ function envelope(
   extraMeta: Record<string, unknown> = {},
 ): SkillEnvelope {
   const { direction } = ctx;
-  return {
-    skillId: "pr-port",
-    status,
-    results: { [direction.target]: result },
-    meta: {
-      outcome,
-      sourcePr: direction.pr,
-      source: direction.source,
-      target: direction.target,
-      profileTakenAt: ctx.snapshot.takenAt,
-      usage: ctx.usage,
-      ...extraMeta,
-    },
-  };
-}
-
-async function preserveWork(
-  repoKey: RepoKey,
-  message: string,
-): Promise<SubmoduleCommitResult> {
-  return commitWithSubmodules(REPOS[repoKey].dir, repoKey, message);
+  return makeEnvelope(ctx, "pr-port", status, outcome, { [direction.target]: result }, {
+    sourcePr: direction.pr,
+    source: direction.source,
+    target: direction.target,
+    ...(ctx.triageRepair ? { triageRepair: ctx.triageRepair } : {}),
+    ...(ctx.portSpecRepair ? { portSpecRepair: ctx.portSpecRepair } : {}),
+    ...extraMeta,
+  });
 }
 
 // ─── pipeline ───────────────────────────────────────────────────────────────
@@ -463,7 +528,7 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       );
     }
 
-    emit({ type: "phase_marker", phase: "fetching" });
+    beginPhase(ctx, "fetching");
     const source = await getBranchDiff(sourceDir, direction.pr.url, "main", direction.source);
     if (!source.diff.trim()) {
       return envelope(
@@ -485,7 +550,7 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
     });
 
     const deterministic = deterministicPortabilityHints(direction.source, direction.target, source.diff);
-    emit({ type: "phase_marker", phase: "triaging" });
+    beginPhase(ctx, "triaging");
     const triageText = await runDefinition(ctx, "pr-port/triage", {
       PR_URL: direction.pr.url,
       SOURCE_REPO: REPOS[direction.source].name,
@@ -494,10 +559,43 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       SOURCE_DIFF: source.diff,
       DETERMINISTIC_HINTS: deterministic.length > 0 ? deterministic.map((h) => `- ${h}`).join("\n") : "- No deterministic non-portability hints.",
     }, sourceDir, sourceDir, targetDir);
-    const triage = parseTriageResult(triageText);
-    emit({ type: "triage_result", triage });
+    let triageResolution: TriageResolution;
+    try {
+      triageResolution = await resolveTriageResult(triageText, async (request) => {
+        emit({ type: "triage_repair", attempt: 1, reason: request.validationError });
+        return runDefinition(ctx, "pr-port/triage-repair", {
+          PR_URL: direction.pr.url,
+          SOURCE_REPO: REPOS[direction.source].name,
+          TARGET_REPO: REPOS[direction.target].name,
+          CHANGED_FILES: parseDiffFiles(source.diff).map((file) => `- ${file.path}`).join("\n"),
+          SOURCE_DIFF: source.diff,
+          DETERMINISTIC_HINTS: deterministic.length > 0 ? deterministic.map((h) => `- ${h}`).join("\n") : "- No deterministic non-portability hints.",
+          VALIDATION_ERROR: request.validationError,
+          INVALID_OUTPUT: request.invalidOutput,
+        }, sourceDir, sourceDir, targetDir);
+      });
+    } catch (err) {
+      if (err instanceof TriageRepairFailedError) ctx.triageRepair = err.diagnostics;
+      throw err;
+    }
+    ctx.triageRepair = triageResolution.diagnostics;
+    const triage = triageResolution.triage;
+    emit({ type: "triage_result", triage, repaired: triageResolution.diagnostics.repaired });
 
-    if (triage.portability === "no") {
+    // Triage scopes the work; it does not get to end the run on its own opinion.
+    //
+    // It sees only the diff, has not read the target repo, and is the cheapest,
+    // least-informed stage in the pipeline — yet a "no" here used to cancel
+    // everything. On hyperswitch-web#1593 ("eligibility enhancement with
+    // surcharge calculation", 29 files) that produced a flat refusal to port a
+    // straightforwardly portable feature.
+    //
+    // A refusal is therefore only honoured when the DETERMINISTIC rules agree.
+    // Those encode structural facts about the two SDKs (mobile has no static
+    // payment-method registry, native-only changes have no web counterpart) and
+    // cost no tokens. Absent that corroboration the pipeline continues, and the
+    // analyst — which reads actual code in both repos — decides.
+    if (triage.portability === "no" && deterministic.length > 0) {
       const reason = triage.reasons.join(" ") || "No meaningful target-SDK behavior remains.";
       return envelope(
         ctx,
@@ -512,8 +610,16 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
         },
       );
     }
+    if (triage.portability === "no") {
+      // Recorded, not obeyed: the analyst is told triage wanted to decline and
+      // must either find portable behavior or say plainly that none exists.
+      emit({
+        type: "warning",
+        warning: "Triage proposed declining this PR but no deterministic rule supports that; continuing to source analysis.",
+      });
+    }
 
-    emit({ type: "phase_marker", phase: "analysing" });
+    beginPhase(ctx, "analysing");
     const analystText = await runDefinition(ctx, "pr-port/source-analyst", {
       PR_URL: direction.pr.url,
       SOURCE_REPO: REPOS[direction.source].name,
@@ -522,10 +628,30 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       SOURCE_DIFF: source.diff,
       TRIAGE_JSON: JSON.stringify(triage, null, 2),
     }, sourceDir, sourceDir, targetDir);
-    const spec = parsePortSpec(analystText, sourceDir, source.diff);
-    emit({ type: "spec_result", spec });
+    let specResolution: PortSpecResolution;
+    try {
+      specResolution = await resolvePortSpec(analystText, sourceDir, source.diff, async (request) => {
+        emit({ type: "spec_repair", attempt: 1, reason: request.validationError });
+        return runDefinition(ctx, "pr-port/source-analyst-repair", {
+          PR_URL: direction.pr.url,
+          SOURCE_REPO: REPOS[direction.source].name,
+          TARGET_REPO: REPOS[direction.target].name,
+          CHANGED_FILES: parseDiffFiles(source.diff).map((file) => `- ${file.path}`).join("\n"),
+          SOURCE_DIFF: source.diff,
+          TRIAGE_JSON: JSON.stringify(triage, null, 2),
+          VALIDATION_ERROR: request.validationError,
+          INVALID_OUTPUT: request.invalidOutput,
+        }, sourceDir, sourceDir, targetDir);
+      });
+    } catch (err) {
+      if (err instanceof PortSpecRepairFailedError) ctx.portSpecRepair = err.diagnostics;
+      throw err;
+    }
+    ctx.portSpecRepair = specResolution.diagnostics;
+    const spec = specResolution.spec;
+    emit({ type: "spec_result", spec, repaired: specResolution.diagnostics.repaired });
 
-    const branchName = `port/pr-${direction.pr.number}-${slugify(spec.featureName)}`;
+    const branchName = `${BRANCH_PREFIX}${direction.pr.number}-${slugify(spec.featureName)}`;
     const baseline = await captureSubmoduleHeads(targetDir, direction.target);
     let branchCreated = false;
     let keepBranch = false;
@@ -538,16 +664,31 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       abortIfNeeded(signal);
       await forceCheckoutBranch(targetDir, direction.target, "main");
       await restoreSubmoduleHeads(targetDir, baseline);
-      const targetGit = simpleGit(targetDir);
+      const targetGit = localGit(targetDir);
       try { await targetGit.deleteLocalBranch(branchName, true); } catch { /* first run */ }
       await targetGit.checkoutLocalBranch(branchName);
       branchCreated = true;
 
-      emit({ type: "phase_marker", phase: "implementing", branch: branchName });
+      beginPhase(ctx, "implementing", { branch: branchName });
+      // The implementer reads the source repo directly.
+      //
+      // It used to be deliberately source-blind, with the JSON spec as the only
+      // bridge — the idea being that blindness prevents verbatim copying. In
+      // practice the spec is lossy: anything the analyst failed to write down
+      // became invisible, and the implementer had no way to check an edge case,
+      // a default, or a backend field name. The result was mechanical output.
+      //
+      // Copying is better prevented by instruction and by the validators than by
+      // withholding context. `readDirs` is honoured by claude-code and codex via
+      // --add-dir; opencode has no equivalent and `resolveRun` rejects the slot
+      // up front rather than silently running without it.
       const implementerText = await runDefinition(ctx, "pr-port/implementer", {
         TARGET_REPO: REPOS[direction.target].name,
+        SOURCE_REPO: REPOS[direction.source].name,
+        PR_URL: direction.pr.url,
         PORT_SPEC_JSON: JSON.stringify(spec, null, 2),
-      }, targetDir, sourceDir, targetDir);
+        SOURCE_DIFF: source.diff,
+      }, targetDir, sourceDir, targetDir, false, [sourceDir]);
 
       ({ diff: latestDiff, fileCount: latestFiles } = await getDiffWithSubmodules(targetDir, direction.target));
       if (!latestDiff.trim() || latestFiles === 0) {
@@ -564,7 +705,7 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       patchPath = path.join(PATCHES_DIR, `port-${direction.source}-pr-${direction.pr.number}-${slugify(spec.featureName)}.patch`);
       fs.writeFileSync(patchPath, latestDiff);
 
-      emit({ type: "phase_marker", phase: "building" });
+      beginPhase(ctx, "building");
       const build = runRescriptBuild(targetDir);
       emit({ type: "build_result", passed: build.passed, log: build.log });
       if (!build.passed) {
@@ -582,7 +723,7 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
         );
       }
 
-      emit({ type: "phase_marker", phase: "validating" });
+      beginPhase(ctx, "validating");
       const quality = runPatchValidators({
         diff: latestDiff,
         repoDir: targetDir,
@@ -609,7 +750,7 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
         );
       }
 
-      emit({ type: "phase_marker", phase: "verifying" });
+      beginPhase(ctx, "verifying");
       const verifierText = await runDefinition(ctx, "pr-port/verifier", {
         FEATURE_NAME: spec.featureName,
         SOURCE_REPO: REPOS[direction.source].name,
@@ -625,28 +766,11 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       const commitResult = await preserveWork(direction.target, commitMessage);
       committed = true;
       keepBranch = true;
-      const ahead = await commitsAheadOfForkMain(targetDir, branchName);
-      if (ahead === 0 && commitResult.submodulesChanged.length === 0) {
-        throw new Error("Port commit produced zero commits; refusing to push an empty branch");
-      }
 
       let prUrl: string | null = null;
       let prNumber: number | null = null;
       let prWarning: string | null = null;
-      const submodulePushes: string[] = [];
       try {
-        for (const subDir of commitResult.submodulesChanged) {
-          const pushed = await pushSubmoduleToFork({ parentDir: targetDir, subDir, branchName });
-          submodulePushes.push(`${subDir} -> ${pushed.forkUrl} @ ${pushed.sha.slice(0, 8)}`);
-        }
-        if (commitResult.submodulesChanged.length > 0) {
-          const rewritten = rewriteGitmodulesToForks(targetDir, commitResult.submodulesChanged);
-          if (rewritten.length > 0) {
-            await simpleGit(targetDir).add([".gitmodules"]);
-            await simpleGit(targetDir).commit(`chore: point submodules at bot forks for build\n\nRewritten: ${rewritten.join(", ")}`);
-          }
-        }
-        await pushBranchToFork(targetDir, direction.target, branchName);
         const body = formatPortPrBody({
           sourcePrUrl: direction.pr.url,
           sourceRepo: REPOS[direction.source].name,
@@ -661,14 +785,15 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
           verdict: verdict === "pass" ? "pass" : "needs_review",
           findings: quality.findings,
           verifierIssues: verifier.issues,
-          submodulePushes,
         });
-        const created = await createPullRequest({
+        const created = await publishPullRequest({
+          repoDir: targetDir,
           repoKey: direction.target,
           branch: branchName,
           title: `feat: port ${spec.featureName}`,
           body,
-          draft: verdict !== "pass",
+          draft: ctx.draft || verdict !== "pass",
+          submodulesChanged: commitResult.submodulesChanged,
         });
         prUrl = created.prUrl;
         prNumber = created.prNumber;
@@ -694,7 +819,6 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
           verifier,
           patchPath,
           deterministicHints: deterministic,
-          submodulePushes,
           sourceBaseSha: source.baseSha,
           sourceHeadSha: source.headSha,
         },
@@ -722,7 +846,7 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
       );
     } finally {
       if (branchCreated) {
-        try { await cleanupTarget(direction.target, baseline, branchName, keepBranch); }
+        try { await cleanupTarget(direction.target, baseline, branchName, keepBranch, BRANCH_PREFIX); }
         catch (err) { console.error(`[pr-port] target cleanup failed: ${(err as Error).message}`); }
       }
     }
@@ -730,21 +854,6 @@ async function runPrPort(ctx: PipelineContext): Promise<SkillEnvelope> {
 }
 
 // ─── HTTP interface + persistence ──────────────────────────────────────────
-
-function requestOverride(req: Request): AgentSettings | undefined {
-  const encoded = req.get("X-Agent-Profiles");
-  if (!encoded) return undefined;
-  let parsed: AgentSettings;
-  try {
-    const uriEncoded = Buffer.from(encoded, "base64").toString("utf8");
-    parsed = JSON.parse(decodeURIComponent(uriEncoded)) as AgentSettings;
-  } catch {
-    throw new Error("X-Agent-Profiles is not a valid browser agent profile override");
-  }
-  const validation = validateAgentSettings(parsed);
-  if (!validation.ok) throw new Error(`Invalid browser agent profile override: ${validation.errors.join("; ")}`);
-  return parsed;
-}
 
 function persistEnvelope(input: PrPortInput, value: SkillEnvelope): number | null {
   try {
@@ -774,7 +883,7 @@ export async function handlePrPortSkill(req: Request, res: Response): Promise<vo
   try {
     direction = resolvePortDirection(String(input.prUrl ?? ""));
     const override = requestOverride(req);
-    snapshot = resolveRun(PORT_SLOTS, { override, access: PORT_ACCESS });
+    snapshot = resolveRun(PORT_SLOTS, { override, access: PORT_ACCESS, readDirs: PORT_READ_DIRS });
   } catch (err) {
     if (err instanceof AgentsNotConfiguredError) {
       res.status(428).json({ code: err.code, error: err.message, slots: err.slots });
@@ -814,6 +923,8 @@ export async function handlePrPortSkill(req: Request, res: Response): Promise<vo
     emit,
     signal: controller.signal,
     usage: { stages: 0 },
+    draft: input.draft !== false,
+    timings: [],
   };
 
   let finalEnvelope: SkillEnvelope;

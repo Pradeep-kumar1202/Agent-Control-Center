@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { forkSlug } from "../skills/githubPr.js";
 import { getBranchDiff } from "../skills/prDiff.js";
 import {
   parsePrUrl,
@@ -16,8 +15,8 @@ const mobile = resolvePortDirection("http://www.github.com/juspay/hyperswitch-cl
 assert.equal(mobile.source, "mobile");
 assert.equal(mobile.target, "web");
 
-assert.equal(repoKeyForFullSlug(forkSlug("web")), "web");
-assert.equal(repoKeyForFullSlug(forkSlug("mobile")), "mobile");
+assert.equal(repoKeyForFullSlug("juspay/hyperswitch-web"), "web");
+assert.equal(repoKeyForFullSlug("juspay/hyperswitch-client-core"), "mobile");
 assert.equal(repoKeyForFullSlug("someone/unrelated"), null);
 assert.equal(parsePrUrl("https://gitlab.com/juspay/hyperswitch-web/pull/1"), null);
 assert.equal(parsePrUrl("https://github.com/juspay/hyperswitch-web/issues/1"), null);

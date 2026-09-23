@@ -7,11 +7,16 @@
     "server",
     "web"
   ],
+  "engines": {
+    "node": ">=22 <23"
+  },
   "scripts": {
-    "dev": "concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
-    "dev:server": "npm run dev -w server",
+    "preflight": "node scripts/preflight.mjs",
+    "dev": "npm run preflight && concurrently -n server,web -c blue,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "dev:server": "npm run preflight && npm run dev -w server",
     "dev:web": "npm run dev -w web",
     "build": "npm run build -w server && npm run build -w web",
+    "check": "npm run preflight && npm run build -w server && npm run check:all -w server && npm run build -w web",
     "setup": "npm install && npm run sync -w server"
   },
   "devDependencies": {

@@ -153,7 +153,7 @@ export function TestsForm({ onResult, onError }: SkillFormProps) {
           <div className="text-sm font-medium text-slate-200">Generate new tests</div>
           <div className="text-xs text-slate-500">
             The AI analyzes the branch diff and writes targeted Cypress/Detox tests following each
-            repo's existing patterns. Tests land on a new branch and a PR is opened against the bot fork.
+            repo's existing patterns. Tests land on a new branch and a PR is opened in the canonical juspay repository.
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>

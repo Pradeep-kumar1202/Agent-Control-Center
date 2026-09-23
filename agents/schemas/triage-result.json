@@ -1,15 +1,24 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "PR port triage result",
+  "description": "A portability verdict and a self-consistent classification of source PR files. yes/partial requires at least one portable file; no requires concrete reasons and no portable files.",
   "type": "object",
   "additionalProperties": false,
   "required": ["featureName", "changeKind", "portability", "reasons", "portableFiles", "skippedFiles"],
   "properties": {
     "featureName": { "type": "string", "minLength": 1 },
     "changeKind": { "enum": ["config", "component", "api", "bugfix", "refactor", "infra"] },
-    "portability": { "enum": ["yes", "partial", "no"] },
-    "reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "portability": {
+      "description": "Use yes or partial only when portableFiles contains at least one source-diff path. Use no only when no meaningful target behavior remains.",
+      "enum": ["yes", "partial", "no"]
+    },
+    "reasons": {
+      "description": "Required semantically for partial and no verdicts.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "portableFiles": {
+      "description": "Source-diff files whose behavior should be translated. Must be non-empty for yes or partial and empty for no.",
       "type": "array",
       "items": {
         "type": "object",
@@ -22,6 +31,7 @@
       }
     },
     "skippedFiles": {
+      "description": "Source-diff files intentionally not translated, each with an architectural reason.",
       "type": "array",
       "items": {
         "type": "object",

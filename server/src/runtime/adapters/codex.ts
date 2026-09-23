@@ -28,6 +28,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { DATA_DIR } from "../../config.js";
 import { classifyExit, streamProcess } from "../proc.js";
+import { runtimeCliEnv } from "../agentEnv.js";
 import {
   UnsupportedRuntimeCapabilityError,
   type AccessPolicy, type AgentEvent, type AgentRuntime,
@@ -228,11 +229,18 @@ export const codexRuntime: AgentRuntime = {
 
   async probe(): Promise<RuntimeStatus> {
     try {
-      const { stdout: ver } = await execFileAsync(BIN, ["--version"], { timeout: 5000 });
+      const { stdout: ver } = await execFileAsync(BIN, ["--version"], {
+        timeout: 5000,
+        env: runtimeCliEnv(),
+      });
       let models: string[] = [];
       try {
         // Real machine-readable catalog, unlike the other two runtimes.
-        const { stdout } = await execFileAsync(BIN, ["debug", "models"], { timeout: 20_000, maxBuffer: 32 * 1024 * 1024 });
+        const { stdout } = await execFileAsync(BIN, ["debug", "models"], {
+          timeout: 20_000,
+          maxBuffer: 32 * 1024 * 1024,
+          env: runtimeCliEnv(),
+        });
         const parsed = JSON.parse(stdout.slice(stdout.indexOf("{"))) as {
           models?: Array<{ slug?: string; visibility?: string; supported_in_api?: boolean }>;
         };

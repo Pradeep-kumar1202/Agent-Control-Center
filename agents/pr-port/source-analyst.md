@@ -31,7 +31,9 @@ The downstream implementer cannot see the source repository or this diff. Your s
 {{SOURCE_DIFF}}
 ```
 
-Read the complete changed files and follow their imports/callers where needed. Describe observable behavior rather than source file layout. `sourceFiles` must cite real paths and say what changed. `implementationSteps` must be ordered, target-oriented behavioral steps without guessing target paths.
+Read the complete changed files and follow their imports/callers where needed. Describe observable behavior rather than source file layout. `sourceFiles` must cite exact repository-relative paths from the PR diff and say what changed. Never include absolute paths, local skill/instruction files, `.codex`, `.claude`, `SKILL.md`, or files merely consulted while reasoning. `notPorting` paths must also come from the PR diff. `implementationSteps` must be ordered, target-oriented behavioral steps without guessing target paths.
+
+Always include every schema field. Use `null` for `typeDefinition`, `configKey`, or `defaultValue` when the concept does not apply. Use an empty array for `reScriptGotchas` or `notPorting` when there are no entries.
 
 <!-- include: _partials/cross-sdk-portability.md -->
 
