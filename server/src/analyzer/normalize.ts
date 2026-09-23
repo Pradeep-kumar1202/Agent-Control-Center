@@ -45,6 +45,7 @@ export async function normalizeCategory(
   );
 
   const result = await askJson<{ features: CanonicalFeature[] }>(prompt, {
+    slot: "analysis.normalize",
     model: MODEL_EXTRACT,
     timeoutMs: 300_000,
   });

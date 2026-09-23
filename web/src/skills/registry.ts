@@ -15,6 +15,8 @@ import { ReviewForm } from "./review/Form";
 import { ReviewResults } from "./review/Results";
 import { IntegrationForm } from "./integration/Form";
 import { IntegrationResults } from "./integration/Results";
+import { PrPortForm } from "./pr-port/Form";
+import { PrPortResults } from "./pr-port/Results";
 
 // ─── Shared types ────────────────────────────────────────────────────────────
 
@@ -99,5 +101,13 @@ export const SKILLS_REGISTRY: SkillConfig[] = [
     activeTabClass: "border-rose-500 text-rose-300",
     FormComponent: IntegrationForm,
     ResultsComponent: IntegrationResults,
+  },
+  {
+    id: "pr-port",
+    name: "PR Port",
+    description: "Port a web or mobile pull request into the other SDK",
+    activeTabClass: "border-cyan-500 text-cyan-300",
+    FormComponent: PrPortForm,
+    ResultsComponent: PrPortResults,
   },
 ];

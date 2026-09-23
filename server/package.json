@@ -8,7 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "sync": "tsx src/scripts/syncRepos.ts",
-    "analyze": "tsx src/scripts/runAnalysis.ts"
+    "analyze": "tsx src/scripts/runAnalysis.ts",
+    "check:pr-port": "npm run build && node dist/scripts/checkPrUrl.js && node dist/scripts/checkPrPort.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",

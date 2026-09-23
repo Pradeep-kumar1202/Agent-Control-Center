@@ -164,6 +164,7 @@ Output a JSON object with these fields (output ONLY valid JSON, no markdown fenc
 }`;
 
       await askStream(docAnalystPrompt, {
+        slot: "skill.integration",
         model: "opus",
         timeoutMs: 300_000,
         signal,
@@ -201,6 +202,7 @@ Output a JSON object (no fences):
 }`;
 
       await askStream(patternPrompt, {
+        slot: "skill.integration",
         model: "opus",
         cwd: repoDir,
         allowedTools: ["Read", "Glob", "Grep"],
@@ -243,6 +245,7 @@ When build is green, output a one-line summary of what you implemented.`;
 
       let agentText = "";
       await askStream(implementerPrompt, {
+        slot: "skill.integration",
         model: "opus",
         cwd: repoDir,
         allowedTools: ["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
@@ -286,6 +289,7 @@ Check:
 Output JSON: {pass: boolean, issues: string[]}`;
 
       await askStream(verifierPrompt, {
+        slot: "skill.integration",
         model: "opus",
         cwd: repoDir,
         allowedTools: ["Read", "Glob", "Grep", "Bash"],

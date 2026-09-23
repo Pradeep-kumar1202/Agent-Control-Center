@@ -19,6 +19,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { REPOS, type RepoKey } from "../../config.js";
 import { forceCheckoutBranch } from "../submoduleGit.js";
+import { getCredentials } from "../embeddedMockServer.js";
+import { patchDemoAppForDetox } from "./patchDemoApp.js";
 
 export interface TestRunSpec {
   branch: string;
@@ -33,6 +35,48 @@ export interface TestRunChunk {
   exitCode?: number;
   success?: boolean;
   error?: string;
+}
+
+/**
+ * Spawn a subprocess and stream stdout/stderr into the NDJSON chunk handler.
+ * Resolves when the process exits 0; throws with stderr tail on non-zero
+ * exit. Used for pre-test build steps (e.g. `detox build`) so their logs
+ * are visible in the same test-run stream the user is watching.
+ */
+async function runSubprocess(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  onChunk: (chunk: TestRunChunk) => void,
+  timeoutMs = 600_000,
+): Promise<void> {
+  onChunk({ type: "log", line: `Running: ${cmd} ${args.join(" ")} (cwd: ${path.basename(cwd)})` });
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const timer = setTimeout(() => {
+      onChunk({ type: "log", line: `${cmd} timed out after ${Math.round(timeoutMs / 1000)}s — killing` });
+      try { proc.kill("SIGKILL"); } catch { /* */ }
+    }, timeoutMs);
+    proc.stdout.on("data", (raw) => {
+      for (const line of raw.toString().split("\n")) {
+        if (line.trim()) onChunk({ type: "log", line: line.trimEnd() });
+      }
+    });
+    proc.stderr.on("data", (raw) => {
+      for (const line of raw.toString().split("\n")) {
+        if (line.trim()) onChunk({ type: "log", line: `[stderr] ${line.trimEnd()}` });
+      }
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`${cmd} ${args.join(" ")} exited with code ${code}`));
+    });
+  });
 }
 
 /**
@@ -97,34 +141,63 @@ export async function runTestSuite(
       args.push("--spec", specs.join(","));
     }
     cwd = cypressDir;
+    const creds = getCredentials();
     env = {
       ...process.env,
-      // Cypress reads these from env (cypress.env.json has empty defaults)
-      CYPRESS_HYPERSWITCH_PUBLISHABLE_KEY:
-        process.env.HYPERSWITCH_PUBLISHABLE_KEY ?? "",
-      CYPRESS_HYPERSWITCH_SECRET_KEY:
-        process.env.HYPERSWITCH_SECRET_KEY ?? "",
+      // UI-overridable — Credentials panel wins over .env.
+      CYPRESS_HYPERSWITCH_PUBLISHABLE_KEY: creds.publishableKey,
+      CYPRESS_HYPERSWITCH_SECRET_KEY: creds.secretKey,
       // Headless Chrome flags for CI-like environment
       ELECTRON_EXTRA_LAUNCH_ARGS: "--disable-gpu --no-sandbox",
     };
   } else {
-    // Mobile — Detox. The `--reuse` flag is critical: without it, Detox
-    // tries to boot a fresh emulator for each test suite, which crashes on
-    // this headless Linux box (no Qt/X display). With --reuse, Detox
-    // attaches to whatever emulator is already connected via adb.
+    // Mobile — Detox.
+    //
+    // We use `android.att.debug` (attached) instead of `android.emu.debug`
+    // so Detox reuses the Pixel_9_Pro our preview step already booted.
+    // With `android.emu.debug`, Detox spawns its own Medium_Phone AVD
+    // (from .detoxrc.js) regardless of --reuse, giving us two emulators
+    // and the dreaded "No instrumentation runner" error when Detox targets
+    // a device that never saw our APK.
+    //
+    // Before running, build the `*-androidTest.apk` ourselves. Detox ≥ 20
+    // removed the implicit build from `detox test`, and without the test
+    // APK, Detox can't inject its JSInstrumentation into the demo app and
+    // fails with the same "No instrumentation runner" error.
+    // Patch the demo-app source so its Application class is a ReactApplication
+    // — without this, Detox's JS-bridge sync crashes with a ClassCastException
+    // the moment the test calls `device.enableSynchronization()`.
+    patchDemoAppForDetox(repoDir, (line) =>
+      onChunk({ type: "log", line }),
+    );
+
+    await runSubprocess(
+      "npx",
+      ["detox", "build", "--configuration", "android.att.debug"],
+      repoDir,
+      onChunk,
+    );
+
+    // With the `attached` device type, Detox doesn't boot an emulator
+    // (so we don't need --reuse to prevent a fresh boot), AND --reuse
+    // actually HURTS: it tells Detox to skip reinstalling the app, which
+    // means the freshly-built -androidTest.apk never lands on the device
+    // and `device.launchApp` fails with
+    //   "No instrumentation runner found on device emulator-XXXX …".
+    // Removing --reuse lets Detox install both APKs on every run.
+    //
+    // --headless is also noise for attached (Detox ignores it and logs a
+    // warning), so we drop it.
     cmd = "npx";
     args = [
       "detox",
       "test",
       "--configuration",
-      "android.emu.debug",
-      "--reuse",
-      "--headless",
+      "android.att.debug",
       "--loglevel",
       "info",
     ];
     if (spec.testFiles && spec.testFiles.length > 0) {
-      // Detox accepts test file paths after --
       args.push("--", ...spec.testFiles);
     }
     cwd = repoDir;

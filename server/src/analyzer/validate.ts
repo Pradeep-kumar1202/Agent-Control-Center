@@ -166,6 +166,7 @@ Output ONLY a JSON object — no prose, no code fences, no commentary:
 There must be exactly ${claims.length} entries, one per claim, in the same order as the input.`;
 
   const result = await askJson<{ results: ValidationResult[] }>(prompt, {
+    slot: "gap.verify",
     model: MODEL_REASON,
     timeoutMs: 600_000,
     cwd,

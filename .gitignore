@@ -1,7 +1,9 @@
 node_modules
 dist
 .env
-workspace
+# Repo-root runtime clones only — leading slash anchors to project root so
+# server/src/workspace/ (mutex.ts, repoManager.ts) is NOT excluded.
+/workspace
 data
 *.log
 .DS_Store

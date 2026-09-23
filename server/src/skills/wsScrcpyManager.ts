@@ -18,6 +18,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { PROJECT_ROOT } from "../config.js";
@@ -82,6 +83,19 @@ export async function ensureWsScrcpy(): Promise<WsScrcpyInfo> {
       return;
     }
 
+    // Fail with something actionable BEFORE spawning. `tools/ws-scrcpy` is
+    // vendored but not built by `npm run setup`, so on a fresh checkout this
+    // directory does not exist — and spawning into a missing cwd reports
+    // ENOENT against the COMMAND ("spawn node ENOENT"), which reads as "node is
+    // missing" and sends you chasing the wrong problem entirely.
+    if (!fs.existsSync(path.join(WS_SCRCPY_DIR, "index.js"))) {
+      throw new Error(
+        `ws-scrcpy is not built — ${path.join(WS_SCRCPY_DIR, "index.js")} does not exist. ` +
+        `Emulator mirroring is unavailable; the rest of the dashboard is unaffected. ` +
+        `To enable it: cd tools/ws-scrcpy && npm install && npm run dist`,
+      );
+    }
+
     console.log(`[ws-scrcpy] starting sidecar on port ${WS_SCRCPY_PORT}`);
     proc = spawn("node", ["index.js"], {
       cwd: WS_SCRCPY_DIR,
@@ -97,6 +111,15 @@ export async function ensureWsScrcpy(): Promise<WsScrcpyInfo> {
     proc.stderr?.on("data", (b) => {
       const s = b.toString().trim();
       if (s) console.error(`[ws-scrcpy!] ${s}`);
+    });
+    // A ChildProcess emits 'error' when the spawn itself fails, and an
+    // UNHANDLED 'error' event throws — which killed the entire dashboard the
+    // first time anyone clicked Preview on a checkout without the sidecar
+    // built. An optional side feature must never be able to take the server
+    // down, so this is handled and downgraded to a log line.
+    proc.on("error", (err) => {
+      console.error(`[ws-scrcpy] failed to start: ${err.message} — emulator mirroring disabled`);
+      proc = null;
     });
     proc.on("exit", (code, signal) => {
       console.log(`[ws-scrcpy] exited code=${code} signal=${signal}`);

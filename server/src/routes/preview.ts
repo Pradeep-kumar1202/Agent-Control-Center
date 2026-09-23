@@ -12,7 +12,18 @@ import {
   forceRestartMetro,
   type PreviewKind,
 } from "../skills/previewManager.js";
+import { BranchGoneError } from "../skills/submoduleGit.js";
 import { ensureWsScrcpy, wsScrcpyInfo } from "../skills/wsScrcpyManager.js";
+import {
+  getCredentials,
+  getMockServerState,
+  setCredentials,
+  setPaymentIntentBody,
+  startMockServer,
+  stopMockServer,
+  tailMockServerLogs,
+  type Credentials,
+} from "../skills/embeddedMockServer.js";
 import { db, type GapRow, type PatchRow } from "../db.js";
 import { askStream, type StreamChunk } from "../llm.js";
 import { forceCheckoutBranch } from "../skills/submoduleGit.js";
@@ -46,6 +57,18 @@ previewRouter.post("/preview/start", async (req, res) => {
     const state = await startPreview(repoKey, branch, kind);
     res.json(state);
   } catch (err) {
+    if (err instanceof BranchGoneError) {
+      // 409 Conflict — the client's understanding of the server state
+      // (patch row says this branch is valid) is stale. Dashboard reacts
+      // by marking the row and prompting regeneration.
+      return res.status(409).json({
+        error: "branch_gone",
+        code: "BRANCH_GONE",
+        branch: err.branch,
+        repo: err.repo,
+        message: err.message,
+      });
+    }
     console.error("[preview] start failed:", err);
     res.status(500).json({ error: (err as Error).message });
   }
@@ -56,6 +79,73 @@ previewRouter.post("/preview/stop", async (req, res) => {
   if (!repoKey) return res.status(400).json({ error: "invalid repoKey" });
   const state = await stopPreview(repoKey);
   res.json({ stopped: state !== null, state });
+});
+
+// ─── Mock merchant server lifecycle (embedded on port 5252) ───────────────────
+//
+// Registered BEFORE the generic `/preview/:repoKey` route so that
+// `/preview/mock-server` doesn't get parsed as a repoKey param.
+
+previewRouter.get("/preview/mock-server", (_req, res) => {
+  res.json(getMockServerState());
+});
+
+previewRouter.post("/preview/mock-server/start", async (_req, res) => {
+  try {
+    const state = await startMockServer();
+    res.json(state);
+  } catch (err) {
+    res.status(503).json({ error: (err as Error).message });
+  }
+});
+
+previewRouter.post("/preview/mock-server/stop", async (_req, res) => {
+  try {
+    const state = await stopMockServer();
+    res.json(state);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+previewRouter.post("/preview/mock-server/config", (req, res) => {
+  const body = req.body?.paymentIntentBody;
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({ error: "paymentIntentBody must be a JSON object" });
+  }
+  setPaymentIntentBody(body as Record<string, unknown>);
+  res.json(getMockServerState());
+});
+
+previewRouter.get("/preview/mock-server/logs", (req, res) => {
+  const since = Number(req.query.since ?? 0);
+  res.json(tailMockServerLogs(Number.isFinite(since) ? since : 0));
+});
+
+// Hyperswitch credentials (UI-overridable at runtime). Returns the resolved
+// values (UI override OR .env fallback) plus a flag per field so the UI
+// knows whether each came from an override vs. the environment.
+previewRouter.get("/preview/mock-server/credentials", (_req, res) => {
+  res.json(getCredentials());
+});
+
+previewRouter.post("/preview/mock-server/credentials", (req, res) => {
+  const allowed: Array<keyof Credentials> = [
+    "publishableKey",
+    "secretKey",
+    "profileId",
+    "netceteraApiKey",
+    "baseUrl",
+  ];
+  const patch: Partial<Credentials> = {};
+  for (const k of allowed) {
+    const v = req.body?.[k];
+    if (typeof v === "string") patch[k] = v;
+  }
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: "no valid credential fields in body" });
+  }
+  res.json(setCredentials(patch));
 });
 
 previewRouter.get("/preview/:repoKey", (req, res) => {

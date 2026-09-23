@@ -75,4 +75,12 @@ export const SKILLS: SkillManifest[] = [
     endpoint: "/skills/integration/generate",
     repos: ["web", "mobile"],
   },
+  {
+    id: "pr-port",
+    name: "PR Port",
+    description:
+      "Port the behavior from a web or mobile pull request into the other SDK",
+    endpoint: "/skills/pr-port/generate",
+    repos: ["web", "mobile"],
+  },
 ];

@@ -30,6 +30,7 @@ export async function extractUiComponents(
   );
 
   const result = await askJson<{ components: ExtractedFeature[] }>(prompt, {
+    slot: "analysis.extract",
     model: MODEL_EXTRACT,
     timeoutMs: 240_000,
   });
