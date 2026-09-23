@@ -1,6 +1,6 @@
 /**
- * Smoke test: run a full analysis from the CLI without involving the HTTP
- * server. Useful for iterating on extractors.
+ * Run a full analysis from the CLI without involving the HTTP server.
+ * Deterministic and model-free; see analyzer/index.ts.
  *
  *   npm run analyze -w server
  */
@@ -15,10 +15,14 @@ async function main() {
   console.log(`  web SHA:   ${result.webSha.slice(0, 10)}`);
   console.log(`  mobile SHA: ${result.mobileSha.slice(0, 10)}`);
   console.log(`  gaps:      ${result.gapCount}`);
-  console.log(`  pipeline:`);
-  console.log(`    raw extracted        ${result.passCounts.raw}`);
-  console.log(`    after prefilter      ${result.passCounts.afterPrefilter}`);
-  console.log(`    after normalize      ${result.passCounts.afterNormalize}`);
+  console.log(`  declared surface:`);
+  for (const [cat, s] of Object.entries(result.surface)) {
+    console.log(`    ${cat.padEnd(15)} web ${s.web}  mobile ${s.mobile}  matched ${s.matched}`);
+  }
+  if (result.tableWarnings.length > 0) {
+    console.log(`  equivalence-table warnings:`);
+    for (const w of result.tableWarnings) console.log(`    ${w}`);
+  }
   console.log(`  by category:`);
   for (const [cat, n] of Object.entries(result.gapCountByCategory)) {
     console.log(`    ${cat.padEnd(15)} ${n}`);

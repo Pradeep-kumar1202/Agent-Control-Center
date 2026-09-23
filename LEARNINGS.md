@@ -1017,3 +1017,68 @@ April `force-pr` route was moved onto `publishPullRequest`. `npm run check` pass
 - `seed/verified-gaps.json` still marks `payment_method_order` verified although
   iteration 9 proved it a false positive. The seed is ground truth for evals, so it
   must be corrected before anything is scored against it.
+
+### 2026-09-23 — Iteration 10: gap analysis reads declarations, not model opinions
+
+**Why.** Iteration 2's diagnosis ("extractors are too permissive") was right but
+the fixes kept filtering LLM output. An audit of the 59 dismissed seed gaps showed
+almost none needed judgement: the extractors read files truncated at 6 KB (web
+`PaymentType.res` is 41 KB, so the options decoder was never seen), were seeded
+with the wrong files for backend APIs, and named features with model-invented
+strings that drifted on every commit (`poll_payment_status` / `any_payments_poll`),
+so dismissals and Verify verdicts stopped matching.
+
+**What.** `server/src/analyzer/surface/` replaces extract + normalize for config,
+backend_api and component — zero model calls:
+- config: web `itemToObjMapper`/`allowedPaymentElementOptions` + `elements`
+  options; mobile `parseConfigurationDict` + `parseLayout`.
+- backend_api: web's `APIUtils.res` endpoint registry + every
+  `${…url/endpoint}/path` literal in both SDKs, normalised to `payments/{}/confirm`.
+- component: `getPaymentMode` (web) / `parseSdkState`+`parsePmmState` (mobile)
+  entry points, plus a small feature catalogue detected by file-path pattern on
+  BOTH sides.
+- `equivalences.ts`: reviewed renames, platform-scoped keys, non-surface keys and
+  implicit presence (evidence re-checked every run). Stale rows surface as warnings.
+- Identity is the declared key; evidence is exact file:line. Parsers fail closed
+  (missing anchor / implausibly small surface → report `failed`), because a
+  one-sided surface floods false gaps.
+- `payment_method` dropped from the run until it is re-framed as categories/flows.
+- Dead code removed: LLM extractors, `filter.ts`, `normalize.ts`, the unused batch
+  `validate.ts`, `measureFilter.ts`, extract/normalize caches.
+
+**Verify hardening (same change).** Cache key now includes category (`config|terms`
+and `component|terms` shared a verdict). Verdicts are parsed strictly: an unknown
+verdict no longer means "verified", and `false_positive` must cite a file that
+exists in the missing repo, or the gap is kept.
+
+**Measured.**
+- Full run: ~2.5–3.3 s including git pull; was ~1 min cold + 12 model calls.
+- `npm run eval:gaps` vs seed: 16/16 in-scope seed gaps still reported with the same
+  platform flag; 2 seed gaps correctly detected as closed upstream since April
+  (`payment_method_order` — the iteration-9 false positive — and
+  `hide_card_nickname_field`); 0 dismissed items reported; 0 table warnings;
+  46 new candidates with evidence awaiting review.
+- `check:surface`: 29 checks, each of 4 deliberately reintroduced bugs turned the
+  matching check red before the checks were kept.
+
+**Seed corrections (evidence in the diff).** Removed the two closed-upstream rows from
+`verified-gaps.json`. `customer_payment_methods` moved from dismissed to verified: the
+April dismissal cited a mobile API type, not an integrator option. `sdk_handle_save_payment`
+removed from dismissed: its evidence was `useSavePaymentMethod`, a hook with no call
+sites; it is back to unverified for a human/Verify decision. `primary_button_label`
+stays dismissed, now backed by an implicit-presence row (`sdkHandleConfirmPayment.buttonText`).
+The seed files were re-serialised with 2-space indentation, hence the large diff.
+
+**Lessons.**
+- Ask where the thing is *declared* before asking a model to find it. Three of four
+  categories had a machine-readable source of truth all along.
+- The seed is a snapshot of a moving target: 2 of 16 gaps closed in five months and
+  6 rows name features that were renamed or removed. Evals must distinguish "we
+  missed it" from "it no longer exists".
+- Knowledge that a model rediscovered every run (renames) belongs in a reviewed,
+  versioned table that checks itself against the code.
+
+**Next.** Review the 46 new candidates into the table or Verify; payment-method
+categories/flows as a fourth surface; gate "Generate Patch" on verified rows and
+remove "Verify all" (bulk Opus + tools violates constraint #3); promote Verify
+`false_positive` findings into the equivalence table instead of a per-DB dismissal.

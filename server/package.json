@@ -13,8 +13,10 @@
     "check:preview": "npm run build && node dist/scripts/checkPreviewManager.js",
     "check:git-safety": "npm run build && node dist/scripts/checkGitSafety.js",
     "check:pr-port": "npm run build && node dist/scripts/checkPrUrl.js && node dist/scripts/checkPrPort.js && node dist/scripts/checkEmbeddedMockServer.js && node dist/scripts/checkPreviewManager.js && node dist/scripts/checkGitHubPr.js",
-    "check:all": "npm run build && node dist/scripts/checkGitSafety.js && node dist/scripts/checkJobs.js && node dist/scripts/checkPrUrl.js && node dist/scripts/checkPrPort.js && node dist/scripts/checkEmbeddedMockServer.js && node dist/scripts/checkPreviewManager.js && node dist/scripts/checkGitHubPr.js",
-    "check:jobs": "npm run build && node dist/scripts/checkJobs.js"
+    "check:all": "npm run build && node dist/scripts/checkSurface.js && node dist/scripts/checkGitSafety.js && node dist/scripts/checkJobs.js && node dist/scripts/checkPrUrl.js && node dist/scripts/checkPrPort.js && node dist/scripts/checkEmbeddedMockServer.js && node dist/scripts/checkPreviewManager.js && node dist/scripts/checkGitHubPr.js",
+    "check:jobs": "npm run build && node dist/scripts/checkJobs.js",
+    "check:surface": "npm run build && node dist/scripts/checkSurface.js",
+    "eval:gaps": "tsx src/scripts/evalGaps.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",

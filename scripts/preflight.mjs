@@ -202,5 +202,5 @@ function warnIfPortBusy(port) {
 const wanted = requiredMajor();
 checkNodeVersion(wanted);
 checkNativeModules();
-warnIfPortBusy(5174);
+warnIfPortBusy(Number(process.env.PORT ?? 5174));
 console.log(`✔ preflight: Node v${process.versions.node}, native modules OK`);

@@ -22,8 +22,9 @@ interface VerdictPayload {
  * repo and either marks the row verified=1 (with updated severity/rationale),
  * marks it platform_specific, or deletes it if Opus finds it's a false positive.
  *
- * Results are cached by (missing_repo_sha, canonical_name) so re-clicking
- * Verify on the same gap at the same repo SHA is free.
+ * Results are cached by (category, missing_repo, missing_repo_sha,
+ * canonical_name) so re-clicking Verify on the same gap at the same repo SHA
+ * is free. Only a verdict that passes parseVerdict is ever cached or applied.
  */
 gapsRouter.post("/gaps/:id/validate", async (req, res) => {
   const gapId = Number(req.params.id);
@@ -41,15 +42,11 @@ gapsRouter.post("/gaps/:id/validate", async (req, res) => {
     const missingRepo = gap.missing_in as RepoKey;
     const missingSha = repos[missingRepo].sha;
 
-    let verdict = getValidateCache<VerdictPayload>(
-      missingRepo,
-      missingSha,
-      gap.canonical_name,
-    );
-
+    const cached = getValidateCache<unknown>(gap.category, missingRepo, missingSha, gap.canonical_name);
+    let verdict = cached ? parseVerdict(cached, REPOS[missingRepo].dir) : null;
     if (!verdict) {
-      verdict = await validateOne(gap, missingRepo);
-      putValidateCache(missingRepo, missingSha, gap.canonical_name, verdict);
+      verdict = parseVerdict(await validateOne(gap, missingRepo), REPOS[missingRepo].dir);
+      putValidateCache(gap.category, missingRepo, missingSha, gap.canonical_name, verdict);
     }
 
     if (verdict.verdict === "false_positive") {
@@ -150,14 +147,18 @@ async function validateOne(
     missingRepo === "web"
       ? "hyperswitch-web (the web SDK)"
       : "hyperswitch-client-core (the mobile SDK)";
-  const evidence = safeParse(gap.evidence) as Array<{ file?: string }> | null;
-  const otherFile = evidence?.[0]?.file ?? "unknown";
+  const evidence = safeParse(gap.evidence) as Array<{ name?: string; file?: string; line?: number; snippet?: string }> | null;
+  const ev = evidence?.[0];
+  const otherFile = ev?.file ? `${ev.file}${ev.line ? `:${ev.line}` : ""}` : "unknown";
+  const declared = ev?.name && ev?.snippet ? `\nIt is declared there as \`${ev.name}\`:  ${ev.snippet}\n` : "";
 
   const prompt = `You are validating ONE claimed feature gap in ${repoLabel}.
 
 Your current working directory IS the ${missingRepo} repo. You have Glob, Grep, and Read tools — USE THEM. Do not guess. Actually look.
 
 Claim: feature "${gap.canonical_name}" (category: ${gap.category}) is present in the OTHER repo at ${otherFile}, and the gap-finder thinks it's MISSING here.
+${declared}
+The gap-finder compared declared keys and already knows the documented renames between the two SDKs. Your job is the case it cannot decide: does this repo offer the same integrator capability under a different name or shape?
 
 Important context about the mobile repo (hyperswitch-client-core): payment methods there are rendered dynamically from backend responses — you will NOT find payment method names hardcoded in source. If the claim is a payment method and you're searching in the mobile repo, treat it as "platform_specific" because the mobile SDK gets its payment method list from the backend at runtime.
 
@@ -166,7 +167,7 @@ Instructions:
   2. Open files with Read if you need to confirm.
   3. Decide ONE verdict:
       "confirmed"         - feature is genuinely absent from this repo
-      "false_positive"    - you found it (under this name or another). Set found_in_missing to the file path.
+      "false_positive"    - you found it (under this name or another). Set found_in_missing to the repo-relative file path where it lives — it will be checked, and a path that does not exist rejects the verdict.
       "platform_specific" - the feature inherently cannot exist in this platform, OR it's a dynamic backend-driven feature (like payment methods in mobile).
 
 Severity guidance:
@@ -187,6 +188,34 @@ Output ONLY a JSON object — no prose, no code fences:
   });
 
   return result;
+}
+
+/**
+ * Accept only a verdict the dashboard can act on safely. A missing or
+ * misspelt verdict used to fall through to "verified=1"; a false_positive
+ * citing a file that does not exist used to delete a real gap permanently.
+ */
+function parseVerdict(raw: unknown, missingRepoDir: string): VerdictPayload {
+  const v = (raw ?? {}) as Partial<VerdictPayload>;
+  const verdicts = ["confirmed", "false_positive", "platform_specific"] as const;
+  const severities = ["low", "medium", "high"] as const;
+  if (!verdicts.includes(v.verdict as (typeof verdicts)[number])) {
+    throw new Error(`Verify returned an unusable verdict ${JSON.stringify(v.verdict)}; nothing was changed`);
+  }
+  if (typeof v.rationale !== "string" || v.rationale.trim() === "") {
+    throw new Error("Verify returned no rationale; nothing was changed");
+  }
+  const severity = severities.includes(v.severity as (typeof severities)[number]) ? v.severity! : "medium";
+  if (v.verdict === "false_positive") {
+    const cited = (v.found_in_missing ?? "").replace(/:\d+(:\d+)?$/, "").trim();
+    if (!cited || !fs.existsSync(path.join(missingRepoDir, cited))) {
+      throw new Error(
+        `Verify said false_positive but cited ${cited ? `"${cited}", which does not exist` : "no file"}; the gap was kept`,
+      );
+    }
+    return { verdict: v.verdict, severity, rationale: v.rationale, found_in_missing: cited };
+  }
+  return { verdict: v.verdict!, severity, rationale: v.rationale };
 }
 
 function safeParse(s: string): unknown {

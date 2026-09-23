@@ -1,14 +1,21 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
+// Overridable (WEB_PORT, PORT) so a local run can sit beside ports that VS Code
+// Remote-SSH forwards from another machine — those silently serve that
+// machine's app on localhost (LEARNINGS 2026-09-23).
+const WEB_PORT = Number(process.env.WEB_PORT ?? 5173);
+const API_PORT = Number(process.env.PORT ?? 5174);
+
 export default defineConfig({
   plugins: [react()],
   server: {
     host: true,
-    port: 5173,
+    port: WEB_PORT,
+    strictPort: true,
     proxy: {
       "/api": {
-        target: "http://localhost:5174",
+        target: `http://localhost:${API_PORT}`,
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ""),
         /**
@@ -30,7 +37,7 @@ export default defineConfig({
             if (down && !reported) {
               reported = true;
               console.error(
-                "\n[api] cannot reach the server on http://localhost:5174" +
+                `\n[api] cannot reach the server on http://localhost:${API_PORT}` +
                   "\n[api] start it with `npm run dev`, and check its output for a startup error" +
                   "\n[api] (further proxy errors suppressed until it comes back)\n",
               );
