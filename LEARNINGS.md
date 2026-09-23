@@ -982,3 +982,38 @@ source checkout plus the diff as reference, and is told in prose that it is
 a correct answer, and that backend contracts (field names, enum values) are the
 one thing to mirror exactly. Copying is prevented by instruction, the build gate
 and the validators, not by withholding context.
+
+### 2026-09-23 — Recovery: a stale-tree commit silently reverted August, and the newest work was never pushed
+
+**What happened.** `49a8247` ("feat: some enhancements", pushed to main) was
+committed from a stale working tree: 51 of its 55 files are byte-identical to the
+April 23 WIP stash, which itself carried files copied from the April
+`port-sdk-skills-to-main` branch. Committed on top of main it reverted PR #6
+(multi-agent runtimes + Settings) without any conflict, leaving SettingsPage,
+runtime adapters and prPort wired to functions that no longer existed. Separately,
+the Aug 12 follow-up (job runner, secret-gated publishing, git safety, PR-port
+repair loops, preflight, self-checks — 72 files) existed only as *staged* changes
+in a second checkout, `~/Documents/Agent-Control-Center`, and was never committed.
+And the app the operator was looking at was a third copy on `dobby`, reached
+through VS Code Remote-SSH port forwarding of 5173/5174, at the April 9 initial
+commit — which is why "Settings is missing" persisted after the code was fixed.
+
+**Recovery.** Per file, a 3-way merge with ours = pre-damage main, theirs = the bad
+commit, and base = the *older version the stale copy was actually derived from*
+(closest blob match), not the stash's nominal parent — the stash itself contained
+stale reverts, so applying it normally would have re-reverted work. Then the Aug 12
+staged diff was applied on top; its publishing policy (canonical upstream,
+secret-gated, refuse submodule changes) superseded the April bot-fork flow, and the
+April `force-pr` route was moved onto `publishPullRequest`. `npm run check` passes.
+
+**Lessons.**
+- A commit that "adds" old files produces no conflict and no warning. Before
+  committing a large change, `git diff --stat origin/main` and look for big
+  deletion counts in files you did not mean to touch.
+- Three copies of one project (Mac clone, second Mac checkout, remote box) with
+  work in each is how work gets lost. One checkout, pushed branches.
+- Check which process is actually serving a port before debugging the code behind
+  it (`lsof -iTCP:5173 -sTCP:LISTEN`); VS Code Remote-SSH forwards look local.
+- `seed/verified-gaps.json` still marks `payment_method_order` verified although
+  iteration 9 proved it a false positive. The seed is ground truth for evals, so it
+  must be corrected before anything is scored against it.
